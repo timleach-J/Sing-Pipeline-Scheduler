@@ -82,6 +82,7 @@ Valid values: `Perfusion`, `MERFISH`, `RNAseq`, `Extra`
 - pandas
 - openpyxl
 - tkinter (included with standard Python on Windows)
+- Climb (exports must have all columns selected)
 
 Install dependencies:
 ```
