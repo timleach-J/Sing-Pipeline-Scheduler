@@ -92,6 +92,6 @@ pip install pandas openpyxl
 
 ## Notes
 
-- The script is designed for the Sing Lab colony at JAX
+- The script is designed for the Kumar Lab at JAX
 - Extra animals attend Wednesday behavior but are not harvested and do not count toward quota
 - Do Not Schedule removes an animal from the run entirely
