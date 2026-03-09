@@ -1,6 +1,6 @@
 # Sing Animal Scheduler
 
-A Python script that handles animal scheduling and harvest processing for the Sing Lab mouse colony. It runs as a full GUI application — no terminal interaction required after launch.
+A Python script that handles animal scheduling and harvest processing for the Kumar Lab's contribution to the SING Project. It runs as a full GUI application — no terminal interaction required after launch.
 
 ---
 
