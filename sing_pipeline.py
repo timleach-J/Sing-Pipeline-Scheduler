@@ -1,3 +1,8 @@
+# ============================================================
+# Sing Pipeline
+# Version 1.2
+# ============================================================
+
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Side
@@ -2347,14 +2352,20 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         key = (strain_key, timepoint, sex, htype)
         counts[key] = counts.get(key, 0) + 1
 
-    # Build the set of (strain, timepoint, sex) combos that are actually
-    # present in schedulable_df, so we only flag quota mismatches for
-    # groups that have animals in this run.
+    # Build the set of (strain, timepoint, sex) combos that have at least
+    # one animal actually being harvested (not Extra or Do Not Schedule).
+    # This ensures we only flag quota mismatches for groups with real
+    # harvest animals in this run.
     present_combos = set()
-    for _, r in schedulable_df.iterrows():
-        sk = str(r.get('Strain', '')).strip().upper()
-        tp = str(r.get('Assigned_Timepoint', '')).strip()
-        sx = str(r.get('Sex', '')).strip()
+    for name, htype in selections.items():
+        if htype in ('Do Not Schedule', 'Extra'):
+            continue
+        row = df_map.get(name)
+        if row is None:
+            continue
+        sk = str(row.get('Strain', '')).strip().upper()
+        tp = str(row.get('Assigned_Timepoint', '')).strip()
+        sx = str(row.get('Sex', '')).strip()
         if tp in ('P14', 'P56'):
             present_combos.add((sk, tp, sx))
 
@@ -2658,6 +2669,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     def _confirm():
         current = {n: v.get() for n, v in selection_vars.items()}
+
+        # ── Quota check (harvest types only, not Extra or Do Not Schedule) ────
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
         mismatches = [r for r in quota_data if r[6] != '✓ Match']
 
@@ -2671,6 +2684,50 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
             proceed = messagebox.askyesno(
                 "Quota Mismatch",
                 f"The following assignments don't match the tracking sheet:\n\n"
+                f"{lines}\n\n"
+                f"Proceed anyway?",
+                icon='warning'
+            )
+            if not proceed:
+                return
+
+        # ── Group-of-3 check (Harvest + Extra count per Birth_ID, P56 only) ──
+        # Build a map of animal name -> row for quick lookup
+        df_map = {
+            str(r.get('Animal_Name', '')).strip(): r
+            for _, r in schedulable.iterrows()
+        }
+        # Group animals by Birth_ID, P56 only
+        birth_groups = {}
+        for name, htype in current.items():
+            row = df_map.get(name)
+            if row is None:
+                continue
+            if str(row.get('Assigned_Timepoint', '')).strip() != 'P56':
+                continue
+            birth_id = str(row.get('Birth_ID', 'Unknown')).strip()
+            if birth_id not in birth_groups:
+                birth_groups[birth_id] = []
+            birth_groups[birth_id].append((name, htype))
+
+        incomplete_groups = []
+        for birth_id, animals in birth_groups.items():
+            # Count animals that are Harvest or Extra (not Do Not Schedule)
+            active = [a for a in animals if a[1] != 'Do Not Schedule']
+            if 0 < len(active) < CONFIG['CAGE_SIZE']:
+                strain = str(df_map.get(animals[0][0], {}).get('Strain', '')).strip()
+                incomplete_groups.append(
+                    f"  Birth {birth_id} ({strain}): {len(active)} of {CONFIG['CAGE_SIZE']} animals active"
+                )
+
+        if incomplete_groups:
+            lines = '\n'.join(incomplete_groups[:8])
+            if len(incomplete_groups) > 8:
+                lines += f"\n  ... and {len(incomplete_groups) - 8} more"
+            proceed = messagebox.askyesno(
+                "Incomplete Cage Groups",
+                f"The following P56 cage groups have fewer than {CONFIG['CAGE_SIZE']} animals\n"
+                f"(counting Harvest + Extra, excluding Do Not Schedule):\n\n"
                 f"{lines}\n\n"
                 f"Proceed anyway?",
                 icon='warning'
@@ -6615,6 +6672,14 @@ def build_working_data(all_animals_df):
     before = len(df)
     df = df[df['Assigned_Timepoint'] != 'Unschedulable'].copy()
     print(f"  Filtered: {before - len(df)} Unschedulable removed")
+
+    # Remove Do Not Schedule animals only — Extras still appear on the
+    # harvest worksheet for day-of paperwork, but generate no samples or labels
+    before2 = len(df)
+    df = df[~df['Harvest_Type'].isin(['DO_NOT_SCHEDULE', 'Do Not Schedule'])].copy()
+    filtered2 = before2 - len(df)
+    if filtered2 > 0:
+        print(f"  Filtered: {filtered2} Do Not Schedule removed from harvest pipeline")
     print(f"  Remaining: {len(df)} animals")
 
     df['Protocol'] = df.apply(
