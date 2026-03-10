@@ -22,7 +22,7 @@ The pipeline runs in two phases:
 
 ## Input Files
 
-Place these files in the same folder as `unified_pipeline_2.py`:
+Place these files in the same folder as `sing_pipeline.py`:
 
 | File | Required | Purpose |
 |------|----------|---------|
@@ -36,7 +36,7 @@ Place these files in the same folder as `unified_pipeline_2.py`:
 ## How to Run
 
 ```
-python unified_pipeline_2.py
+python sing_pipeline.py
 ```
 
 Or just double-click the file. The GUI will open automatically.
