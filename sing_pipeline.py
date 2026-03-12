@@ -96,7 +96,7 @@ CONFIG = {
     'RUN_TESTS': False,
 
     'HARVEST_TARGETS': {
-        'Perfusion': 5,
+        'Perfusion': 5,   # Base — actual target is 5 or 6 per sex (11 total per timepoint)
         'MERFISH': 1,
         'RNAseq': 1
     },
@@ -107,7 +107,7 @@ CONFIG = {
     ],
 
     'REQUIRED_BIRTHS_COLUMNS': [
-        'Birth ID', 'Status', 'Birth Date', 'Live Count', '# of Pups', 'Line (Short)', 'Dam', 'Sire'
+        'Birth ID', 'Status', 'Birth Date', 'Live Count'
     ],
 
     'SUPER_PRIORITY_STRAINS': [
@@ -709,6 +709,10 @@ def read_births_data(filename: str) -> Optional[pd.DataFrame]:
         return None
     df['Birth Date'] = pd.to_datetime(df['Birth Date'], errors='coerce')
     df['Birth ID'] = df['Birth ID'].astype(str)
+    # Births CSV has 'Line' (full name) but not 'Line (Short)' — use 'Line' as fallback
+    if 'Line (Short)' not in df.columns and 'Line' in df.columns:
+        df['Line (Short)'] = df['Line']
+        logger.info("Births: 'Line (Short)' not found — using 'Line' as fallback")
     logger.info(f"Loaded {len(df)} birth records")
     return df
 
@@ -1254,6 +1258,12 @@ def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
         logger.warning(f"Expected at least 15 columns, found {len(tracking_df.columns)}")
         return {}
 
+    # Filter to real strain rows only — real rows always have 'Yes' or 'No'
+    # in column 1 (P14 Decisions). Ghost/percentage rows have decimals or NaN.
+    col1_upper = tracking_df.iloc[:, 1].astype(str).str.strip().str.upper()
+    tracking_df = tracking_df[col1_upper.isin(['YES', 'NO'])].reset_index(drop=True)
+    logger.info(f"After filtering to Yes/No rows: {len(tracking_df)} strain rows")
+
     requirements = {}
     for idx, row in tracking_df.iterrows():
         strain = row.iloc[0]
@@ -1282,10 +1292,37 @@ def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
             logger.warning(f"Could not parse row for strain '{strain}': {e}")
             continue
 
-        targets = {
-            'P14': {'Male': dict(CONFIG['HARVEST_TARGETS']), 'Female': dict(CONFIG['HARVEST_TARGETS'])},
-            'P56': {'Male': dict(CONFIG['HARVEST_TARGETS']), 'Female': dict(CONFIG['HARVEST_TARGETS'])}
-        }
+        # Read P14/P56 completion flags from tracking sheet (cols 17 and 18).
+        # These flags are maintained in the sheet and are the authoritative source.
+        def _is_complete_flag(val):
+            s = str(val).strip().upper()
+            return s in ('TRUE', 'YES', '1')
+
+        p14_complete = _is_complete_flag(row.iloc[17]) if len(row) > 17 else False
+        p56_complete = _is_complete_flag(row.iloc[18]) if len(row) > 18 else False
+
+        # Perfusion target is 11 per timepoint (one sex gets 6, other gets 5).
+        # Assign the higher target (6) to whichever sex has fewer completions.
+        # If equal, Male gets 5 and Female gets 6.
+        targets = {}
+        for _tp, _complete in [('P14', p14_complete), ('P56', p56_complete)]:
+            if _complete:
+                # Timepoint done — set targets equal to completed so needed=0
+                targets[_tp] = {
+                    'Male':   {ht: completed[_tp]['Male'][ht] for ht in ['Perfusion', 'MERFISH', 'RNAseq']},
+                    'Female': {ht: completed[_tp]['Female'][ht] for ht in ['Perfusion', 'MERFISH', 'RNAseq']},
+                }
+            else:
+                m_perf = completed[_tp]['Male']['Perfusion']
+                f_perf = completed[_tp]['Female']['Perfusion']
+                if m_perf < f_perf:
+                    male_perf_target, female_perf_target = 6, 5
+                else:
+                    male_perf_target, female_perf_target = 5, 6
+                targets[_tp] = {
+                    'Male':   {**dict(CONFIG['HARVEST_TARGETS']), 'Perfusion': male_perf_target},
+                    'Female': {**dict(CONFIG['HARVEST_TARGETS']), 'Perfusion': female_perf_target},
+                }
 
         requirements[strain_key] = {
             'original_name': strain_str,
@@ -1319,6 +1356,88 @@ def calculate_remaining_needs(requirements: Dict) -> Dict:
     return remaining
 
 
+
+
+def check_extra_perfusion_status(requirements: Dict) -> Dict:
+    """
+    Check extra perfusion quota status per strain per timepoint.
+
+    Rule: For each strain + timepoint, one sex must have 6 perfusions
+    and the other must have at least 5 (11 total). The quota is fulfilled
+    when one sex hits 6. Once both timepoints are fulfilled the strain
+    is complete and should not receive any more perfusion scheduling.
+
+    Returns a dict keyed by strain_key:
+    {
+        'P14': {'male_completed': int, 'female_completed': int,
+                'fulfilled': bool, 'status': str},
+        'P56': { ... },
+        'strain_complete': bool   # True only if BOTH timepoints fulfilled
+    }
+    """
+    EXTRA_PERF_TARGET_HIGH = 6
+    EXTRA_PERF_TARGET_LOW  = 5
+
+    result = {}
+    for strain_key, data in requirements.items():
+        strain_result = {}
+        both_fulfilled = True
+
+        for timepoint in ['P14', 'P56']:
+            male_done   = data['completed'][timepoint]['Male']['Perfusion']
+            female_done = data['completed'][timepoint]['Female']['Perfusion']
+
+            # Fulfilled when either sex hits 6 AND the other has at least 5
+            fulfilled = (
+                (male_done >= EXTRA_PERF_TARGET_HIGH and female_done >= EXTRA_PERF_TARGET_LOW) or
+                (female_done >= EXTRA_PERF_TARGET_HIGH and male_done >= EXTRA_PERF_TARGET_LOW)
+            )
+
+            if not fulfilled:
+                both_fulfilled = False
+
+            # Build a human-readable status
+            if fulfilled:
+                status = f'✅ Complete ({male_done}M / {female_done}F)'
+            else:
+                male_needed   = max(0, EXTRA_PERF_TARGET_LOW  - male_done)
+                female_needed = max(0, EXTRA_PERF_TARGET_LOW  - female_done)
+                # One of them needs to reach 6
+                if male_done >= female_done:
+                    male_needed   = max(0, EXTRA_PERF_TARGET_HIGH - male_done)
+                    female_needed = max(0, EXTRA_PERF_TARGET_LOW  - female_done)
+                else:
+                    female_needed = max(0, EXTRA_PERF_TARGET_HIGH - female_done)
+                    male_needed   = max(0, EXTRA_PERF_TARGET_LOW  - male_done)
+                status = (f'⚠ In Progress ({male_done}M / {female_done}F) — '
+                          f'need {male_needed} more M, {female_needed} more F')
+
+            strain_result[timepoint] = {
+                'male_completed':   male_done,
+                'female_completed': female_done,
+                'fulfilled':        fulfilled,
+                'status':           status,
+            }
+
+        strain_result['strain_complete'] = both_fulfilled
+        result[strain_key] = strain_result
+
+    return result
+
+
+def is_extra_perfusion_complete(strain: str, timepoint: str,
+                                extra_perf_status: Dict) -> bool:
+    """
+    Returns True if the extra perfusion quota for this strain + timepoint
+    is already fulfilled — meaning no more perfusions should be scheduled.
+    """
+    if not extra_perf_status:
+        return False
+    strain_key = str(strain).strip().upper()
+    if strain_key not in extra_perf_status:
+        return False
+    return extra_perf_status[strain_key].get(timepoint, {}).get('fulfilled', False)
+
 def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict) -> bool:
     strain_upper = str(strain).strip().upper()
     if strain_upper in _B6_STRAINS_UPPER:
@@ -1335,7 +1454,7 @@ def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict
     return total_needed >= 1
 
 
-def create_requirements_status(remaining_needs: Dict, requirements: Dict) -> pd.DataFrame:
+def create_requirements_status(remaining_needs: Dict, requirements: Dict, extra_perf_status: Dict = None) -> pd.DataFrame:
     if not remaining_needs or not requirements:
         return pd.DataFrame()
 
@@ -1347,6 +1466,14 @@ def create_requirements_status(remaining_needs: Dict, requirements: Dict) -> pd.
         for timepoint, sexes in timepoints.items():
             for sex, harvest_types in sexes.items():
                 for harvest_type, counts in harvest_types.items():
+                    # Extra perfusion status for this strain/timepoint
+                    extra_perf_col = ''
+                    if extra_perf_status:
+                        strain_key_ep = original_strain.strip().upper()
+                        if strain_key_ep in extra_perf_status:
+                            tp_data = extra_perf_status[strain_key_ep].get(timepoint, {})
+                            extra_perf_col = tp_data.get('status', '')
+
                     status_rows.append({
                         'Strain': original_strain,
                         'Strain_Priority': 'PRIORITY' if is_priority else 'Standard',
@@ -1357,7 +1484,8 @@ def create_requirements_status(remaining_needs: Dict, requirements: Dict) -> pd.
                         'Completed': counts['completed'],
                         'Remaining': counts['needed'],
                         'Progress': f"{counts['completed']}/{counts['target']}",
-                        'Status': '✓ Complete' if counts['needed'] == 0 else f'Need {counts["needed"]} more'
+                        'Status': '✓ Complete' if counts['needed'] == 0 else f'Need {counts["needed"]} more',
+                        'Extra_Perfusion': extra_perf_col,
                     })
 
     status_df = pd.DataFrame(status_rows)
@@ -1366,6 +1494,8 @@ def create_requirements_status(remaining_needs: Dict, requirements: Dict) -> pd.
         ascending=[False, True, True, True, True]
     )
     return status_df
+
+
 
 
 # ============================================================================
@@ -1753,7 +1883,7 @@ def check_eligibility(animals_df: pd.DataFrame,
 # ANIMAL ASSIGNMENT
 # ============================================================================
 
-def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) -> pd.DataFrame:
+def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict, extra_perf_status: Dict = None) -> pd.DataFrame:
     logger.info("Assigning animals to timepoints...")
 
     if len(eligibility_df) == 0:
@@ -1851,6 +1981,14 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
         for (strain, genotype, sex, behavior_date), group in sorted_groups:
             group_sorted = group.sort_values('Animal_Name').copy()
             animals = group_sorted.to_dict('records')
+
+            if is_extra_perfusion_complete(strain, 'P56', extra_perf_status):
+                for animal in animals:
+                    animal['_quota_limited_complete_group'] = True
+                    animal['_incomplete_group'] = False
+                    animal['_extra_perf_complete'] = True
+                    p56_fallback.append(animal)
+                continue
 
             if not group_has_quota(strain, sex, 'P56', remaining_needs):
                 for animal in animals:
@@ -1964,6 +2102,12 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
 
             strain = animal.get('Strain', '')
             sex = animal.get('Sex', '')
+
+            if is_extra_perfusion_complete(strain, 'P14', extra_perf_status):
+                for animal in animals_p14:
+                    animal['_extra_perf_complete'] = True
+                    unschedulable_p14.append(animal)
+                continue
 
             if group_has_quota(strain, sex, 'P14', remaining_needs):
                 if animal.get('_quota_limited_complete_group'):
@@ -2351,11 +2495,15 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         sex        = str(row.get('Sex', '')).strip()
         key = (strain_key, timepoint, sex, htype)
         counts[key] = counts.get(key, 0) + 1
+        logger.debug(f"QUOTA COUNT: {name} → {strain_key} {timepoint} {sex} {htype} (running total: {counts[key]})")
 
     # Build the set of (strain, timepoint, sex) combos that have at least
     # one animal actually being harvested (not Extra or Do Not Schedule).
     # This ensures we only flag quota mismatches for groups with real
     # harvest animals in this run.
+    # Build set of (strain, timepoint, sex, harvest_type) combos that
+    # actually have animals selected in this run (excluding Extra/DNS).
+    # Only these specific combos should be checked for mismatches.
     present_combos = set()
     for name, htype in selections.items():
         if htype in ('Do Not Schedule', 'Extra'):
@@ -2367,20 +2515,21 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         tp = str(row.get('Assigned_Timepoint', '')).strip()
         sx = str(row.get('Sex', '')).strip()
         if tp in ('P14', 'P56'):
-            present_combos.add((sk, tp, sx))
+            present_combos.add((sk, tp, sx, htype))
 
     rows = []
     for strain_key, timepoints in remaining_needs.items():
         for timepoint, sexes in timepoints.items():
             for sex, htypes in sexes.items():
-                # Skip entirely if no animals from this group are in this run
-                if (strain_key, timepoint, sex) not in present_combos:
-                    continue
                 for htype, info in htypes.items():
-                    needed   = info['needed']
                     selected = counts.get((strain_key, timepoint, sex, htype), 0)
+                    needed   = info['needed']
+                    # Only flag if this specific harvest type was actually selected
+                    # in this run — avoids false mismatches for types not scheduled
+                    if (strain_key, timepoint, sex, htype) not in present_combos:
+                        continue
                     if needed == 0 and selected == 0:
-                        continue  # not interesting
+                        continue
                     if selected == needed:
                         status = '✓ Match'
                     elif selected > needed:
@@ -2478,8 +2627,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     left_frame.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
     # Column headers
-    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Harvest Type']
-    col_widths = [18, 12, 8, 10, 16]
+    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Harvest Type']
+    col_widths = [18, 12, 8, 10, 12, 16]
 
     hdr_row = tk.Frame(left_frame, bg='#2c3e50')
     hdr_row.pack(fill='x')
@@ -2488,6 +2637,23 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
             hdr_row, text=h, width=w, anchor='w',
             font=('Helvetica', 9, 'bold'),
             bg='#2c3e50', fg='white', padx=4, pady=4
+        ).pack(side='left')
+
+    # ── Color key ─────────────────────────────────────────────────────────────
+    key_frame = tk.Frame(left_frame, bg='#e8e8e8', pady=3)
+    key_frame.pack(fill='x')
+    tk.Label(
+        key_frame, text='Row color = selected harvest type:',
+        font=('Helvetica', 8, 'italic'), bg='#e8e8e8', fg='#555555', padx=6
+    ).pack(side='left')
+    for label, color in OPTION_COLORS.items():
+        swatch = tk.Frame(key_frame, bg=color, width=12, height=12,
+                          relief='solid', bd=1)
+        swatch.pack(side='left', padx=(4, 1), pady=2)
+        swatch.pack_propagate(False)
+        tk.Label(
+            key_frame, text=label,
+            font=('Helvetica', 8), bg='#e8e8e8', fg='#333333', padx=2
         ).pack(side='left')
 
     # Scrollable rows
@@ -2519,11 +2685,26 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     sorted_rows = sorted(schedulable.to_dict('records'), key=_harvest_sort_key)
 
     # Store StringVars so we can read them later
-    selection_vars = {}   # name → StringVar
-    row_frames     = {}   # name → tk.Frame (for recoloring)
+    selection_vars   = {}   # name → StringVar
+    selection_values = {}   # name → current value (always in sync, avoids tkinter canvas StringVar decouple bug)
+    row_frames       = {}   # name → tk.Frame (for recoloring)
+
+    def _on_type_change_cb(name, combobox, frame):
+        """Called on <<ComboboxSelected>> — reads directly from combobox widget."""
+        val = combobox.get()
+        selection_values[name] = val   # store in plain dict (reliable)
+        color = OPTION_COLORS.get(val, '#ffffff')
+        frame.configure(bg=color)
+        for w in frame.winfo_children():
+            try:
+                w.configure(bg=color)
+            except Exception:
+                pass
+        _refresh_quota_panel()
 
     def _on_type_change(name, var, frame):
         val = var.get()
+        selection_values[name] = val
         color = OPTION_COLORS.get(val, '#ffffff')
         frame.configure(bg=color)
         for w in frame.winfo_children():
@@ -2542,13 +2723,27 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
+        selection_values[name] = default   # seed plain-dict copy
 
         bg = '#ffffff' if i % 2 == 0 else '#f7f7f7'
         frame = tk.Frame(rows_frame, bg=bg)
         frame.pack(fill='x')
         row_frames[name] = frame
 
-        for val, w in zip([name, strain, sex, timepoint], col_widths[:4]):
+        # Pick the relevant date: P14 -> harvest date, P56 -> behavior date
+        # A missing date here means a scheduling logic error — flag it clearly
+        if timepoint == 'P14':
+            raw_date = str(row.get('P14_Date', '') or '')
+        else:
+            raw_date = str(row.get('P56_Behavior_Date', '') or '')
+        try:
+            from datetime import datetime as _dt
+            display_date = _dt.strptime(raw_date, '%Y-%m-%d').strftime('%m/%d/%y')
+        except Exception:
+            display_date = '⚠ NO DATE'
+            logger.warning(f"Animal {name} ({timepoint}) is scheduled but has no date — check scheduling logic")
+
+        for val, w in zip([name, strain, sex, timepoint, display_date], col_widths[:5]):
             tk.Label(
                 frame, text=val, width=w, anchor='w',
                 font=('Helvetica', 9), bg=bg, padx=4, pady=3
@@ -2561,7 +2756,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         )
         menu.pack(side='left', padx=2, pady=2)
         menu.bind('<<ComboboxSelected>>',
-                  lambda e, n=name, v=var, f=frame: _on_type_change(n, v, f))
+                  lambda e, n=name, f=frame, m=menu: _on_type_change_cb(n, m, f))
 
         # Apply initial color
         c = OPTION_COLORS.get(default, bg)
@@ -2604,7 +2799,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         for w in quota_rows_frame.winfo_children():
             w.destroy()
 
-        current = {n: v.get() for n, v in selection_vars.items()}
+        current = dict(selection_values)  # use plain-dict copy, not StringVar (avoids canvas decouple bug)
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
 
         if not quota_data:
@@ -2656,7 +2851,9 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     def _reset_to_auto():
         for name, var in selection_vars.items():
-            var.set(auto_types.get(name, 'Perfusion'))
+            val = auto_types.get(name, 'Perfusion')
+            var.set(val)
+            selection_values[name] = val  # keep plain-dict in sync
             frame = row_frames[name]
             c = OPTION_COLORS.get(var.get(), '#ffffff')
             frame.configure(bg=c)
@@ -2668,7 +2865,11 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         _refresh_quota_panel()
 
     def _confirm():
-        current = {n: v.get() for n, v in selection_vars.items()}
+        current = dict(selection_values)  # use plain-dict copy, not StringVar (avoids canvas decouple bug)
+        # Debug: log all non-Perfusion selections so we can verify they're captured
+        for _n, _h in sorted(current.items()):
+            if _h != 'Perfusion':
+                logger.info(f"CONFIRM selection: {_n} → {_h}")
 
         # ── Quota check (harvest types only, not Extra or Do Not Schedule) ────
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
@@ -4470,6 +4671,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     # Parse requirements
     requirements = parse_requirements(tracking_df)
     remaining_needs = calculate_remaining_needs(requirements)
+    extra_perf_status = check_extra_perfusion_status(requirements) if requirements else {}
 
     # Births analysis
     print("\n" + "=" * 70)
@@ -4542,7 +4744,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
     # Assignment
     print("\nAssigning animals to timepoints...")
-    assignments = assign_animals_smart(eligibility, remaining_needs)
+    assignments = assign_animals_smart(eligibility, remaining_needs, extra_perf_status)
 
     if len(assignments) > 0:
         assignments = check_capacity_and_reassign(assignments, remaining_needs)
@@ -4622,6 +4824,12 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
     # Build output sheets
     print("Creating schedule sheets...")
+    # Debug: log Harvest_Type for each animal going into P56 schedule
+    p56_debug = assignments[assignments['Assigned_Timepoint'] == 'P56'] if len(assignments) > 0 else pd.DataFrame()
+    if len(p56_debug) > 0:
+        logger.info("P56 animals entering create_p56_schedule:")
+        for _, _row in p56_debug.iterrows():
+            logger.info(f"  {_row.get('Animal_Name')} | {_row.get('Strain')} | {_row.get('Sex')} | {_row.get('Harvest_Type')} | Priority={_row.get('Priority')}")
     p14_schedule = create_p14_schedule(assignments)
     p56_schedule = create_p56_schedule(assignments)
     unschedulable = create_unschedulable_report(
@@ -4632,7 +4840,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     )
     capacity = create_capacity_summary(p56_schedule)
     strain_summary = create_strain_summary(assignments)
-    requirements_status = create_requirements_status(remaining_needs, requirements)
+    requirements_status = create_requirements_status(remaining_needs, requirements, extra_perf_status)
     genotype_summary = summarize_genotype_exclusions(genotype_excluded)
     b6_monthly_summary = create_b6_monthly_summary(assignments)
 
@@ -4715,6 +4923,9 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             'P56 Complete Cages',
             'Unschedulable',
             'HIGH Priority Animals',
+            '── EXTRA PERFUSIONS ──',
+            'Extra Perfusion Strains Complete (Both Timepoints)',
+            'Extra Perfusion Strains In Progress',
             '── B6/B6N ──',
             'B6/B6N Monthly Minimum Required',
             'B6/B6N Top-Up Animals Added',
@@ -4757,6 +4968,9 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             p56_cages,
             len(unschedulable),
             high_priority_count,
+            '',
+            sum(1 for v in extra_perf_status.values() if v.get('strain_complete', False)),
+            sum(1 for v in extra_perf_status.values() if not v.get('strain_complete', False) and requirements),
             '',
             CONFIG.get('B6_MIN_PER_MONTH', 3),
             b6_topup_count,
@@ -4811,6 +5025,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
             if len(requirements_status) > 0:
                 requirements_status.to_excel(writer, sheet_name='Requirements Status', index=False)
+
 
             if len(p14_schedule) > 0:
                 p14_schedule.to_excel(writer, sheet_name='P14 Schedule', index=False)
