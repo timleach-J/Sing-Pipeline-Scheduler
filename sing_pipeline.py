@@ -2687,6 +2687,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     # Store StringVars so we can read them later
     selection_vars   = {}   # name → StringVar
     selection_values = {}   # name → current value (always in sync, avoids tkinter canvas StringVar decouple bug)
+    selection_menus  = {}   # name → Combobox widget (for direct .get() at confirm time)
     row_frames       = {}   # name → tk.Frame (for recoloring)
 
     def _on_type_change_cb(name, combobox, frame):
@@ -2755,6 +2756,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
             state='readonly', width=col_widths[4] - 2
         )
         menu.pack(side='left', padx=2, pady=2)
+        selection_menus[name] = menu  # store widget ref for direct read at confirm
         menu.bind('<<ComboboxSelected>>',
                   lambda e, n=name, f=frame, m=menu: _on_type_change_cb(n, m, f))
 
@@ -2865,7 +2867,14 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         _refresh_quota_panel()
 
     def _confirm():
-        current = dict(selection_values)  # use plain-dict copy, not StringVar (avoids canvas decouple bug)
+        # Read directly from each combobox widget — most reliable method,
+        # bypasses StringVar decouple and callback-miss issues entirely
+        current = {}
+        for name, menu in selection_menus.items():
+            val = menu.get()
+            if not val:  # fallback to selection_values if widget returns empty
+                val = selection_values.get(name, 'Perfusion')
+            current[name] = val
         # Debug: log all non-Perfusion selections so we can verify they're captured
         for _n, _h in sorted(current.items()):
             if _h != 'Perfusion':
@@ -4796,9 +4805,16 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         if do_not_schedule:
             print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
             logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
+            # Compare as strings on both sides to avoid int/str mismatch
+            dns_str = {str(n) for n in do_not_schedule}
+            before_count = len(assignments)
             assignments = assignments[
-                ~assignments['Animal_Name'].isin(do_not_schedule)
+                ~assignments['Animal_Name'].astype(str).isin(dns_str)
             ].copy()
+            after_count = len(assignments)
+            logger.info(f"DNS filter: {before_count} → {after_count} animals (removed {before_count - after_count})")
+            # Log all animal names currently in assignments for verification
+            logger.info(f"Animals in assignments after DNS filter: {sorted(assignments['Animal_Name'].astype(str).tolist())}")
 
         # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
         harvest_overrides = {
@@ -4817,10 +4833,9 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     # Persist confirmed assignments as the override file for reference / next run
     write_harvest_overrides_template(assignments, overrides_file)
 
-    # B6/B6N monthly minimum
-    print(f"Enforcing B6/B6N minimum ({CONFIG['B6_MIN_PER_MONTH']}/month)...")
-    if len(assignments) > 0:
-        assignments = enforce_b6_monthly_minimum(assignments, eligibility, remaining_needs)
+    # B6/B6N monthly minimum enforcement disabled — managed manually
+    # if len(assignments) > 0:
+    #     assignments = enforce_b6_monthly_minimum(assignments, eligibility, remaining_needs)
 
     # Build output sheets
     print("Creating schedule sheets...")
