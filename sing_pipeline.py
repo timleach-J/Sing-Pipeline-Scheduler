@@ -78,6 +78,7 @@ CONFIG = {
     'SEXING_OFFSET_DAYS': 9,
 
     'B6_MIN_PER_MONTH': 3,
+    'P56_WEDNESDAY_CAPACITY': 18,   # max animals per P56 Wednesday (6 pens × 3)
     'B6_STRAINS': ['B6J', 'B6NJ'],
 
     'DATE_VALIDATION': {
@@ -2543,7 +2544,7 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
     return rows
 
 
-def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
+def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_selections=None):
     """
     Block the pipeline and show a GUI letting the user review and confirm
     harvest type assignments for every scheduled animal.
@@ -2587,6 +2588,11 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     # Compute auto-suggested types
     auto_types = _compute_auto_types(schedulable, remaining_needs)
+    # Apply previous confirmed selections on top of auto-suggestions
+    if previous_selections:
+        for name, htype in previous_selections.items():
+            if htype != 'DO_NOT_SCHEDULE':
+                auto_types[name] = htype
 
     # ── Build the window ──────────────────────────────────────────────────────
     root = tk.Tk()
@@ -2720,7 +2726,12 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         strain    = str(row.get('Strain', '')).strip()
         sex       = str(row.get('Sex', '')).strip()
         timepoint = str(row.get('Assigned_Timepoint', '')).strip()
-        default   = auto_types.get(name, 'Perfusion')
+        # Use previous confirmed selection if available, otherwise auto-suggest
+        default = (
+            previous_selections.get(name)
+            or previous_selections.get(str(name))
+            if previous_selections else None
+        ) or auto_types.get(name, 'Perfusion')
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
@@ -4793,36 +4804,112 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     print("=" * 70)
     overrides_file = os.path.join(output_dir, CONFIG.get('INPUT_OVERRIDES_FILE', 'harvest_overrides.csv'))
 
-    if len(assignments) > 0:
-        # Show the GUI — user reviews and confirms (or skips for auto)
-        gui_selections = prompt_harvest_assignments_gui(assignments, remaining_needs)
+    # ── Harvest review loop ───────────────────────────────────────────────────
+    # Shows GUI, removes DNS animals, finds replacements, repeats until
+    # all Wednesdays are full or no more replacements can be found.
+    P56_WEDNESDAY_CAPACITY = CONFIG.get('P56_WEDNESDAY_CAPACITY', 18)
+    all_dns = set()          # permanent DNS set across all rounds
+    harvest_overrides = {}   # accumulates confirmed selections across rounds
+    round_num = 0
 
-        # Separate out any "Do Not Schedule" animals
-        do_not_schedule = {
-            name for name, htype in gui_selections.items()
-            if htype == 'DO_NOT_SCHEDULE'
-        }
-        if do_not_schedule:
-            print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
-            logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
-            # Compare as strings on both sides to avoid int/str mismatch
-            dns_str = {str(n) for n in do_not_schedule}
-            before_count = len(assignments)
+    if len(assignments) > 0:
+        while True:
+            round_num += 1
+            logger.info(f"Harvest review round {round_num}: {len(assignments)} animals in pool")
+
+            # Show GUI — pass confirmed selections from previous rounds so dropdowns are pre-filled
+            prior = harvest_overrides if round_num > 1 else None
+            gui_selections = prompt_harvest_assignments_gui(assignments, remaining_needs, previous_selections=prior)
+
+            # Collect DNS from this round
+            new_dns = {
+                name for name, htype in gui_selections.items()
+                if htype == 'DO_NOT_SCHEDULE'
+            }
+            all_dns |= new_dns
+
+            # Remove all DNS animals (including any from previous rounds)
+            dns_str = {str(n) for n in all_dns}
             assignments = assignments[
                 ~assignments['Animal_Name'].astype(str).isin(dns_str)
             ].copy()
-            after_count = len(assignments)
-            logger.info(f"DNS filter: {before_count} → {after_count} animals (removed {before_count - after_count})")
-            # Log all animal names currently in assignments for verification
-            logger.info(f"Animals in assignments after DNS filter: {sorted(assignments['Animal_Name'].astype(str).tolist())}")
 
-        # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
-        harvest_overrides = {
-            name: htype
-            for name, htype in gui_selections.items()
-            if htype != 'DO_NOT_SCHEDULE'
-        }
+            if new_dns:
+                logger.info(f"Round {round_num} DNS: {sorted(new_dns)}")
+                logger.info(f"Assignments after DNS filter: {len(assignments)} animals")
 
+            # Update confirmed overrides (non-DNS selections from this round)
+            for name, htype in gui_selections.items():
+                if htype != 'DO_NOT_SCHEDULE':
+                    harvest_overrides[name] = htype
+
+            # Check Wednesday capacity — count P56 animals per harvest date
+            p56_assignments = assignments[
+                assignments['Assigned_Timepoint'] == 'P56'
+            ] if len(assignments) > 0 else pd.DataFrame()
+
+            if len(p56_assignments) > 0:
+                wednesday_counts = p56_assignments.groupby(
+                    'P56_Harvest_Date'
+                ).size()
+                open_slots = sum(
+                    max(0, P56_WEDNESDAY_CAPACITY - count)
+                    for count in wednesday_counts
+                )
+                # Also count Wednesdays with no animals yet (from eligibility pool)
+                all_wednesdays = set(
+                    eligibility['P56_Harvest_Date'].dropna().unique()
+                ) if 'P56_Harvest_Date' in eligibility.columns else set()
+                empty_wednesdays = all_wednesdays - set(wednesday_counts.index)
+                open_slots += len(empty_wednesdays) * P56_WEDNESDAY_CAPACITY
+            else:
+                open_slots = 0
+
+            logger.info(f"Round {round_num}: {open_slots} open P56 slots across all Wednesdays")
+
+            # If no DNS this round and no open slots, we're done
+            if not new_dns:
+                logger.info(f"No DNS animals in round {round_num} — exiting review loop")
+                break
+
+            if open_slots <= 0:
+                print("\n  ✓ All Wednesdays are full — no replacements needed.")
+                logger.info("All Wednesdays full — exiting review loop")
+                break
+
+            # Look for replacements from the unscheduled eligible pool
+            already_assigned = set(assignments['Animal_Name'].astype(str))
+            replacement_pool = eligibility[
+                ~eligibility['Animal_Name'].astype(str).isin(already_assigned | dns_str)
+            ].copy()
+
+            if len(replacement_pool) == 0:
+                print("\n  ℹ No replacement animals found for Do Not Schedule animals.")
+                logger.info("No replacements available — exiting review loop")
+                break
+
+            # Run assignment logic on replacement pool only
+            replacements = assign_animals_smart(replacement_pool, remaining_needs, extra_perf_status)
+            replacements = replacements[
+                replacements['Assigned_Timepoint'] == 'P56'
+            ].copy() if len(replacements) > 0 else pd.DataFrame()
+
+            # Trim to open slots
+            if len(replacements) > open_slots:
+                replacements = replacements.head(open_slots)
+
+            if len(replacements) == 0:
+                print("\n  ℹ No replacement animals found for Do Not Schedule animals.")
+                logger.info("No eligible replacements found — exiting review loop")
+                break
+
+            print(f"\n  ✓ Found {len(replacements)} replacement animal(s) — opening review again.")
+            logger.info(f"Round {round_num}: found {len(replacements)} replacements: {sorted(replacements['Animal_Name'].astype(str).tolist())}")
+
+            # Add replacements to assignments and loop back to GUI
+            assignments = pd.concat([assignments, replacements], ignore_index=True)
+
+        # Final harvest type assignment with all confirmed overrides
         assignments = assign_harvest_types(
             assignments, remaining_needs, requirements, harvest_overrides
         )
