@@ -4877,10 +4877,33 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
                 logger.info("All Wednesdays full — exiting review loop")
                 break
 
+            # Recompute which Wednesdays are actually full after DNS removal
+            # (blank genotype animals may have been DNS'd, freeing up slots)
+            p56_now = assignments[assignments['Assigned_Timepoint'] == 'P56'].copy() if len(assignments) > 0 else pd.DataFrame()
+            if len(p56_now) > 0 and 'P56_Behavior_Date' in p56_now.columns:
+                p56_now['P56_Behavior_Date'] = p56_now['P56_Behavior_Date'].apply(to_date)
+                wed_counts_now = p56_now.groupby('P56_Behavior_Date').size()
+                updated_full_dates = wed_counts_now[
+                    wed_counts_now >= CONFIG['WEDNESDAY_CAPACITY']
+                ].index.tolist()
+            else:
+                updated_full_dates = []
+            logger.info(f"Round {round_num}: updated full dates after DNS: {sorted(str(d) for d in updated_full_dates)}")
+
+            # Re-run blank genotype second pass with updated full dates
+            # so previously-excluded blank animals on now-open Wednesdays become candidates
+            fresh_blank_pass2 = analyze_blank_genotypes_second_pass(
+                blank_genotypes, updated_full_dates, remaining_needs
+            )
+            # Rebuild eligibility pool: original eligibility + fresh blank second pass
+            fresh_eligibility = pd.concat(
+                [eligibility, fresh_blank_pass2], ignore_index=True
+            ).drop_duplicates(subset=['Animal_Name'])
+
             # Look for replacements from the unscheduled eligible pool
             already_assigned = set(assignments['Animal_Name'].astype(str))
-            replacement_pool = eligibility[
-                ~eligibility['Animal_Name'].astype(str).isin(already_assigned | dns_str)
+            replacement_pool = fresh_eligibility[
+                ~fresh_eligibility['Animal_Name'].astype(str).isin(already_assigned | dns_str)
             ].copy()
 
             if len(replacement_pool) == 0:
