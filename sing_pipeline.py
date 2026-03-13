@@ -7561,30 +7561,76 @@ class MultiSheetExporter:
 
 
 def run_deliverables(working_df, samples_df, timestamp):
-    """STEP 2: Create multi-sheet deliverables Excel file."""
+    """STEP 2: Create multi-sheet deliverables Excel file — one file per date."""
     print("\n" + "=" * 80)
     print("STEP 2: DELIVERABLES")
     print("=" * 80)
 
     if samples_df.empty:
         print("  ✗ No sample data. Skipping.")
-        return None
+        return []
 
-    output_filename = f"Lab_Data_Export_{timestamp}.xlsx"
-    try:
-        exporter = MultiSheetExporter(
-            working_df=working_df,
-            samples_df=samples_df,
-            output_filename=output_filename
-        )
-        exporter.create_all_sheets()
-        saved_file = exporter.save()
-        print(f"\n  ✓ Step 2 complete: 4 sheets created")
-        return saved_file
-    except Exception as e:
-        print(f"  ✗ Error: {e}")
-        traceback.print_exc()
-        return None
+    # Determine the split date per animal:
+    # P14 → Harvest_Date, P56 → Envision_Date (behavior date)
+    def _get_split_date(row):
+        tp = str(row.get('Assigned_Timepoint', '')).strip()
+        if tp == 'P14':
+            return str(row.get('Harvest_Date', '') or '').strip()
+        else:
+            return str(row.get('Envision_Date', '') or '').strip()
+
+    working_df = working_df.copy()
+    working_df['_split_date'] = working_df.apply(_get_split_date, axis=1)
+
+    # Get unique dates (excluding blanks)
+    unique_dates = sorted(
+        d for d in working_df['_split_date'].unique()
+        if d and d.lower() not in ('', 'nan', 'none')
+    )
+
+    if not unique_dates:
+        print("  ✗ No valid dates found in working data. Skipping.")
+        return []
+
+    saved_files = []
+    for split_date in unique_dates:
+        # Format date for filename: 2026_04_15
+        try:
+            date_obj = pd.to_datetime(split_date)
+            date_str = date_obj.strftime('%Y_%m_%d')
+        except:
+            date_str = str(split_date).replace('/', '_').replace('-', '_')
+
+        # Filter working_df and samples_df to this date
+        wdf_date = working_df[working_df['_split_date'] == split_date].copy()
+        animal_names_date = set(wdf_date['Animal_Name'].astype(str))
+        sdf_date = samples_df[
+            samples_df['Source'].astype(str).isin(animal_names_date)
+        ].copy() if 'Source' in samples_df.columns else samples_df[
+            samples_df['Animal_Name'].astype(str).isin(animal_names_date)
+        ].copy() if 'Animal_Name' in samples_df.columns else pd.DataFrame()
+
+        if sdf_date.empty:
+            print(f"  ⚠ No samples for date {split_date} — skipping.")
+            continue
+
+        output_filename = f"Lab_Data_Export_{date_str}_{timestamp}.xlsx"
+        try:
+            exporter = MultiSheetExporter(
+                working_df=wdf_date,
+                samples_df=sdf_date,
+                output_filename=output_filename
+            )
+            exporter.create_all_sheets()
+            saved_file = exporter.save()
+            saved_files.append(saved_file)
+            print(f"  ✓ {date_str}: {len(wdf_date)} animals → {output_filename}")
+        except Exception as e:
+            print(f"  ✗ Error for date {split_date}: {e}")
+            traceback.print_exc()
+
+    print(f"\n  ✓ Step 2 complete: {len(saved_files)} file(s) created")
+    return saved_files
 
 
 # ============================================================
@@ -7646,37 +7692,17 @@ def group_animals_by_housing(df):
     return group_suffixes
 
 
-def run_climb_to_envision(working_df, timestamp):
-    """STEP 3: Create Envision translation."""
-    print("\n" + "=" * 80)
-    print("STEP 3: CLIMB TO ENVISION")
-    print("=" * 80)
-
-    if working_df.empty:
-        print("  ✗ No data. Skipping.")
-        return None
-
-    df = working_df.copy()
-
-    required = ['Genotype', 'Sex', 'Housing ID', 'Animal_Name', 'Line', 'Birth_Date']
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        print(f"  ✗ Missing columns: {missing}")
-        return None
-
-    print(f"  Processing {len(df)} animals...")
-
+def _build_envision_output_df(df):
+    """Build the Envision output DataFrame from a working_df subset."""
+    df = df.copy()
     df['genotype_base'] = df.apply(
         lambda row: clean_genotype_base(row['Genotype'], row['Line']), axis=1)
     df['sex_initial'] = df['Sex'].str[0].str.upper()
     df['Group_base'] = df['genotype_base'] + '-' + df['sex_initial']
-
     group_suffixes = group_animals_by_housing(df)
     df['Group'] = df.index.map(group_suffixes)
-
     df = assign_ear_tags_by_strain_sex(df)
     df['Genotype_clean'] = df['Genotype'].apply(clean_genotype)
-
     output_df = pd.DataFrame({
         'Group': df['Group'],
         'Cage': df['Housing ID'],
@@ -7696,37 +7722,79 @@ def run_climb_to_envision(working_df, timestamp):
         'RFID': '',
         'Tail Tattoo': ''
     })
-    output_df = output_df[ENVISION_TEMPLATE_COLUMNS]
+    return output_df[ENVISION_TEMPLATE_COLUMNS]
 
-    output_filename = f"Envision_{timestamp}.xlsx"
 
+def _save_envision_df(output_df, output_filename):
+    """Save an Envision output DataFrame to Excel."""
     wb = Workbook()
     ws = wb.active
     ws.title = 'template_csv_v1.0'
-
     for col_num, header in enumerate(ENVISION_TEMPLATE_COLUMNS, 1):
         ws.cell(row=1, column=col_num, value=header)
-
     for row_num, row_data in enumerate(output_df.values, 2):
         for col_num, value in enumerate(row_data, 1):
             cell = ws.cell(row=row_num, column=col_num)
-            if pd.isna(value):
-                cell.value = ''
-            else:
-                cell.value = value
-
+            cell.value = '' if pd.isna(value) else value
     auto_width_worksheet(ws)
     wb.save(output_filename)
 
-    print(f"  📄 Saved: {output_filename}")
-    print(f"  ✓ Step 3 complete: {len(output_df)} animals")
 
-    group_counts = output_df.groupby(['Group', 'Cage']).size().reset_index(name='Count')
-    print(f"\n  Group Summary:")
-    for _, row in group_counts.iterrows():
-        print(f"    {row['Group']} | Cage {row['Cage']} | {row['Count']} animals")
+def run_climb_to_envision(working_df, timestamp):
+    """STEP 3: Create Envision translation — one file per P56 behavior date."""
+    print("\n" + "=" * 80)
+    print("STEP 3: CLIMB TO ENVISION")
+    print("=" * 80)
 
-    return output_filename
+    if working_df.empty:
+        print("  ✗ No data. Skipping.")
+        return []
+
+    # Envision is P56 only
+    df = working_df[working_df['Assigned_Timepoint'] == 'P56'].copy()
+    if df.empty:
+        print("  ✗ No P56 animals. Skipping Envision.")
+        return []
+
+    required = ['Genotype', 'Sex', 'Housing ID', 'Animal_Name', 'Line', 'Birth_Date']
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        print(f"  ✗ Missing columns: {missing}")
+        return []
+
+    # Split by Envision_Date (behavior date)
+    df['_envision_date_str'] = df['Envision_Date'].apply(
+        lambda d: str(d).strip() if pd.notna(d) and str(d).strip() not in ('', 'nan') else ''
+    )
+    unique_dates = sorted(d for d in df['_envision_date_str'].unique() if d)
+
+    if not unique_dates:
+        print("  ✗ No valid Envision dates found. Skipping.")
+        return []
+
+    saved_files = []
+    for env_date in unique_dates:
+        try:
+            date_obj = pd.to_datetime(env_date)
+            date_str = date_obj.strftime('%Y_%m_%d')
+        except:
+            date_str = str(env_date).replace('/', '_').replace('-', '_')
+
+        df_date = df[df['_envision_date_str'] == env_date].copy()
+        output_df = _build_envision_output_df(df_date)
+        output_filename = f"Envision_{date_str}_{timestamp}.xlsx"
+        _save_envision_df(output_df, output_filename)
+
+        print(f"  📄 Saved: {output_filename} ({len(output_df)} animals)")
+
+        group_counts = output_df.groupby(['Group', 'Cage']).size().reset_index(name='Count')
+        for _, row in group_counts.iterrows():
+            print(f"    {row['Group']} | Cage {row['Cage']} | {row['Count']} animals")
+
+        saved_files.append(output_filename)
+
+    print(f"\n  ✓ Step 3 complete: {len(saved_files)} file(s) created")
+    return saved_files
 
 
 # ============================================================
