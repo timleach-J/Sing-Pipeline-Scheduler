@@ -1,8 +1,3 @@
-# ============================================================
-# Sing Pipeline
-# Version 1.2
-# ============================================================
-
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Side
@@ -78,7 +73,6 @@ CONFIG = {
     'SEXING_OFFSET_DAYS': 9,
 
     'B6_MIN_PER_MONTH': 3,
-    'P56_WEDNESDAY_CAPACITY': 18,   # max animals per P56 Wednesday (6 pens × 3)
     'B6_STRAINS': ['B6J', 'B6NJ'],
 
     'DATE_VALIDATION': {
@@ -97,7 +91,7 @@ CONFIG = {
     'RUN_TESTS': False,
 
     'HARVEST_TARGETS': {
-        'Perfusion': 5,   # Base — actual target is 5 or 6 per sex (11 total per timepoint)
+        'Perfusion': 5,
         'MERFISH': 1,
         'RNAseq': 1
     },
@@ -108,7 +102,7 @@ CONFIG = {
     ],
 
     'REQUIRED_BIRTHS_COLUMNS': [
-        'Birth ID', 'Status', 'Birth Date', 'Live Count'
+        'Birth ID', 'Status', 'Birth Date', 'Live Count', '# of Pups', 'Line (Short)', 'Dam', 'Sire'
     ],
 
     'SUPER_PRIORITY_STRAINS': [
@@ -710,10 +704,6 @@ def read_births_data(filename: str) -> Optional[pd.DataFrame]:
         return None
     df['Birth Date'] = pd.to_datetime(df['Birth Date'], errors='coerce')
     df['Birth ID'] = df['Birth ID'].astype(str)
-    # Births CSV has 'Line' (full name) but not 'Line (Short)' — use 'Line' as fallback
-    if 'Line (Short)' not in df.columns and 'Line' in df.columns:
-        df['Line (Short)'] = df['Line']
-        logger.info("Births: 'Line (Short)' not found — using 'Line' as fallback")
     logger.info(f"Loaded {len(df)} birth records")
     return df
 
@@ -1259,12 +1249,6 @@ def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
         logger.warning(f"Expected at least 15 columns, found {len(tracking_df.columns)}")
         return {}
 
-    # Filter to real strain rows only — real rows always have 'Yes' or 'No'
-    # in column 1 (P14 Decisions). Ghost/percentage rows have decimals or NaN.
-    col1_upper = tracking_df.iloc[:, 1].astype(str).str.strip().str.upper()
-    tracking_df = tracking_df[col1_upper.isin(['YES', 'NO'])].reset_index(drop=True)
-    logger.info(f"After filtering to Yes/No rows: {len(tracking_df)} strain rows")
-
     requirements = {}
     for idx, row in tracking_df.iterrows():
         strain = row.iloc[0]
@@ -1293,37 +1277,10 @@ def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
             logger.warning(f"Could not parse row for strain '{strain}': {e}")
             continue
 
-        # Read P14/P56 completion flags from tracking sheet (cols 17 and 18).
-        # These flags are maintained in the sheet and are the authoritative source.
-        def _is_complete_flag(val):
-            s = str(val).strip().upper()
-            return s in ('TRUE', 'YES', '1')
-
-        p14_complete = _is_complete_flag(row.iloc[17]) if len(row) > 17 else False
-        p56_complete = _is_complete_flag(row.iloc[18]) if len(row) > 18 else False
-
-        # Perfusion target is 11 per timepoint (one sex gets 6, other gets 5).
-        # Assign the higher target (6) to whichever sex has fewer completions.
-        # If equal, Male gets 5 and Female gets 6.
-        targets = {}
-        for _tp, _complete in [('P14', p14_complete), ('P56', p56_complete)]:
-            if _complete:
-                # Timepoint done — set targets equal to completed so needed=0
-                targets[_tp] = {
-                    'Male':   {ht: completed[_tp]['Male'][ht] for ht in ['Perfusion', 'MERFISH', 'RNAseq']},
-                    'Female': {ht: completed[_tp]['Female'][ht] for ht in ['Perfusion', 'MERFISH', 'RNAseq']},
-                }
-            else:
-                m_perf = completed[_tp]['Male']['Perfusion']
-                f_perf = completed[_tp]['Female']['Perfusion']
-                if m_perf < f_perf:
-                    male_perf_target, female_perf_target = 6, 5
-                else:
-                    male_perf_target, female_perf_target = 5, 6
-                targets[_tp] = {
-                    'Male':   {**dict(CONFIG['HARVEST_TARGETS']), 'Perfusion': male_perf_target},
-                    'Female': {**dict(CONFIG['HARVEST_TARGETS']), 'Perfusion': female_perf_target},
-                }
+        targets = {
+            'P14': {'Male': dict(CONFIG['HARVEST_TARGETS']), 'Female': dict(CONFIG['HARVEST_TARGETS'])},
+            'P56': {'Male': dict(CONFIG['HARVEST_TARGETS']), 'Female': dict(CONFIG['HARVEST_TARGETS'])}
+        }
 
         requirements[strain_key] = {
             'original_name': strain_str,
@@ -1357,88 +1314,6 @@ def calculate_remaining_needs(requirements: Dict) -> Dict:
     return remaining
 
 
-
-
-def check_extra_perfusion_status(requirements: Dict) -> Dict:
-    """
-    Check extra perfusion quota status per strain per timepoint.
-
-    Rule: For each strain + timepoint, one sex must have 6 perfusions
-    and the other must have at least 5 (11 total). The quota is fulfilled
-    when one sex hits 6. Once both timepoints are fulfilled the strain
-    is complete and should not receive any more perfusion scheduling.
-
-    Returns a dict keyed by strain_key:
-    {
-        'P14': {'male_completed': int, 'female_completed': int,
-                'fulfilled': bool, 'status': str},
-        'P56': { ... },
-        'strain_complete': bool   # True only if BOTH timepoints fulfilled
-    }
-    """
-    EXTRA_PERF_TARGET_HIGH = 6
-    EXTRA_PERF_TARGET_LOW  = 5
-
-    result = {}
-    for strain_key, data in requirements.items():
-        strain_result = {}
-        both_fulfilled = True
-
-        for timepoint in ['P14', 'P56']:
-            male_done   = data['completed'][timepoint]['Male']['Perfusion']
-            female_done = data['completed'][timepoint]['Female']['Perfusion']
-
-            # Fulfilled when either sex hits 6 AND the other has at least 5
-            fulfilled = (
-                (male_done >= EXTRA_PERF_TARGET_HIGH and female_done >= EXTRA_PERF_TARGET_LOW) or
-                (female_done >= EXTRA_PERF_TARGET_HIGH and male_done >= EXTRA_PERF_TARGET_LOW)
-            )
-
-            if not fulfilled:
-                both_fulfilled = False
-
-            # Build a human-readable status
-            if fulfilled:
-                status = f'✅ Complete ({male_done}M / {female_done}F)'
-            else:
-                male_needed   = max(0, EXTRA_PERF_TARGET_LOW  - male_done)
-                female_needed = max(0, EXTRA_PERF_TARGET_LOW  - female_done)
-                # One of them needs to reach 6
-                if male_done >= female_done:
-                    male_needed   = max(0, EXTRA_PERF_TARGET_HIGH - male_done)
-                    female_needed = max(0, EXTRA_PERF_TARGET_LOW  - female_done)
-                else:
-                    female_needed = max(0, EXTRA_PERF_TARGET_HIGH - female_done)
-                    male_needed   = max(0, EXTRA_PERF_TARGET_LOW  - male_done)
-                status = (f'⚠ In Progress ({male_done}M / {female_done}F) — '
-                          f'need {male_needed} more M, {female_needed} more F')
-
-            strain_result[timepoint] = {
-                'male_completed':   male_done,
-                'female_completed': female_done,
-                'fulfilled':        fulfilled,
-                'status':           status,
-            }
-
-        strain_result['strain_complete'] = both_fulfilled
-        result[strain_key] = strain_result
-
-    return result
-
-
-def is_extra_perfusion_complete(strain: str, timepoint: str,
-                                extra_perf_status: Dict) -> bool:
-    """
-    Returns True if the extra perfusion quota for this strain + timepoint
-    is already fulfilled — meaning no more perfusions should be scheduled.
-    """
-    if not extra_perf_status:
-        return False
-    strain_key = str(strain).strip().upper()
-    if strain_key not in extra_perf_status:
-        return False
-    return extra_perf_status[strain_key].get(timepoint, {}).get('fulfilled', False)
-
 def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict) -> bool:
     strain_upper = str(strain).strip().upper()
     if strain_upper in _B6_STRAINS_UPPER:
@@ -1455,7 +1330,7 @@ def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict
     return total_needed >= 1
 
 
-def create_requirements_status(remaining_needs: Dict, requirements: Dict, extra_perf_status: Dict = None) -> pd.DataFrame:
+def create_requirements_status(remaining_needs: Dict, requirements: Dict) -> pd.DataFrame:
     if not remaining_needs or not requirements:
         return pd.DataFrame()
 
@@ -1467,14 +1342,6 @@ def create_requirements_status(remaining_needs: Dict, requirements: Dict, extra_
         for timepoint, sexes in timepoints.items():
             for sex, harvest_types in sexes.items():
                 for harvest_type, counts in harvest_types.items():
-                    # Extra perfusion status for this strain/timepoint
-                    extra_perf_col = ''
-                    if extra_perf_status:
-                        strain_key_ep = original_strain.strip().upper()
-                        if strain_key_ep in extra_perf_status:
-                            tp_data = extra_perf_status[strain_key_ep].get(timepoint, {})
-                            extra_perf_col = tp_data.get('status', '')
-
                     status_rows.append({
                         'Strain': original_strain,
                         'Strain_Priority': 'PRIORITY' if is_priority else 'Standard',
@@ -1485,8 +1352,7 @@ def create_requirements_status(remaining_needs: Dict, requirements: Dict, extra_
                         'Completed': counts['completed'],
                         'Remaining': counts['needed'],
                         'Progress': f"{counts['completed']}/{counts['target']}",
-                        'Status': '✓ Complete' if counts['needed'] == 0 else f'Need {counts["needed"]} more',
-                        'Extra_Perfusion': extra_perf_col,
+                        'Status': '✓ Complete' if counts['needed'] == 0 else f'Need {counts["needed"]} more'
                     })
 
     status_df = pd.DataFrame(status_rows)
@@ -1495,8 +1361,6 @@ def create_requirements_status(remaining_needs: Dict, requirements: Dict, extra_
         ascending=[False, True, True, True, True]
     )
     return status_df
-
-
 
 
 # ============================================================================
@@ -1884,7 +1748,7 @@ def check_eligibility(animals_df: pd.DataFrame,
 # ANIMAL ASSIGNMENT
 # ============================================================================
 
-def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict, extra_perf_status: Dict = None) -> pd.DataFrame:
+def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) -> pd.DataFrame:
     logger.info("Assigning animals to timepoints...")
 
     if len(eligibility_df) == 0:
@@ -1982,14 +1846,6 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict, ex
         for (strain, genotype, sex, behavior_date), group in sorted_groups:
             group_sorted = group.sort_values('Animal_Name').copy()
             animals = group_sorted.to_dict('records')
-
-            if is_extra_perfusion_complete(strain, 'P56', extra_perf_status):
-                for animal in animals:
-                    animal['_quota_limited_complete_group'] = True
-                    animal['_incomplete_group'] = False
-                    animal['_extra_perf_complete'] = True
-                    p56_fallback.append(animal)
-                continue
 
             if not group_has_quota(strain, sex, 'P56', remaining_needs):
                 for animal in animals:
@@ -2103,12 +1959,6 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict, ex
 
             strain = animal.get('Strain', '')
             sex = animal.get('Sex', '')
-
-            if is_extra_perfusion_complete(strain, 'P14', extra_perf_status):
-                for animal in animals_p14:
-                    animal['_extra_perf_complete'] = True
-                    unschedulable_p14.append(animal)
-                continue
 
             if group_has_quota(strain, sex, 'P14', remaining_needs):
                 if animal.get('_quota_limited_complete_group'):
@@ -2496,15 +2346,11 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         sex        = str(row.get('Sex', '')).strip()
         key = (strain_key, timepoint, sex, htype)
         counts[key] = counts.get(key, 0) + 1
-        logger.debug(f"QUOTA COUNT: {name} → {strain_key} {timepoint} {sex} {htype} (running total: {counts[key]})")
 
     # Build the set of (strain, timepoint, sex) combos that have at least
     # one animal actually being harvested (not Extra or Do Not Schedule).
     # This ensures we only flag quota mismatches for groups with real
     # harvest animals in this run.
-    # Build set of (strain, timepoint, sex, harvest_type) combos that
-    # actually have animals selected in this run (excluding Extra/DNS).
-    # Only these specific combos should be checked for mismatches.
     present_combos = set()
     for name, htype in selections.items():
         if htype in ('Do Not Schedule', 'Extra'):
@@ -2516,21 +2362,20 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         tp = str(row.get('Assigned_Timepoint', '')).strip()
         sx = str(row.get('Sex', '')).strip()
         if tp in ('P14', 'P56'):
-            present_combos.add((sk, tp, sx, htype))
+            present_combos.add((sk, tp, sx))
 
     rows = []
     for strain_key, timepoints in remaining_needs.items():
         for timepoint, sexes in timepoints.items():
             for sex, htypes in sexes.items():
+                # Skip entirely if no animals from this group are in this run
+                if (strain_key, timepoint, sex) not in present_combos:
+                    continue
                 for htype, info in htypes.items():
-                    selected = counts.get((strain_key, timepoint, sex, htype), 0)
                     needed   = info['needed']
-                    # Only flag if this specific harvest type was actually selected
-                    # in this run — avoids false mismatches for types not scheduled
-                    if (strain_key, timepoint, sex, htype) not in present_combos:
-                        continue
+                    selected = counts.get((strain_key, timepoint, sex, htype), 0)
                     if needed == 0 and selected == 0:
-                        continue
+                        continue  # not interesting
                     if selected == needed:
                         status = '✓ Match'
                     elif selected > needed:
@@ -2544,7 +2389,7 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
     return rows
 
 
-def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_selections=None):
+def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     """
     Block the pipeline and show a GUI letting the user review and confirm
     harvest type assignments for every scheduled animal.
@@ -2588,11 +2433,6 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
 
     # Compute auto-suggested types
     auto_types = _compute_auto_types(schedulable, remaining_needs)
-    # Apply previous confirmed selections on top of auto-suggestions
-    if previous_selections:
-        for name, htype in previous_selections.items():
-            if htype != 'DO_NOT_SCHEDULE':
-                auto_types[name] = htype
 
     # ── Build the window ──────────────────────────────────────────────────────
     root = tk.Tk()
@@ -2633,8 +2473,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
     left_frame.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
     # Column headers
-    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Harvest Type']
-    col_widths = [18, 12, 8, 10, 12, 16]
+    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Harvest Type']
+    col_widths = [18, 12, 8, 10, 16]
 
     hdr_row = tk.Frame(left_frame, bg='#2c3e50')
     hdr_row.pack(fill='x')
@@ -2643,23 +2483,6 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
             hdr_row, text=h, width=w, anchor='w',
             font=('Helvetica', 9, 'bold'),
             bg='#2c3e50', fg='white', padx=4, pady=4
-        ).pack(side='left')
-
-    # ── Color key ─────────────────────────────────────────────────────────────
-    key_frame = tk.Frame(left_frame, bg='#e8e8e8', pady=3)
-    key_frame.pack(fill='x')
-    tk.Label(
-        key_frame, text='Row color = selected harvest type:',
-        font=('Helvetica', 8, 'italic'), bg='#e8e8e8', fg='#555555', padx=6
-    ).pack(side='left')
-    for label, color in OPTION_COLORS.items():
-        swatch = tk.Frame(key_frame, bg=color, width=12, height=12,
-                          relief='solid', bd=1)
-        swatch.pack(side='left', padx=(4, 1), pady=2)
-        swatch.pack_propagate(False)
-        tk.Label(
-            key_frame, text=label,
-            font=('Helvetica', 8), bg='#e8e8e8', fg='#333333', padx=2
         ).pack(side='left')
 
     # Scrollable rows
@@ -2691,27 +2514,11 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
     sorted_rows = sorted(schedulable.to_dict('records'), key=_harvest_sort_key)
 
     # Store StringVars so we can read them later
-    selection_vars   = {}   # name → StringVar
-    selection_values = {}   # name → current value (always in sync, avoids tkinter canvas StringVar decouple bug)
-    selection_menus  = {}   # name → Combobox widget (for direct .get() at confirm time)
-    row_frames       = {}   # name → tk.Frame (for recoloring)
-
-    def _on_type_change_cb(name, combobox, frame):
-        """Called on <<ComboboxSelected>> — reads directly from combobox widget."""
-        val = combobox.get()
-        selection_values[name] = val   # store in plain dict (reliable)
-        color = OPTION_COLORS.get(val, '#ffffff')
-        frame.configure(bg=color)
-        for w in frame.winfo_children():
-            try:
-                w.configure(bg=color)
-            except Exception:
-                pass
-        _refresh_quota_panel()
+    selection_vars = {}   # name → StringVar
+    row_frames     = {}   # name → tk.Frame (for recoloring)
 
     def _on_type_change(name, var, frame):
         val = var.get()
-        selection_values[name] = val
         color = OPTION_COLORS.get(val, '#ffffff')
         frame.configure(bg=color)
         for w in frame.winfo_children():
@@ -2726,36 +2533,17 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
         strain    = str(row.get('Strain', '')).strip()
         sex       = str(row.get('Sex', '')).strip()
         timepoint = str(row.get('Assigned_Timepoint', '')).strip()
-        # Use previous confirmed selection if available, otherwise auto-suggest
-        default = (
-            previous_selections.get(name)
-            or previous_selections.get(str(name))
-            if previous_selections else None
-        ) or auto_types.get(name, 'Perfusion')
+        default   = auto_types.get(name, 'Perfusion')
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
-        selection_values[name] = default   # seed plain-dict copy
 
         bg = '#ffffff' if i % 2 == 0 else '#f7f7f7'
         frame = tk.Frame(rows_frame, bg=bg)
         frame.pack(fill='x')
         row_frames[name] = frame
 
-        # Pick the relevant date: P14 -> harvest date, P56 -> behavior date
-        # A missing date here means a scheduling logic error — flag it clearly
-        if timepoint == 'P14':
-            raw_date = str(row.get('P14_Date', '') or '')
-        else:
-            raw_date = str(row.get('P56_Behavior_Date', '') or '')
-        try:
-            from datetime import datetime as _dt
-            display_date = _dt.strptime(raw_date, '%Y-%m-%d').strftime('%m/%d/%y')
-        except Exception:
-            display_date = '⚠ NO DATE'
-            logger.warning(f"Animal {name} ({timepoint}) is scheduled but has no date — check scheduling logic")
-
-        for val, w in zip([name, strain, sex, timepoint, display_date], col_widths[:5]):
+        for val, w in zip([name, strain, sex, timepoint], col_widths[:4]):
             tk.Label(
                 frame, text=val, width=w, anchor='w',
                 font=('Helvetica', 9), bg=bg, padx=4, pady=3
@@ -2767,9 +2555,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
             state='readonly', width=col_widths[4] - 2
         )
         menu.pack(side='left', padx=2, pady=2)
-        selection_menus[name] = menu  # store widget ref for direct read at confirm
         menu.bind('<<ComboboxSelected>>',
-                  lambda e, n=name, f=frame, m=menu: _on_type_change_cb(n, m, f))
+                  lambda e, n=name, v=var, f=frame: _on_type_change(n, v, f))
 
         # Apply initial color
         c = OPTION_COLORS.get(default, bg)
@@ -2812,7 +2599,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
         for w in quota_rows_frame.winfo_children():
             w.destroy()
 
-        current = dict(selection_values)  # use plain-dict copy, not StringVar (avoids canvas decouple bug)
+        current = {n: v.get() for n, v in selection_vars.items()}
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
 
         if not quota_data:
@@ -2864,9 +2651,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
 
     def _reset_to_auto():
         for name, var in selection_vars.items():
-            val = auto_types.get(name, 'Perfusion')
-            var.set(val)
-            selection_values[name] = val  # keep plain-dict in sync
+            var.set(auto_types.get(name, 'Perfusion'))
             frame = row_frames[name]
             c = OPTION_COLORS.get(var.get(), '#ffffff')
             frame.configure(bg=c)
@@ -2878,18 +2663,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, previous_sel
         _refresh_quota_panel()
 
     def _confirm():
-        # Read directly from each combobox widget — most reliable method,
-        # bypasses StringVar decouple and callback-miss issues entirely
-        current = {}
-        for name, menu in selection_menus.items():
-            val = menu.get()
-            if not val:  # fallback to selection_values if widget returns empty
-                val = selection_values.get(name, 'Perfusion')
-            current[name] = val
-        # Debug: log all non-Perfusion selections so we can verify they're captured
-        for _n, _h in sorted(current.items()):
-            if _h != 'Perfusion':
-                logger.info(f"CONFIRM selection: {_n} → {_h}")
+        current = {n: v.get() for n, v in selection_vars.items()}
 
         # ── Quota check (harvest types only, not Extra or Do Not Schedule) ────
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
@@ -4691,7 +4465,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     # Parse requirements
     requirements = parse_requirements(tracking_df)
     remaining_needs = calculate_remaining_needs(requirements)
-    extra_perf_status = check_extra_perfusion_status(requirements) if requirements else {}
 
     # Births analysis
     print("\n" + "=" * 70)
@@ -4764,7 +4537,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
     # Assignment
     print("\nAssigning animals to timepoints...")
-    assignments = assign_animals_smart(eligibility, remaining_needs, extra_perf_status)
+    assignments = assign_animals_smart(eligibility, remaining_needs)
 
     if len(assignments) > 0:
         assignments = check_capacity_and_reassign(assignments, remaining_needs)
@@ -4804,135 +4577,29 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     print("=" * 70)
     overrides_file = os.path.join(output_dir, CONFIG.get('INPUT_OVERRIDES_FILE', 'harvest_overrides.csv'))
 
-    # ── Harvest review loop ───────────────────────────────────────────────────
-    # Shows GUI, removes DNS animals, finds replacements, repeats until
-    # all Wednesdays are full or no more replacements can be found.
-    P56_WEDNESDAY_CAPACITY = CONFIG.get('P56_WEDNESDAY_CAPACITY', 18)
-    all_dns = set()          # permanent DNS set across all rounds
-    harvest_overrides = {}   # accumulates confirmed selections across rounds
-    round_num = 0
-
     if len(assignments) > 0:
-        while True:
-            round_num += 1
-            logger.info(f"Harvest review round {round_num}: {len(assignments)} animals in pool")
+        # Show the GUI — user reviews and confirms (or skips for auto)
+        gui_selections = prompt_harvest_assignments_gui(assignments, remaining_needs)
 
-            # Show GUI — pass confirmed selections from previous rounds so dropdowns are pre-filled
-            prior = harvest_overrides if round_num > 1 else None
-            gui_selections = prompt_harvest_assignments_gui(assignments, remaining_needs, previous_selections=prior)
-
-            # Collect DNS from this round
-            new_dns = {
-                name for name, htype in gui_selections.items()
-                if htype == 'DO_NOT_SCHEDULE'
-            }
-            all_dns |= new_dns
-
-            # Remove all DNS animals (including any from previous rounds)
-            dns_str = {str(n) for n in all_dns}
+        # Separate out any "Do Not Schedule" animals
+        do_not_schedule = {
+            name for name, htype in gui_selections.items()
+            if htype == 'DO_NOT_SCHEDULE'
+        }
+        if do_not_schedule:
+            print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
+            logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
             assignments = assignments[
-                ~assignments['Animal_Name'].astype(str).isin(dns_str)
+                ~assignments['Animal_Name'].isin(do_not_schedule)
             ].copy()
 
-            if new_dns:
-                logger.info(f"Round {round_num} DNS: {sorted(new_dns)}")
-                logger.info(f"Assignments after DNS filter: {len(assignments)} animals")
+        # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
+        harvest_overrides = {
+            name: htype
+            for name, htype in gui_selections.items()
+            if htype != 'DO_NOT_SCHEDULE'
+        }
 
-            # Update confirmed overrides (non-DNS selections from this round)
-            for name, htype in gui_selections.items():
-                if htype != 'DO_NOT_SCHEDULE':
-                    harvest_overrides[name] = htype
-
-            # Check Wednesday capacity — count P56 animals per harvest date
-            p56_assignments = assignments[
-                assignments['Assigned_Timepoint'] == 'P56'
-            ] if len(assignments) > 0 else pd.DataFrame()
-
-            if len(p56_assignments) > 0:
-                wednesday_counts = p56_assignments.groupby(
-                    'P56_Harvest_Date'
-                ).size()
-                open_slots = sum(
-                    max(0, P56_WEDNESDAY_CAPACITY - count)
-                    for count in wednesday_counts
-                )
-                # Also count Wednesdays with no animals yet (from eligibility pool)
-                all_wednesdays = set(
-                    eligibility['P56_Harvest_Date'].dropna().unique()
-                ) if 'P56_Harvest_Date' in eligibility.columns else set()
-                empty_wednesdays = all_wednesdays - set(wednesday_counts.index)
-                open_slots += len(empty_wednesdays) * P56_WEDNESDAY_CAPACITY
-            else:
-                open_slots = 0
-
-            logger.info(f"Round {round_num}: {open_slots} open P56 slots across all Wednesdays")
-
-            # If no DNS this round and no open slots, we're done
-            if not new_dns:
-                logger.info(f"No DNS animals in round {round_num} — exiting review loop")
-                break
-
-            if open_slots <= 0:
-                print("\n  ✓ All Wednesdays are full — no replacements needed.")
-                logger.info("All Wednesdays full — exiting review loop")
-                break
-
-            # Recompute which Wednesdays are actually full after DNS removal
-            # (blank genotype animals may have been DNS'd, freeing up slots)
-            p56_now = assignments[assignments['Assigned_Timepoint'] == 'P56'].copy() if len(assignments) > 0 else pd.DataFrame()
-            if len(p56_now) > 0 and 'P56_Behavior_Date' in p56_now.columns:
-                p56_now['P56_Behavior_Date'] = p56_now['P56_Behavior_Date'].apply(to_date)
-                wed_counts_now = p56_now.groupby('P56_Behavior_Date').size()
-                updated_full_dates = wed_counts_now[
-                    wed_counts_now >= CONFIG['WEDNESDAY_CAPACITY']
-                ].index.tolist()
-            else:
-                updated_full_dates = []
-            logger.info(f"Round {round_num}: updated full dates after DNS: {sorted(str(d) for d in updated_full_dates)}")
-
-            # Re-run blank genotype second pass with updated full dates
-            # so previously-excluded blank animals on now-open Wednesdays become candidates
-            fresh_blank_pass2 = analyze_blank_genotypes_second_pass(
-                blank_genotypes, updated_full_dates, remaining_needs
-            )
-            # Rebuild eligibility pool: original eligibility + fresh blank second pass
-            fresh_eligibility = pd.concat(
-                [eligibility, fresh_blank_pass2], ignore_index=True
-            ).drop_duplicates(subset=['Animal_Name'])
-
-            # Look for replacements from the unscheduled eligible pool
-            already_assigned = set(assignments['Animal_Name'].astype(str))
-            replacement_pool = fresh_eligibility[
-                ~fresh_eligibility['Animal_Name'].astype(str).isin(already_assigned | dns_str)
-            ].copy()
-
-            if len(replacement_pool) == 0:
-                print("\n  ℹ No replacement animals found for Do Not Schedule animals.")
-                logger.info("No replacements available — exiting review loop")
-                break
-
-            # Run assignment logic on replacement pool only
-            replacements = assign_animals_smart(replacement_pool, remaining_needs, extra_perf_status)
-            replacements = replacements[
-                replacements['Assigned_Timepoint'] == 'P56'
-            ].copy() if len(replacements) > 0 else pd.DataFrame()
-
-            # Trim to open slots
-            if len(replacements) > open_slots:
-                replacements = replacements.head(open_slots)
-
-            if len(replacements) == 0:
-                print("\n  ℹ No replacement animals found for Do Not Schedule animals.")
-                logger.info("No eligible replacements found — exiting review loop")
-                break
-
-            print(f"\n  ✓ Found {len(replacements)} replacement animal(s) — opening review again.")
-            logger.info(f"Round {round_num}: found {len(replacements)} replacements: {sorted(replacements['Animal_Name'].astype(str).tolist())}")
-
-            # Add replacements to assignments and loop back to GUI
-            assignments = pd.concat([assignments, replacements], ignore_index=True)
-
-        # Final harvest type assignment with all confirmed overrides
         assignments = assign_harvest_types(
             assignments, remaining_needs, requirements, harvest_overrides
         )
@@ -4943,18 +4610,13 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     # Persist confirmed assignments as the override file for reference / next run
     write_harvest_overrides_template(assignments, overrides_file)
 
-    # B6/B6N monthly minimum enforcement disabled — managed manually
-    # if len(assignments) > 0:
-    #     assignments = enforce_b6_monthly_minimum(assignments, eligibility, remaining_needs)
+    # B6/B6N monthly minimum
+    print(f"Enforcing B6/B6N minimum ({CONFIG['B6_MIN_PER_MONTH']}/month)...")
+    if len(assignments) > 0:
+        assignments = enforce_b6_monthly_minimum(assignments, eligibility, remaining_needs)
 
     # Build output sheets
     print("Creating schedule sheets...")
-    # Debug: log Harvest_Type for each animal going into P56 schedule
-    p56_debug = assignments[assignments['Assigned_Timepoint'] == 'P56'] if len(assignments) > 0 else pd.DataFrame()
-    if len(p56_debug) > 0:
-        logger.info("P56 animals entering create_p56_schedule:")
-        for _, _row in p56_debug.iterrows():
-            logger.info(f"  {_row.get('Animal_Name')} | {_row.get('Strain')} | {_row.get('Sex')} | {_row.get('Harvest_Type')} | Priority={_row.get('Priority')}")
     p14_schedule = create_p14_schedule(assignments)
     p56_schedule = create_p56_schedule(assignments)
     unschedulable = create_unschedulable_report(
@@ -4965,7 +4627,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     )
     capacity = create_capacity_summary(p56_schedule)
     strain_summary = create_strain_summary(assignments)
-    requirements_status = create_requirements_status(remaining_needs, requirements, extra_perf_status)
+    requirements_status = create_requirements_status(remaining_needs, requirements)
     genotype_summary = summarize_genotype_exclusions(genotype_excluded)
     b6_monthly_summary = create_b6_monthly_summary(assignments)
 
@@ -5048,9 +4710,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             'P56 Complete Cages',
             'Unschedulable',
             'HIGH Priority Animals',
-            '── EXTRA PERFUSIONS ──',
-            'Extra Perfusion Strains Complete (Both Timepoints)',
-            'Extra Perfusion Strains In Progress',
             '── B6/B6N ──',
             'B6/B6N Monthly Minimum Required',
             'B6/B6N Top-Up Animals Added',
@@ -5093,9 +4752,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             p56_cages,
             len(unschedulable),
             high_priority_count,
-            '',
-            sum(1 for v in extra_perf_status.values() if v.get('strain_complete', False)),
-            sum(1 for v in extra_perf_status.values() if not v.get('strain_complete', False) and requirements),
             '',
             CONFIG.get('B6_MIN_PER_MONTH', 3),
             b6_topup_count,
@@ -5150,7 +4806,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
             if len(requirements_status) > 0:
                 requirements_status.to_excel(writer, sheet_name='Requirements Status', index=False)
-
 
             if len(p14_schedule) > 0:
                 p14_schedule.to_excel(writer, sheet_name='P14 Schedule', index=False)
@@ -7012,14 +6667,6 @@ def build_working_data(all_animals_df):
     before = len(df)
     df = df[df['Assigned_Timepoint'] != 'Unschedulable'].copy()
     print(f"  Filtered: {before - len(df)} Unschedulable removed")
-
-    # Remove Do Not Schedule animals only — Extras still appear on the
-    # harvest worksheet for day-of paperwork, but generate no samples or labels
-    before2 = len(df)
-    df = df[~df['Harvest_Type'].isin(['DO_NOT_SCHEDULE', 'Do Not Schedule'])].copy()
-    filtered2 = before2 - len(df)
-    if filtered2 > 0:
-        print(f"  Filtered: {filtered2} Do Not Schedule removed from harvest pipeline")
     print(f"  Remaining: {len(df)} animals")
 
     df['Protocol'] = df.apply(
@@ -7160,7 +6807,7 @@ def run_harvest_and_samples(working_df, timestamp):
             'Line': row.get('Line (Short)', ''),
             'BD': birth_date_str,
             'Housing': row.get('Housing ID', ''),
-            'Identification': row.get('Marker_Type', ''),
+            'Identification': row.get('Marker', ''),
             'Sex': row.get('Sex', ''),
             'Age (Days)': row.get('Age_Days', ''),
             'Envision Date': envision_date_str,
@@ -7197,15 +6844,36 @@ def run_harvest_and_samples(working_df, timestamp):
         print(f"    First row: {samples_for_chain.iloc[0].to_dict()}")
         print(f"    Unique Source values (first 5): {samples_for_chain['Source'].unique()[:5].tolist()}")
 
-    # Save Harvest Sheet Import
-    harvest_file = f"Harvest_Sheet_Import_{timestamp}.xlsx"
-    save_df_to_excel(harvest_df, harvest_file, sheet_name='Harvest Worksheet')
-    print(f"\n  📄 Saved: {harvest_file}")
+    # Save Harvest Sheet Import — one file per harvest date
+    harvest_dates = harvest_df['Harvest Date'].dropna().unique() if 'Harvest Date' in harvest_df.columns else []
+    if len(harvest_dates) == 0:
+        harvest_file = f"Harvest_Sheet_Import_{timestamp}.xlsx"
+        save_df_to_excel(harvest_df, harvest_file, sheet_name='Harvest Worksheet')
+        print(f"\n  📄 Saved: {harvest_file}")
+    else:
+        for hdate in sorted(harvest_dates):
+            date_str = pd.to_datetime(hdate).strftime('%Y_%m_%d') if hdate else 'Unknown'
+            subset = harvest_df[harvest_df['Harvest Date'] == hdate]
+            harvest_file = f"Harvest_Sheet_Import_{date_str}_{timestamp}.xlsx"
+            save_df_to_excel(subset, harvest_file, sheet_name='Harvest Worksheet')
+            print(f"\n  📄 Saved: {harvest_file}")
 
-    # Save Climb Sample Import
-    climb_file = f"Climb_Sample_Import_{timestamp}.xlsx"
-    save_df_to_excel(climb_import_df, climb_file, sheet_name='Samples')
-    print(f"  📄 Saved: {climb_file}")
+    # Save Climb Sample Import — one CSV per harvest date
+    climb_dates = climb_import_df['Date Harvest'].dropna().unique() if 'Date Harvest' in climb_import_df.columns else []
+    if len(climb_dates) == 0:
+        climb_file = f"Climb_Sample_Import_{timestamp}.csv"
+        climb_import_df.to_csv(climb_file, index=False)
+        print(f"  📄 Saved: {climb_file}")
+    else:
+        for cdate in sorted(climb_dates):
+            try:
+                date_str = pd.to_datetime(cdate).strftime('%Y_%m_%d') if cdate else 'Unknown'
+            except:
+                date_str = str(cdate).replace('/', '_').replace('-', '_')
+            subset = climb_import_df[climb_import_df['Date Harvest'] == cdate]
+            climb_file = f"Climb_Sample_Import_{date_str}_{timestamp}.csv"
+            subset.to_csv(climb_file, index=False)
+            print(f"  📄 Saved: {climb_file}")
 
     print(f"\n  ✓ Steps 0+1 complete:")
     print(f"    {len(harvest_df)} animals on harvest worksheet")
@@ -7322,7 +6990,7 @@ class MultiSheetExporter:
                         'Line': self._safe_get(row, 'Line (Short)', 'Line', 'Strain'),
                         'BD': self._safe_get(row, 'Birth_Date'),
                         'Housing': self._safe_get(row, 'Housing ID'),
-                        'Identification': self._safe_get(row, 'Marker_Type', 'Marker'),
+                        'Identification': self._safe_get(row, 'Marker', 'Marker_Type'),
                         'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
                         'Age (Days)': self._safe_get(row, 'Age_Days',
                                                       'P56_Age_At_Harvest_Days',
@@ -7561,76 +7229,70 @@ class MultiSheetExporter:
 
 
 def run_deliverables(working_df, samples_df, timestamp):
-    """STEP 2: Create multi-sheet deliverables Excel file — one file per date."""
+    """STEP 2: Create multi-sheet deliverables Excel files — one per harvest date."""
     print("\n" + "=" * 80)
     print("STEP 2: DELIVERABLES")
     print("=" * 80)
 
     if samples_df.empty:
         print("  ✗ No sample data. Skipping.")
-        return []
+        return None
 
-    # Determine the split date per animal:
-    # P14 → Harvest_Date, P56 → Envision_Date (behavior date)
-    def _get_split_date(row):
-        tp = str(row.get('Assigned_Timepoint', '')).strip()
-        if tp == 'P14':
-            return str(row.get('Harvest_Date', '') or '').strip()
-        else:
-            return str(row.get('Envision_Date', '') or '').strip()
-
-    working_df = working_df.copy()
-    working_df['_split_date'] = working_df.apply(_get_split_date, axis=1)
-
-    # Get unique dates (excluding blanks)
-    unique_dates = sorted(
-        d for d in working_df['_split_date'].unique()
-        if d and d.lower() not in ('', 'nan', 'none')
-    )
-
-    if not unique_dates:
-        print("  ✗ No valid dates found in working data. Skipping.")
-        return []
-
+    # Determine harvest dates from working_df
+    date_col = 'Harvest_Date'
     saved_files = []
-    for split_date in unique_dates:
-        # Format date for filename: 2026_04_15
+
+    if date_col not in working_df.columns or working_df[date_col].dropna().empty:
+        # No date column — fall back to single file
+        output_filename = f"Lab_Data_Export_{timestamp}.xlsx"
         try:
-            date_obj = pd.to_datetime(split_date)
-            date_str = date_obj.strftime('%Y_%m_%d')
+            exporter = MultiSheetExporter(working_df=working_df, samples_df=samples_df,
+                                          output_filename=output_filename)
+            exporter.create_all_sheets()
+            saved_files.append(exporter.save())
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            traceback.print_exc()
+        print(f"\n  ✓ Step 2 complete: 1 file, 4 sheets")
+        return saved_files
+
+    harvest_dates = sorted(working_df[date_col].dropna().unique(),
+                           key=lambda d: pd.to_datetime(d, errors='coerce') or d)
+
+    for hdate in harvest_dates:
+        try:
+            date_str = pd.to_datetime(hdate).strftime('%Y_%m_%d')
         except:
-            date_str = str(split_date).replace('/', '_').replace('-', '_')
+            date_str = str(hdate).replace('/', '_').replace('-', '_')
 
-        # Filter working_df and samples_df to this date
-        wdf_date = working_df[working_df['_split_date'] == split_date].copy()
-        animal_names_date = set(wdf_date['Animal_Name'].astype(str))
-        sdf_date = samples_df[
-            samples_df['Source'].astype(str).isin(animal_names_date)
-        ].copy() if 'Source' in samples_df.columns else samples_df[
-            samples_df['Animal_Name'].astype(str).isin(animal_names_date)
-        ].copy() if 'Animal_Name' in samples_df.columns else pd.DataFrame()
+        # Filter working_df to this date
+        w_subset = working_df[working_df[date_col] == hdate]
 
-        if sdf_date.empty:
-            print(f"  ⚠ No samples for date {split_date} — skipping.")
+        # Filter samples_df to animals in this date's working subset
+        animals_this_date = set(w_subset['Animal_Name'].astype(str).str.strip())
+        src_col = 'Source' if 'Source' in samples_df.columns else (
+                  'Animal_Name' if 'Animal_Name' in samples_df.columns else None)
+        if src_col:
+            s_subset = samples_df[samples_df[src_col].astype(str).str.strip().isin(animals_this_date)]
+        else:
+            s_subset = samples_df
+
+        if w_subset.empty or s_subset.empty:
+            print(f"  ⚠ No data for date {date_str}, skipping.")
             continue
 
         output_filename = f"Lab_Data_Export_{date_str}_{timestamp}.xlsx"
         try:
-            exporter = MultiSheetExporter(
-                working_df=wdf_date,
-                samples_df=sdf_date,
-                output_filename=output_filename
-            )
+            exporter = MultiSheetExporter(working_df=w_subset, samples_df=s_subset,
+                                          output_filename=output_filename)
             exporter.create_all_sheets()
-            saved_file = exporter.save()
-            saved_files.append(saved_file)
-            print(f"  ✓ {date_str}: {len(wdf_date)} animals → {output_filename}")
+            saved_files.append(exporter.save())
         except Exception as e:
-            print(f"  ✗ Error for date {split_date}: {e}")
+            print(f"  ✗ Error for {date_str}: {e}")
             traceback.print_exc()
 
-    print(f"\n  ✓ Step 2 complete: {len(saved_files)} file(s) created")
-    return saved_files
+    print(f"\n  ✓ Step 2 complete: {len(saved_files)} file(s), 4 sheets each")
+    return saved_files if saved_files else None
 
 
 # ============================================================
@@ -7692,17 +7354,37 @@ def group_animals_by_housing(df):
     return group_suffixes
 
 
-def _build_envision_output_df(df):
-    """Build the Envision output DataFrame from a working_df subset."""
-    df = df.copy()
+def run_climb_to_envision(working_df, timestamp):
+    """STEP 3: Create Envision translation — one file per behavior date."""
+    print("\n" + "=" * 80)
+    print("STEP 3: CLIMB TO ENVISION")
+    print("=" * 80)
+
+    if working_df.empty:
+        print("  ✗ No data. Skipping.")
+        return None
+
+    df = working_df.copy()
+
+    required = ['Genotype', 'Sex', 'Housing ID', 'Animal_Name', 'Line', 'Birth_Date']
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        print(f"  ✗ Missing columns: {missing}")
+        return None
+
+    print(f"  Processing {len(df)} animals...")
+
     df['genotype_base'] = df.apply(
         lambda row: clean_genotype_base(row['Genotype'], row['Line']), axis=1)
     df['sex_initial'] = df['Sex'].str[0].str.upper()
     df['Group_base'] = df['genotype_base'] + '-' + df['sex_initial']
+
     group_suffixes = group_animals_by_housing(df)
     df['Group'] = df.index.map(group_suffixes)
+
     df = assign_ear_tags_by_strain_sex(df)
     df['Genotype_clean'] = df['Genotype'].apply(clean_genotype)
+
     output_df = pd.DataFrame({
         'Group': df['Group'],
         'Cage': df['Housing ID'],
@@ -7722,79 +7404,72 @@ def _build_envision_output_df(df):
         'RFID': '',
         'Tail Tattoo': ''
     })
-    return output_df[ENVISION_TEMPLATE_COLUMNS]
+    output_df = output_df[ENVISION_TEMPLATE_COLUMNS]
 
-
-def _save_envision_df(output_df, output_filename):
-    """Save an Envision output DataFrame to Excel."""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = 'template_csv_v1.0'
-    for col_num, header in enumerate(ENVISION_TEMPLATE_COLUMNS, 1):
-        ws.cell(row=1, column=col_num, value=header)
-    for row_num, row_data in enumerate(output_df.values, 2):
-        for col_num, value in enumerate(row_data, 1):
-            cell = ws.cell(row=row_num, column=col_num)
-            cell.value = '' if pd.isna(value) else value
-    auto_width_worksheet(ws)
-    wb.save(output_filename)
-
-
-def run_climb_to_envision(working_df, timestamp):
-    """STEP 3: Create Envision translation — one file per P56 behavior date."""
-    print("\n" + "=" * 80)
-    print("STEP 3: CLIMB TO ENVISION")
-    print("=" * 80)
-
-    if working_df.empty:
-        print("  ✗ No data. Skipping.")
-        return []
-
-    # Envision is P56 only
-    df = working_df[working_df['Assigned_Timepoint'] == 'P56'].copy()
-    if df.empty:
-        print("  ✗ No P56 animals. Skipping Envision.")
-        return []
-
-    required = ['Genotype', 'Sex', 'Housing ID', 'Animal_Name', 'Line', 'Birth_Date']
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        print(f"  ✗ Missing columns: {missing}")
-        return []
-
-    # Split by Envision_Date (behavior date)
-    df['_envision_date_str'] = df['Envision_Date'].apply(
-        lambda d: str(d).strip() if pd.notna(d) and str(d).strip() not in ('', 'nan') else ''
-    )
-    unique_dates = sorted(d for d in df['_envision_date_str'].unique() if d)
-
-    if not unique_dates:
-        print("  ✗ No valid Envision dates found. Skipping.")
-        return []
+    # Attach Envision_Date from working_df for splitting
+    if 'Envision_Date' in df.columns:
+        output_df['_Envision_Date'] = df['Envision_Date'].values
+    else:
+        output_df['_Envision_Date'] = None
 
     saved_files = []
-    for env_date in unique_dates:
-        try:
-            date_obj = pd.to_datetime(env_date)
-            date_str = date_obj.strftime('%Y_%m_%d')
-        except:
-            date_str = str(env_date).replace('/', '_').replace('-', '_')
+    envision_dates = sorted(
+        output_df['_Envision_Date'].dropna().unique(),
+        key=lambda d: pd.to_datetime(d, errors='coerce') or d
+    )
 
-        df_date = df[df['_envision_date_str'] == env_date].copy()
-        output_df = _build_envision_output_df(df_date)
-        output_filename = f"Envision_{date_str}_{timestamp}.xlsx"
-        _save_envision_df(output_df, output_filename)
-
-        print(f"  📄 Saved: {output_filename} ({len(output_df)} animals)")
-
-        group_counts = output_df.groupby(['Group', 'Cage']).size().reset_index(name='Count')
-        for _, row in group_counts.iterrows():
-            print(f"    {row['Group']} | Cage {row['Cage']} | {row['Count']} animals")
-
+    if len(envision_dates) == 0:
+        # No date info — save single file
+        output_filename = f"Envision_{timestamp}.xlsx"
+        final_df = output_df[ENVISION_TEMPLATE_COLUMNS]
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'template_csv_v1.0'
+        for col_num, header in enumerate(ENVISION_TEMPLATE_COLUMNS, 1):
+            ws.cell(row=1, column=col_num, value=header)
+        for row_num, row_data in enumerate(final_df.values, 2):
+            for col_num, value in enumerate(row_data, 1):
+                cell = ws.cell(row=row_num, column=col_num)
+                cell.value = '' if pd.isna(value) else value
+        auto_width_worksheet(ws)
+        wb.save(output_filename)
         saved_files.append(output_filename)
+        print(f"  📄 Saved: {output_filename}")
+    else:
+        for edate in envision_dates:
+            try:
+                date_str = pd.to_datetime(edate).strftime('%Y_%m_%d')
+            except:
+                date_str = str(edate).replace('/', '_').replace('-', '_')
 
-    print(f"\n  ✓ Step 3 complete: {len(saved_files)} file(s) created")
-    return saved_files
+            subset = output_df[output_df['_Envision_Date'] == edate][ENVISION_TEMPLATE_COLUMNS]
+            output_filename = f"Envision_{date_str}_{timestamp}.xlsx"
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = 'template_csv_v1.0'
+            for col_num, header in enumerate(ENVISION_TEMPLATE_COLUMNS, 1):
+                ws.cell(row=1, column=col_num, value=header)
+            for row_num, row_data in enumerate(subset.values, 2):
+                for col_num, value in enumerate(row_data, 1):
+                    cell = ws.cell(row=row_num, column=col_num)
+                    cell.value = '' if pd.isna(value) else value
+            auto_width_worksheet(ws)
+            wb.save(output_filename)
+            saved_files.append(output_filename)
+            print(f"  📄 Saved: {output_filename}")
+
+    total_animals = len(output_df)
+    print(f"  ✓ Step 3 complete: {len(saved_files)} file(s), {total_animals} animals total")
+
+    group_counts = output_df[['Group', 'Cage']].copy()
+    group_counts['Count'] = 1
+    group_counts = group_counts.groupby(['Group', 'Cage']).count().reset_index()
+    print(f"\n  Group Summary:")
+    for _, row in group_counts.iterrows():
+        print(f"    {row['Group']} | Cage {row['Cage']} | {row['Count']} animals")
+
+    return saved_files if saved_files else None
 
 
 # ============================================================
@@ -8116,34 +7791,63 @@ def run_labels(samples_df, working_df, timestamp):
         return None
 
     print("\n  Generating labels...")
-    perfusion_labels, rna_labels, perf_count, rna_count, oct_count = generate_all_labels(merged_df)
-
-    if not perfusion_labels and not rna_labels:
-        if oct_count > 0:
-            print("  ⚠ All samples are OCT Block — no labels needed.")
-        else:
-            print("  ✗ No labels generated.")
-        return None
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     created_files = []
 
-    # --- RNA Tube Labeler ---
-    if rna_labels:
-        rna_file = create_rna_excel(rna_labels, script_dir, timestamp)
-        if rna_file:
-            created_files.append(rna_file)
-
-    # --- Perfusion Mail-Merge sheets ---
-    if perfusion_labels:
-        num_sheets, perf_files = create_label_sheets(perfusion_labels, script_dir, timestamp)
+    # --- Perfusion labels: one combined file across all dates ---
+    # (label sheets have a fixed physical layout; splitting by date would
+    #  break the offset/sheet-count GUI flow)
+    all_perfusion_labels, _, perf_count, _, oct_count_all = generate_all_labels(merged_df)
+    if all_perfusion_labels:
+        num_sheets, perf_files = create_label_sheets(all_perfusion_labels, script_dir, timestamp)
         created_files.extend(perf_files)
+
+    # --- RNA labels: one file per harvest date ---
+    date_col = None
+    for c in ['Sample Harvest Date', 'Harvest Date', 'Harvest_Date']:
+        if c in merged_df.columns:
+            date_col = c
+            break
+
+    if date_col and not merged_df[date_col].dropna().empty:
+        harvest_dates = sorted(merged_df[date_col].dropna().unique(),
+                               key=lambda d: pd.to_datetime(d, errors='coerce') or d)
+    else:
+        harvest_dates = [None]
+
+    rna_count_total = 0
+    for hdate in harvest_dates:
+        if hdate is not None:
+            date_subset = merged_df[merged_df[date_col] == hdate]
+            try:
+                date_str = pd.to_datetime(hdate).strftime('%Y_%m_%d')
+            except:
+                date_str = str(hdate).replace('/', '_').replace('-', '_')
+            date_tag = f"{date_str}_{timestamp}"
+        else:
+            date_subset = merged_df
+            date_tag = timestamp
+
+        _, rna_labels, _, rna_count, _ = generate_all_labels(date_subset)
+        rna_count_total += rna_count
+
+        if rna_labels:
+            rna_file = create_rna_excel(rna_labels, script_dir, date_tag)
+            if rna_file:
+                created_files.append(rna_file)
+
+    if not all_perfusion_labels and rna_count_total == 0:
+        if oct_count_all > 0:
+            print("  ⚠ All samples are OCT Block — no labels needed.")
+        else:
+            print("  ✗ No labels generated.")
 
     total = len(created_files)
     if total > 0:
         print(f"\n  ✓ Step 4 complete: {total} label file(s)")
-        if oct_count > 0:
-            print(f"    Note: {oct_count} OCT Block sample(s) skipped")
+    if oct_count_all > 0:
+        print(f"    Note: {oct_count_all} OCT Block sample(s) skipped")
 
     return created_files if created_files else None
 
