@@ -105,6 +105,10 @@ CONFIG = {
         'Birth ID', 'Status', 'Birth Date', 'Live Count', '# of Pups', 'Line (Short)', 'Dam', 'Sire'
     ],
 
+    'P56_BEHAVIOR_COMPLETE_STRAINS': [
+        'CDKL5', 'C3', 'GRN', 'FMR1', 'KCND3', 'FBN1', 'SHANK3', 'CNTNAP2', 'CACNA1A'
+    ],
+
     'SUPER_PRIORITY_STRAINS': [
         'ARID1B', 'CACNA1G', 'CHD8', 'CNTNAP2', 'CTCF',
         'CTNNB1', 'DLL1', 'FMR1', 'GABRA1', 'KMT2C',
@@ -259,6 +263,7 @@ except ValueError as e:
 _PRIORITY_STRAINS_UPPER = {s.upper(): v for s, v in CONFIG['PRIORITY_STRAINS'].items()}
 _SUPER_PRIORITY_STRAINS_UPPER = frozenset(s.upper() for s in CONFIG['SUPER_PRIORITY_STRAINS'])
 _B6_STRAINS_UPPER = frozenset(s.upper() for s in CONFIG.get('B6_STRAINS', ['B6J', 'B6NJ']))
+_P56_BEHAVIOR_COMPLETE_UPPER = frozenset(s.upper() for s in CONFIG.get('P56_BEHAVIOR_COMPLETE_STRAINS', []))
 
 # ============================================================================
 # CANONICAL GENOTYPE LABELS
@@ -1316,6 +1321,8 @@ def calculate_remaining_needs(requirements: Dict) -> Dict:
 
 def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict) -> bool:
     strain_upper = str(strain).strip().upper()
+    if timepoint == 'P56' and strain_upper in _P56_BEHAVIOR_COMPLETE_UPPER:
+        return False
     if strain_upper in _B6_STRAINS_UPPER:
         return True
     if not remaining_needs:
@@ -2473,8 +2480,18 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     left_frame.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
     # Column headers
-    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Harvest Type']
-    col_widths = [18, 12, 8, 10, 16]
+    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Harvest Type']
+    col_widths = [18, 12, 8, 10, 12, 16]
+
+    # Color legend
+    legend_frame = tk.Frame(left_frame, bg='#f0f0f0', pady=4)
+    legend_frame.pack(fill='x')
+    tk.Label(legend_frame, text='Key: ', font=('Helvetica', 8, 'bold'),
+             bg='#f0f0f0', fg='#555').pack(side='left', padx=(4, 2))
+    for opt, color in OPTION_COLORS.items():
+        lbl = tk.Label(legend_frame, text=f' {opt} ', font=('Helvetica', 8),
+                       bg=color, fg='#333', relief='flat', padx=4, pady=1)
+        lbl.pack(side='left', padx=2)
 
     hdr_row = tk.Frame(left_frame, bg='#2c3e50')
     hdr_row.pack(fill='x')
@@ -2513,12 +2530,15 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     sorted_rows = sorted(schedulable.to_dict('records'), key=_harvest_sort_key)
 
-    # Store StringVars so we can read them later
-    selection_vars = {}   # name → StringVar
-    row_frames     = {}   # name → tk.Frame (for recoloring)
+    # Store StringVars, plain dict (canvas-safe), and widget refs
+    selection_vars   = {}   # name → StringVar
+    selection_values = {}   # name → str  (plain dict, always current)
+    selection_menus  = {}   # name → Combobox widget (direct read at confirm)
+    row_frames       = {}   # name → tk.Frame (for recoloring)
 
-    def _on_type_change(name, var, frame):
-        val = var.get()
+    def _on_type_change(name, combobox, frame):
+        val = combobox.get()
+        selection_values[name] = val
         color = OPTION_COLORS.get(val, '#ffffff')
         frame.configure(bg=color)
         for w in frame.winfo_children():
@@ -2533,17 +2553,23 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         strain    = str(row.get('Strain', '')).strip()
         sex       = str(row.get('Sex', '')).strip()
         timepoint = str(row.get('Assigned_Timepoint', '')).strip()
+        _raw_date = row.get('P14_Date') if timepoint == 'P14' else row.get('P56_Behavior_Date')
+        try:
+            date_str = pd.to_datetime(_raw_date).strftime('%m/%d/%y') if _raw_date and str(_raw_date) not in ('', 'None', 'nan') else ''
+        except Exception:
+            date_str = str(_raw_date) if _raw_date else ''
         default   = auto_types.get(name, 'Perfusion')
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
+        selection_values[name] = default
 
         bg = '#ffffff' if i % 2 == 0 else '#f7f7f7'
         frame = tk.Frame(rows_frame, bg=bg)
         frame.pack(fill='x')
         row_frames[name] = frame
 
-        for val, w in zip([name, strain, sex, timepoint], col_widths[:4]):
+        for val, w in zip([name, strain, sex, timepoint, date_str], col_widths[:5]):
             tk.Label(
                 frame, text=val, width=w, anchor='w',
                 font=('Helvetica', 9), bg=bg, padx=4, pady=3
@@ -2552,11 +2578,12 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         menu = ttk.Combobox(
             frame, textvariable=var,
             values=HARVEST_OPTIONS,
-            state='readonly', width=col_widths[4] - 2
+            state='readonly', width=col_widths[5] - 2
         )
         menu.pack(side='left', padx=2, pady=2)
+        selection_menus[name] = menu
         menu.bind('<<ComboboxSelected>>',
-                  lambda e, n=name, v=var, f=frame: _on_type_change(n, v, f))
+                  lambda e, n=name, m=menu, f=frame: _on_type_change(n, m, f))
 
         # Apply initial color
         c = OPTION_COLORS.get(default, bg)
@@ -2599,7 +2626,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         for w in quota_rows_frame.winfo_children():
             w.destroy()
 
-        current = {n: v.get() for n, v in selection_vars.items()}
+        current = dict(selection_values)
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
 
         if not quota_data:
@@ -2651,9 +2678,11 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     def _reset_to_auto():
         for name, var in selection_vars.items():
-            var.set(auto_types.get(name, 'Perfusion'))
+            val = auto_types.get(name, 'Perfusion')
+            var.set(val)
+            selection_values[name] = val
             frame = row_frames[name]
-            c = OPTION_COLORS.get(var.get(), '#ffffff')
+            c = OPTION_COLORS.get(val, '#ffffff')
             frame.configure(bg=c)
             for w in frame.winfo_children():
                 try:
@@ -2663,7 +2692,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         _refresh_quota_panel()
 
     def _confirm():
-        current = {n: v.get() for n, v in selection_vars.items()}
+        current = {n: m.get() for n, m in selection_menus.items()}
 
         # ── Quota check (harvest types only, not Extra or Do Not Schedule) ────
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
@@ -4472,18 +4501,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     print("=" * 70)
 
     sexing_schedule_df = pd.DataFrame()
-    if births_df is not None:
-        sexing_schedule_df = build_births_sexing_schedule(births_df, animals_df_raw)
-        upcoming = (
-            sexing_schedule_df[
-                sexing_schedule_df['Days_Until_Sexing'].apply(
-                    lambda x: isinstance(x, int) and 0 <= x <= 7
-                )
-            ] if len(sexing_schedule_df) > 0 else pd.DataFrame()
-        )
-        print(f"  Births needing sexing (not yet entered): {len(sexing_schedule_df)}")
-        if len(upcoming) > 0:
-            print(f"  ⚠️  {len(upcoming)} litter(s) need sexing within the next 7 days!")
 
     unmatched_births_df = find_unmatched_births_enhanced(
         births_df, animals_df, requirements, remaining_needs
@@ -4587,11 +4604,71 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             if htype == 'DO_NOT_SCHEDULE'
         }
         if do_not_schedule:
-            print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
+            print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule'.")
             logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
+
+            # ── P14 DNS → try to promote to P56 ──────────────────────────────
+            promoted_to_p56 = []
+            dns_assignments = assignments[assignments['Animal_Name'].isin(do_not_schedule)]
+            p14_dns = dns_assignments[dns_assignments['Assigned_Timepoint'] == 'P14']
+
+            if len(p14_dns) > 0 and len(eligibility) > 0:
+                # Figure out which Wednesdays still have room after current P56 assignments
+                p56_current = assignments[assignments['Assigned_Timepoint'] == 'P56'].copy()
+                if len(p56_current) > 0 and 'P56_Behavior_Date' in p56_current.columns:
+                    p56_current['P56_Behavior_Date'] = p56_current['P56_Behavior_Date'].apply(to_date)
+                    wed_counts = p56_current.groupby('P56_Behavior_Date').size().to_dict()
+                else:
+                    wed_counts = {}
+
+                elig_lookup = {
+                    str(r.get('Animal_Name', '')).strip(): r
+                    for r in eligibility.to_dict('records')
+                }
+
+                for _, animal_row in p14_dns.iterrows():
+                    aname = str(animal_row.get('Animal_Name', '')).strip()
+                    elig = elig_lookup.get(aname)
+                    if elig is None:
+                        continue
+                    if not elig.get('P56_Eligible', False):
+                        continue
+
+                    strain = str(animal_row.get('Strain', '')).strip()
+                    sex    = str(animal_row.get('Sex', '')).strip()
+                    if not group_has_quota(strain, sex, 'P56', remaining_needs):
+                        continue
+
+                    # Find a Wednesday with capacity
+                    behavior_date = to_date(elig.get('P56_Behavior_Date'))
+                    if behavior_date is None:
+                        continue
+                    current_count = wed_counts.get(behavior_date, 0)
+                    if current_count >= CONFIG['WEDNESDAY_CAPACITY']:
+                        continue
+
+                    # Build a promoted P56 row from the existing assignment row
+                    new_row = animal_row.copy()
+                    new_row['Assigned_Timepoint']   = 'P56'
+                    new_row['P56_Behavior_Date']     = behavior_date
+                    new_row['P56_Harvest_Date']      = behavior_date + timedelta(days=P56_HARVEST_OFFSET_FROM_BEHAVIOR)
+                    new_row['P14_Date']              = None
+                    promoted_to_p56.append(new_row)
+                    wed_counts[behavior_date] = current_count + 1
+                    print(f"  ↑ Promoted {aname} from P14 DNS → P56 (behavior {behavior_date})")
+
+            # Remove DNS animals from assignments
             assignments = assignments[
                 ~assignments['Animal_Name'].isin(do_not_schedule)
             ].copy()
+
+            # Add promoted animals back as P56
+            if promoted_to_p56:
+                promoted_df = pd.DataFrame(promoted_to_p56)
+                assignments = pd.concat([assignments, promoted_df], ignore_index=True)
+                print(f"  ✓ {len(promoted_to_p56)} P14 DNS animal(s) promoted to P56.")
+            else:
+                print(f"  ✓ {len(do_not_schedule)} animal(s) removed from assignments.")
 
         # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
         harvest_overrides = {
@@ -4684,12 +4761,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     )
 
     upcoming_sexing_count = 0
-    if len(sexing_schedule_df) > 0 and 'Days_Until_Sexing' in sexing_schedule_df.columns:
-        upcoming_sexing_count = len(sexing_schedule_df[
-            sexing_schedule_df['Days_Until_Sexing'].apply(
-                lambda x: isinstance(x, int) and 0 <= x <= 7
-            )
-        ])
 
     summary_data = {
         'Metric': [
@@ -4713,9 +4784,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             '── B6/B6N ──',
             'B6/B6N Monthly Minimum Required',
             'B6/B6N Top-Up Animals Added',
-            '── BIRTHS / SEXING ──',
-            'Births Needing Sexing (not yet entered)',
-            'Sexing Due Within 7 Days',
+            '── BIRTHS ──',
             'Unmatched Births (Sing Inventory)',
             'Unmatched - Can Schedule P14',
             'Unmatched - Can Schedule P56',
@@ -4723,7 +4792,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             'Unmatched - With Quota Needs',
             '── SETTINGS ──',
             'Wednesday Capacity',
-            'Sexing Day Offset (days)',
             'Birth Date Filter Start',
             'Birth Date Filter End',
             'Behavior Date Filter Start',
@@ -4756,8 +4824,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             CONFIG.get('B6_MIN_PER_MONTH', 3),
             b6_topup_count,
             '',
-            len(sexing_schedule_df),
-            upcoming_sexing_count,
             len(unmatched_births_df),
             unmatched_p14_count,
             unmatched_p56_count,
@@ -4765,7 +4831,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             unmatched_quota_count,
             '',
             CONFIG['WEDNESDAY_CAPACITY'],
-            CONFIG.get('SEXING_OFFSET_DAYS', 9),
             str(birth_date_start) if birth_date_start else 'None',
             str(birth_date_end) if birth_date_end else 'None',
             str(behavior_date_start) if behavior_date_start else 'None',
@@ -4792,7 +4857,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         requirements_status=requirements_status,
         unmatched_births=unmatched_births_df,
         genotype_excluded=genotype_excluded,
-        sexing_schedule=sexing_schedule_df,
         b6_monthly_summary=b6_monthly_summary,
         all_animals=assignments,
     )
@@ -4815,9 +4879,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
             if len(capacity) > 0:
                 capacity.to_excel(writer, sheet_name='Wednesday Capacity', index=False)
-
-            if len(sexing_schedule_df) > 0:
-                sexing_schedule_df.to_excel(writer, sheet_name='Sexing Schedule', index=False)
 
             if len(genotype_excluded) > 0:
                 genotype_excluded.to_excel(
@@ -4986,10 +5047,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         print(f"  ⛔ Unusable for both:  {unusable_both:>6}  (too old for P14 AND P56)")
     if b6_topup_count > 0:
         print(f"  B6/B6N top-up added:  {b6_topup_count:>6}  (to meet {CONFIG['B6_MIN_PER_MONTH']}/month minimum)")
-    if len(sexing_schedule_df) > 0:
-        print(f"\n  Births needing sexing:    {len(sexing_schedule_df)}")
-        if upcoming_sexing_count > 0:
-            print(f"  ⚠️  Sexing due ≤7 days:    {upcoming_sexing_count}")
     if len(unmatched_births_df) > 0:
         print(f"\n  ⚠️  Unmatched births:       {len(unmatched_births_df)}")
     if genotype_critical_count > 0:
@@ -6809,7 +6866,7 @@ def run_harvest_and_samples(working_df, timestamp):
             'Housing': row.get('Housing ID', ''),
             'Identification': row.get('Marker', ''),
             'Sex': row.get('Sex', ''),
-            'Age (Days)': row.get('Age_Days', ''),
+            'Age (Days)': f"P{row.get('Age_Days', '')}" if row.get('Age_Days', '') != '' else '',
             'Envision Date': envision_date_str,
             'Harvest Date': harvest_date_str,
             'Harvested by': '',
