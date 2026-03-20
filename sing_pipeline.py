@@ -112,7 +112,7 @@ CONFIG = {
     'SUPER_PRIORITY_STRAINS': [
         'ARID1B', 'CACNA1G', 'CHD8', 'CNTNAP2', 'CTCF',
         'CTNNB1', 'DLL1', 'FMR1', 'GABRA1', 'KMT2C',
-        'SCN2A', 'SHANK3', 'SMARCC2'
+        'SCN2A', 'SHANK3', 'SHANK3-Hom', 'SMARCC2'
     ],
 
     'PRIORITY_STRAINS': {
@@ -139,7 +139,7 @@ CONFIG = {
         'RAC1': 'Half', 'RALA': 'Half', 'RB1CC1': 'Half', 'RBOBTB2': 'All',
         'RYR2': 'Half', 'SATB1': 'Half', 'SATB2': 'Half', 'SCN1A': 'Half',
         'SCN2A': 'Half', 'SETD1A': 'Half', 'SETD2': 'All', 'SETD5': 'Half',
-        'SHANK3': 'Half', 'SLC6A1': 'Half', 'SMARCC2': 'Half', 'SMARCE1': 'Half',
+        'SHANK3': 'Half', 'SHANK3-Hom': 'Half', 'SLC6A1': 'Half', 'SMARCC2': 'Half', 'SMARCE1': 'Half',
         'SOX2': 'Half', 'SPAST': 'All', 'STXBP1': 'Half', 'SYNCRIP': 'Half',
         'SYNGAP1': 'Half', 'TAOK1': 'Half', 'TBR1': 'Half', 'TCF20': 'All',
         'TCF4': 'Half', 'TCF7L2': 'Half', 'TFAP4': 'All', 'TOP2B': 'Half',
@@ -1554,6 +1554,12 @@ def check_eligibility(animals_df: pd.DataFrame,
         strain = row.get('Line (Short)', 'N/A')
         genotype = row.get('Genotype')
         sex = row.get('Sex')
+
+        # Remap SHANK3 Hom (-/-) to a separate strain key
+        if str(strain).strip().upper() == 'SHANK3':
+            canon = canonicalize_genotype(genotype) if pd.notna(genotype) else GENOTYPE_BLANK
+            if canon == GENOTYPE_HOM:
+                strain = 'SHANK3-Hom'
         marker_type = row.get('Marker Type', '')
         birth_id = row.get('Birth ID', 'N/A')
 
