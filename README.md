@@ -1,98 +1,154 @@
-# Sing Animal Scheduler
+# SING Pipeline Scheduler
 
-A Python script that handles animal scheduling and harvest processing for the Kumar Lab's contribution to the SING Project. It runs as a full GUI application — no terminal interaction required after launch.
-
----
-
-## What It Does
-
-The pipeline runs in two phases:
-
-**Phase 1 — Scheduling**
-- Reads the animal inventory, harvest tracking sheet, and births file
-- Checks eligibility for P14 and P56 timepoints
-- Assigns animals to harvest types (Perfusion, MERFISH, RNAseq, Extra)
-- Outputs a complete schedule Excel file
-
-**Phase 2 — Harvest Pipeline**
-- Reads the schedule output in memory
-- Produces the Harvest Worksheet, Deliverables, Envision plate reader file, and Labels
+**Kumar Lab — The Jackson Laboratory**
+Scalable and Systematic Neurobiology of NPD Risk Genes (SING)
+NIH-funded, 2024–2029
 
 ---
 
-## Input Files
+## Overview
 
-Place these files in the same folder as `sing_pipeline.py`:
+The SING Pipeline Scheduler is a Python/tkinter GUI tool that automates harvest scheduling, Envision tagging prep, sample tracking, and output file generation for the SING project. It processes animal colony data exported from Climb/Envision and produces a complete set of Excel files ready for the harvest workflow.
 
-| File | Required | Purpose |
-|------|----------|---------|
-| `animals.csv` | ✅ Yes | Main colony inventory |
-| `Sing Harvest Sheet - Summary Sheet.csv` | Optional | Quota tracking by strain/type |
-| `births.csv` | Optional | Improves P14 scheduling accuracy |
-| `harvest_overrides.csv` | Optional | Pin specific animals to specific harvest types (auto-generated on first run) |
+Built and maintained by Tim Leach, Research Technician, Kumar Lab.
 
 ---
 
-## How to Run
+## Files
 
-```
-python sing_pipeline.py
-```
-
-Or just double-click the file. The GUI will open automatically.
-
-**Screen 1 — File Setup:** Confirm which input files are available. The script auto-detects files in the same folder.
-
-**Screen 2 — Wednesday Capacity:** Enter how many behavior slots are already booked for the next 6 Wednesdays.
-
-**Screen 3 — Pipeline Running:** The pipeline runs in the background. A Harvest Assignment Review window will appear mid-run — review and confirm or adjust the harvest type for each animal.
-
-**Screen 4 — Summary:** Lists all output files produced with their sizes.
-
----
-
-## Output Files
-
-| File | Description |
-|------|-------------|
-| `Complete_Schedule_{timestamp}.xlsx` | Full schedule — P14, P56, capacity, strain summary, requirements status |
-| `Harvest_Sheet_Import_{timestamp}.xlsx` | Harvest worksheet import file |
-| `Climb_Sample_Import_{timestamp}.xlsx` | Sample import for Climb |
-| `Lab_Data_Export_{timestamp}.xlsx` | Lab data (4 sheets) |
-| `Envision_{timestamp}.xlsx` | Envision plate reader file |
-| `Labels_Mailmerge_{timestamp}_sheet*.xlsx` | Perfusion label mail-merge sheets |
-| `Tube_Labeler_RNA_{timestamp}.xlsx` | RNA tube labeler file (Sides + Tops tabs) |
-| `harvest_overrides.csv` | Auto-generated on first run — edit to override harvest assignments |
-| `logs/scheduler_{timestamp}.log` | Full run log |
-| `backup_{timestamp}/` | CSV backups |
-
----
-
-## Harvest Type Override
-
-To manually pin animals to a specific harvest type before running, edit `harvest_overrides.csv` (auto-generated on first run). Change the `Harvest_Type` column for any animal. Leave blank to auto-assign.
-
-Valid values: `Perfusion`, `MERFISH`, `RNAseq`, `Extra`
+| File | Version | Status | Notes |
+|---|---|---|---|
+| `sing_pipeline.py` | v1.6 | Stable | Production version — use this if v2.0 has issues |
+| `sing_pipeline_v2.py` | v2.0 | Current | Python Expert refactor — correctness, performance, documentation |
 
 ---
 
 ## Requirements
 
-- Python 3.8+
-- pandas
-- openpyxl
-- tkinter (included with standard Python on Windows)
-- Climb (exports must have all columns selected)
+```
+Python 3.9+
+pandas
+openpyxl
+tqdm (optional — gracefully falls back if not installed)
+tkinter (included with standard Python)
+```
 
 Install dependencies:
-```
-pip install pandas openpyxl
+```bash
+pip install pandas openpyxl tqdm
 ```
 
 ---
 
-## Notes
+## Input Files
 
-- The script is designed for the Kumar Lab at JAX
-- Extra animals attend Wednesday behavior but are not harvested and do not count toward quota
-- Do Not Schedule removes an animal from the run entirely
+Place these in the same folder as the script before running:
+
+| File | Description |
+|---|---|
+| `animals.csv` | Alive animal export from Climb |
+| `Sing Harvest Sheet - Summary Sheet.csv` | Tracking sheet with completed harvest counts per strain |
+| `births.csv` | Birth records export from Climb |
+| `harvest_overrides.csv` | *(Optional)* Manual harvest date overrides — leave rows blank for auto-assignment |
+
+---
+
+## Running the Pipeline
+
+Double-click either `.py` file, or run from the command line:
+
+```bash
+python sing_pipeline_v2.py
+```
+
+The GUI walks through four screens:
+
+1. **File Setup** — select input files
+2. **Harvest Type** — choose Perfusion, MERFISH-OCT, or RNA-Seq
+3. **Running** — pipeline executes with live log output
+4. **Summary** — output files listed with file sizes
+
+---
+
+## Output Files
+
+All outputs are saved to the same directory as the script, timestamped:
+
+| Output | Description |
+|---|---|
+| `SING_Schedule_*.xlsx` | Master harvest schedule |
+| `Harvest_Sheet_*.xlsx` | Per-date harvest sheets |
+| `Samples_*.xlsx` | Sample tracking sheets |
+| `Envision_Import_*.xlsx` | Climb-to-Envision tag import file |
+| `Labels_*.xlsx` | Printable sample labels |
+| `Perfusion_Labels_*.xlsx` | Combined perfusion label sheet (single file, all dates) |
+| `logs/scheduler_*.log` | Run log with full diagnostics |
+
+---
+
+## Key Scheduling Logic
+
+- **P14 harvest**: Birth date + 14 days. Must fall Mon–Fri. Has a strict 2-hour collection window — must be scheduled in advance.
+- **P56 behavior**: First Wednesday falling in the P42–P49 window (age in days).
+- **P56 harvest**: Behavior date + 14 days (always exactly 2 weeks later).
+- **Envision tagging**: Always exactly 2 weeks before the harvest date.
+- **Capacity**: Wednesday behavior sessions capped at 18 animals (`WEDNESDAY_CAPACITY` in CONFIG).
+- **Toe clip animals**: Excluded from P56/behavior (gait effects). Ear-notched animals used for P56.
+
+### P56 Behavior-Complete Strains
+
+These strains have completed behavior and are blocked from new P56 scheduling:
+
+`CDKL5, C3, GRN, FMR1, KCND3, FBN1, SHANK3, CNTNAP2, CACNA1A`
+
+---
+
+## Configuration
+
+All tunable parameters live in the `CONFIG` dict near the top of the script. Key settings:
+
+```python
+'WEDNESDAY_CAPACITY': 18,       # Max animals per behavior Wednesday
+'CAGE_SIZE': 3,                 # Animals per cage
+'P14_VALID_DAYS': [0,1,2,3,4], # Mon–Fri
+'HARVEST_TARGETS': {            # Per-strain per-sex targets
+    'Perfusion': 5,
+    'MERFISH': 1,
+    'RNAseq': 1
+},
+```
+
+---
+
+## Version History
+
+### v2.0 — 2026-03-24 (`sing_pipeline_v2.py`)
+Python Expert refactor. No logic changes — all behavioral output is identical to v1.6.
+
+- Narrowed `warnings.filterwarnings` — no longer silences all warnings globally
+- Fixed bare `except` clauses in `auto_size_columns` and `_run_again`
+- Removed redundant `date as date_type` alias — all type hints now use `date` directly
+- Removed unused `timezone` import
+- Moved `import unittest` out of top-level imports
+- Added `Any` to typing imports
+- Documented unused `sex` param in `get_strain_breeding_type`
+- Replaced convoluted `argsort` sort with `sort_values(key=...)` in `build_births_sexing_schedule`
+- Simplified `process_large_dataset` — removed unnecessary line-count pre-pass
+- Vectorized `filter_animals_by_use` excluded record construction (removed `iterrows`)
+- Added docstrings to `to_date`, `validate_config_advanced`, `auto_size_columns`, `get_strain_breeding_type`, `process_large_dataset`, `filter_animals_by_use`
+- Replaced ~30 `len(df) == 0` checks with `df.empty`
+
+### v1.6 — 2025 (`sing_pipeline.py`)
+Production-stable version. See inline comments for full change history.
+
+---
+
+## Project Context
+
+SING spans three institutions — JAX (Kumar Lab), Penn State (Paul Lab), and NYU — and tracks 8 active strains out of 114 total over the project lifetime. Animals are housed in rooms B6 and F29.
+
+**Key collaborators:** Marina Santos (OFA behavior), Tuan Nguyen (data analysis), Fionna Kennedy (Envision tagging and animal entry), Sean Deats (harvester).
+
+---
+
+*Questions or issues: contact Tim Leach, Kumar Lab, JAX.*
