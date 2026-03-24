@@ -8047,12 +8047,58 @@ def prompt_wednesday_capacity_gui(parent=None):
 # ---------------------------------------------------------------------------
 # Main GUI launcher
 # ---------------------------------------------------------------------------
+
+# ── Design tokens ────────────────────────────────────────────────────────────
+_T = {
+    # Surfaces
+    'bg':          '#ffffff',
+    'bg_subtle':   '#f7f8f9',
+    'bg_inset':    '#f1f3f5',
+    # Text
+    'text':        '#111827',
+    'text_muted':  '#6b7280',
+    'text_faint':  '#9ca3af',
+    # Borders
+    'border':      '#e5e7eb',
+    'border_mid':  '#d1d5db',
+    # Accent (teal, matches mockup)
+    'accent':      '#1D9E75',
+    'accent_lt':   '#EAF3DE',
+    'accent_text': '#3B6D11',
+    # Status
+    'red':         '#A32D2D',
+    'red_lt':      '#FCEBEB',
+    'amber':       '#854F0B',
+    'amber_lt':    '#FAEEDA',
+    # Header strip
+    'hdr_bg':      '#f7f8f9',
+    'hdr_border':  '#e5e7eb',
+}
+
+def _make_styled_button(parent, text, command, style='primary', **kwargs):
+    """Return a flat styled button. style = 'primary' | 'secondary' | 'ghost'."""
+    styles = {
+        'primary':   {'bg': _T['accent'],    'fg': '#ffffff',         'ab': '#15825f'},
+        'secondary': {'bg': _T['bg_subtle'], 'fg': _T['text'],        'ab': _T['bg_inset']},
+        'ghost':     {'bg': _T['bg'],        'fg': _T['text_muted'],  'ab': _T['bg_subtle']},
+    }
+    s = styles.get(style, styles['secondary'])
+    btn = tk.Button(
+        parent, text=text, command=command,
+        bg=s['bg'], fg=s['fg'], activebackground=s['ab'], activeforeground=s['fg'],
+        font=('Helvetica', 10, 'bold' if style == 'primary' else 'normal'),
+        relief='flat', bd=0, padx=16, pady=7, cursor='hand2',
+        **kwargs
+    )
+    return btn
+
+
 def run_pipeline_gui():
     """Entry point — shows the full GUI pipeline."""
 
     root = tk.Tk()
-    root.title('Sing Lab Scheduler')
-    root.configure(bg='#f0f0f0')
+    root.title('SING Pipeline Scheduler')
+    root.configure(bg=_T['bg'])
     root.resizable(True, True)
 
     script_dir = _os.path.dirname(_os.path.abspath(__file__))
@@ -8064,9 +8110,9 @@ def run_pipeline_gui():
         'births_file':   _os.path.join(script_dir, CONFIG['INPUT_BIRTHS_FILE']),
     }
 
-    REQUIRED_COLOR = '#c0392b'
-    OPTIONAL_COLOR = '#7f8c8d'
-    OK_COLOR       = '#27ae60'
+    REQUIRED_COLOR = _T['red']
+    OPTIONAL_COLOR = _T['text_muted']
+    OK_COLOR       = _T['accent']
 
     # ── Helper: clear root and show a new screen ──────────────────────────────
     def _switch(frame_fn):
@@ -8074,23 +8120,49 @@ def run_pipeline_gui():
             w.destroy()
         frame_fn()
 
+    # ── Shared header builder ─────────────────────────────────────────────────
+    def _make_header(eyebrow: str, title: str, subtitle: str = '') -> tk.Frame:
+        """Render the consistent light-grey header used on every screen."""
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=16)
+        hdr.pack(fill='x')
+        # Bottom border line
+        sep = tk.Frame(root, bg=_T['hdr_border'], height=1)
+        sep.pack(fill='x')
+        if eyebrow:
+            tk.Label(hdr, text=eyebrow.upper(),
+                     font=('Helvetica', 9), bg=_T['hdr_bg'],
+                     fg=_T['text_faint']).pack()
+        tk.Label(hdr, text=title,
+                 font=('Helvetica', 16, 'bold'),
+                 bg=_T['hdr_bg'], fg=_T['text']).pack()
+        if subtitle:
+            tk.Label(hdr, text=subtitle,
+                     font=('Helvetica', 10), bg=_T['hdr_bg'],
+                     fg=_T['text_muted']).pack(pady=(2, 0))
+        return hdr
+
+    def _make_footer() -> tk.Frame:
+        """Render the consistent light footer strip."""
+        sep = tk.Frame(root, bg=_T['border'], height=1)
+        sep.pack(fill='x')
+        foot = tk.Frame(root, bg=_T['bg_subtle'], pady=10)
+        foot.pack(fill='x')
+        return foot
+
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 1: File Setup
     # ─────────────────────────────────────────────────────────────────────────
     def screen_file_setup():
-        root.title('Sing Lab Scheduler')
-        root.geometry('700x560')
+        root.title('SING Pipeline Scheduler')
+        root.geometry('680x540')
 
-        # ── Header ────────────────────────────────────────────────────────────
-        hdr = tk.Frame(root, bg='#2c3e50', pady=18)
-        hdr.pack(fill='x')
-        tk.Label(hdr, text='Sing Lab Scheduler',
-                 font=('Helvetica', 20, 'bold'),
-                 bg='#2c3e50', fg='white').pack()
-        tk.Label(hdr, text='Which input files do you have ready?',
-                 font=('Helvetica', 10), bg='#2c3e50', fg='#bdc3c7').pack(pady=(4, 0))
+        _make_header(
+            eyebrow='SING Pipeline Scheduler',
+            title='Select input files',
+            subtitle='Files are detected automatically from the script folder.',
+        )
 
-        body = tk.Frame(root, bg='#f0f0f0', padx=24, pady=18)
+        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=16)
         body.pack(fill='both', expand=True)
 
         # ── File card definitions ─────────────────────────────────────────────
@@ -8099,17 +8171,17 @@ def run_pipeline_gui():
                 'key':      'animal_file',
                 'default':  CONFIG['INPUT_ANIMAL_FILE'],
                 'required': True,
-                'label':    'Animal Inventory',
-                'hint':     f'Required  •  usually "{CONFIG['INPUT_ANIMAL_FILE']}"',
-                'desc':     'The main list of all animals currently in the colony.',
+                'label':    'Animal inventory',
+                'hint':     f'Required  ·  default: {CONFIG["INPUT_ANIMAL_FILE"]}',
+                'desc':     'Alive animal export from Climb — the main colony list.',
             },
             {
                 'key':      'tracking_file',
                 'default':  CONFIG['INPUT_TRACKING_FILE'],
                 'required': False,
-                'label':    'Harvest Tracking Sheet',
-                'hint':     'Optional  •  check the box to include in this run',
-                'desc':     'Tracks how many of each strain/type have already been harvested.',
+                'label':    'Harvest tracking sheet',
+                'hint':     'Optional  ·  check to include in this run',
+                'desc':     'Completed harvest counts per strain.',
             },
             {
                 'key':      'births_file',
@@ -8305,36 +8377,213 @@ def run_pipeline_gui():
             root.geometry(f'{w}x{h}+{x}+{y}')
         root.after(10, _fit_window)
 
+        err_lbl = tk.Label(body, text='', font=('Helvetica', 9),
+                           bg=_T['bg'], fg=_T['red'])
+
+        def _update_status(key, path, lbl):
+            if not path.strip():
+                lbl.configure(text='', fg=_T['text_faint'])
+            elif _os.path.exists(path):
+                lbl.configure(text='✓  Found', fg=_T['accent'])
+            else:
+                lbl.configure(text='✗  Not found', fg=_T['red'])
+
+        def _browse(key, var, lbl, title):
+            path = filedialog.askopenfilename(
+                parent=root, title=title,
+                initialdir=_os.path.dirname(var.get()) or script_dir,
+                filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
+            )
+            if path:
+                var.set(path)
+                _update_status(key, path, lbl)
+
+        def _toggle_card(key, toggle_var, detail_frame):
+            pass
+
+        for fd in FILE_DEFS:
+            key      = fd['key']
+            required = fd['required']
+            default  = _os.path.join(script_dir, fd['default'])
+
+            exists       = _os.path.exists(default)
+            initial_path = default if exists else state.get(key, default)
+
+            # ── Card ─────────────────────────────────────────────────────────
+            card = tk.Frame(body, bg=_T['bg'], relief='solid', bd=1,
+                            highlightbackground=_T['border'],
+                            highlightthickness=1, padx=14, pady=10)
+            card.pack(fill='x', pady=5)
+            card.configure(highlightbackground=_T['border'])
+
+            # Top row: checkbox + label + badge + status
+            top_row = tk.Frame(card, bg=_T['bg'])
+            top_row.pack(fill='x')
+
+            tvar = tk.BooleanVar(value=exists or required)
+            toggle_vars[key] = tvar
+
+            chk = tk.Checkbutton(
+                top_row, variable=tvar,
+                bg=_T['bg'], activebackground=_T['bg'],
+                selectcolor=_T['bg'],
+                cursor='hand2' if not required else 'arrow',
+                state='normal' if not required else 'disabled',
+            )
+            chk.pack(side='left', padx=(0, 4))
+
+            tk.Label(top_row, text=fd['label'],
+                     font=('Helvetica', 11, 'bold'),
+                     bg=_T['bg'], fg=_T['text']).pack(side='left')
+
+            badge_text  = '  Required  ' if required else '  Optional  '
+            badge_bg    = _T['red_lt']    if required else _T['bg_inset']
+            badge_fg    = _T['red']       if required else _T['text_muted']
+            tk.Label(top_row, text=badge_text,
+                     font=('Helvetica', 8), bg=badge_bg, fg=badge_fg,
+                     padx=2).pack(side='left', padx=8)
+
+            # desc line
+            tk.Label(card, text=fd['desc'],
+                     font=('Helvetica', 9), bg=_T['bg'],
+                     fg=_T['text_muted'], anchor='w').pack(fill='x', pady=(2, 0))
+
+            # Path inset row
+            inset = tk.Frame(card, bg=_T['bg_inset'], padx=8, pady=6)
+            inset.pack(fill='x', pady=(8, 0))
+            detail_frames[key] = inset
+
+            tk.Label(inset, text=fd['hint'],
+                     font=('Helvetica', 8), bg=_T['bg_inset'],
+                     fg=_T['text_faint'], anchor='w').pack(fill='x', pady=(0, 4))
+
+            entry_row = tk.Frame(inset, bg=_T['bg_inset'])
+            entry_row.pack(fill='x')
+
+            pvar = tk.StringVar(value=initial_path)
+            path_vars[key] = pvar
+            state[key] = initial_path
+
+            slbl = tk.Label(entry_row, text='', font=('Helvetica', 9),
+                            bg=_T['bg_inset'], width=12, anchor='w')
+            status_lbls[key] = slbl
+
+            _make_styled_button(
+                entry_row, 'Browse…',
+                command=lambda k=key, v=pvar, l=slbl, t=fd['label']:
+                    _browse(k, v, l, f'Select {t}'),
+                style='secondary'
+            ).pack(side='right', padx=(4, 0))
+
+            slbl.pack(side='right', padx=(6, 0))
+
+            entry = tk.Entry(entry_row, textvariable=pvar,
+                             font=('Helvetica', 9), relief='flat',
+                             bg=_T['bg'], fg=_T['text'],
+                             insertbackground=_T['text'],
+                             highlightthickness=1,
+                             highlightbackground=_T['border_mid'])
+            entry.pack(side='left', fill='x', expand=True, ipady=3)
+
+            pvar.trace_add('write', lambda *_, k=key, v=pvar, l=slbl:
+                           _update_status(k, v.get(), l))
+            _update_status(key, initial_path, slbl)
+
+            tvar.trace_add('write', lambda *_, k=key, tv=tvar, df=inset:
+                           _toggle_card(k, tv, df))
+
+        err_lbl.pack(fill='x', pady=(4, 0))
+
+        # ── Footer ────────────────────────────────────────────────────────────
+        foot = _make_footer()
+
+        def _proceed():
+            err_lbl.configure(text='')
+
+            animal = path_vars['animal_file'].get().strip()
+            if not toggle_vars['animal_file'].get() or not animal:
+                err_lbl.configure(text='⚠  The Animal Inventory file is required to continue.')
+                return
+            if not _os.path.exists(animal):
+                err_lbl.configure(text=f'⚠  Animal Inventory not found: {animal}')
+                return
+
+            try:
+                import pandas as _pd
+                test_df = _pd.read_csv(animal, nrows=2)
+                missing = [c for c in CONFIG.get('REQUIRED_ANIMAL_COLUMNS', [])
+                           if c not in test_df.columns]
+                if missing:
+                    err_lbl.configure(text=f'⚠  Animal file missing columns: {missing}')
+                    return
+            except Exception as ex:
+                err_lbl.configure(text=f'⚠  Cannot read Animal Inventory: {ex}')
+                return
+
+            state['animal_file'] = animal
+
+            for key in ('tracking_file', 'births_file'):
+                if toggle_vars[key].get():
+                    p = path_vars[key].get().strip()
+                    state[key] = p if _os.path.exists(p) else None
+                    if toggle_vars[key].get() and not _os.path.exists(p):
+                        err_lbl.configure(
+                            text=f'⚠  File checked but not found:\n{p}\n'
+                                 f'Browse to it or uncheck the box.'
+                        )
+                        return
+                else:
+                    state[key] = None
+
+            _switch(screen_wednesday)
+
+        tk.Label(foot, text='v2.0', font=('Helvetica', 9),
+                 bg=_T['bg_subtle'], fg=_T['text_faint']).pack(side='left', padx=8)
+        _make_styled_button(foot, 'Next: Wednesday capacity  →',
+                            command=_proceed, style='primary').pack(side='right', padx=8)
+
+        def _fit_window():
+            root.update_idletasks()
+            w = root.winfo_width()
+            h = root.winfo_reqheight()
+            screen_h = root.winfo_screenheight()
+            h = min(h + 20, screen_h - 80)
+            x = (root.winfo_screenwidth()  - w) // 2
+            y = (root.winfo_screenheight() - h) // 2
+            root.geometry(f'{w}x{h}+{x}+{y}')
+        root.after(10, _fit_window)
+
 
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 2: Wednesday Capacity
     # ─────────────────────────────────────────────────────────────────────────
     def screen_wednesday():
-        root.title('Sing Lab Scheduler — Wednesday Capacity')
+        root.title('SING Pipeline Scheduler — Wednesday capacity')
         root.geometry('620x460')
 
         wednesdays = get_next_wednesdays(6)
         capacity   = CONFIG['WEDNESDAY_CAPACITY']
 
-        hdr = tk.Frame(root, bg='#2c3e50', pady=10)
-        hdr.pack(fill='x')
-        tk.Label(hdr, text='Wednesday Behavior Capacity',
-                 font=('Helvetica', 14, 'bold'),
-                 bg='#2c3e50', fg='white').pack()
-        tk.Label(hdr,
-                 text=f'Max {capacity} animals per Wednesday.\n'
-                      'Enter how many slots are already booked.',
-                 font=('Helvetica', 9), bg='#2c3e50', fg='#bdc3c7').pack(pady=(2, 4))
+        _make_header(
+            eyebrow='Step 2 of 2',
+            title='Wednesday behavior slots',
+            subtitle=f'Max {capacity} animals per Wednesday. Enter how many are already booked.',
+        )
 
-        body = tk.Frame(root, bg='#f0f0f0', padx=24, pady=14)
+        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=14)
         body.pack(fill='both', expand=True)
 
         # Column headers
-        for col, (txt, w) in enumerate([('Wednesday', 24), ('Already Booked', 15),
-                                         ('Remaining', 12), ('Status', 14)]):
-            tk.Label(body, text=txt, width=w, anchor='w' if col == 0 else 'center',
-                     font=('Helvetica', 10, 'bold'), bg='#f0f0f0'
-                     ).grid(row=0, column=col, pady=(0, 6))
+        col_specs = [('Wednesday', 22, 'w'), ('Booked', 9, 'center'),
+                     ('Remaining', 10, 'center'), ('Status', 12, 'center')]
+        for col, (txt, w, anchor) in enumerate(col_specs):
+            tk.Label(body, text=txt.upper(), width=w, anchor=anchor,
+                     font=('Helvetica', 8), fg=_T['text_faint'],
+                     bg=_T['bg']).grid(row=0, column=col, pady=(0, 6), sticky='w' if anchor=='w' else '')
+
+        # Separator line
+        sep = tk.Frame(body, bg=_T['border'], height=1)
+        sep.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(0, 4))
 
         entries = {}
 
@@ -8347,29 +8596,37 @@ def run_pipeline_gui():
             rem = capacity - booked
             rl.configure(text=str(rem))
             if rem <= 0:
-                sl.configure(text='🔴 FULL',  fg='#c0392b')
+                sl.configure(text='● Full',  fg=_T['red'])
+                rl.configure(fg=_T['red'])
             elif rem <= 3:
-                sl.configure(text='🟡 LOW',   fg='#e67e22')
+                sl.configure(text='● Low',   fg=_T['amber'])
+                rl.configure(fg=_T['amber'])
             else:
-                sl.configure(text='🟢 Open',  fg='#27ae60')
+                sl.configure(text='● Open',  fg=_T['accent'])
+                rl.configure(fg=_T['accent_text'])
 
-        for i, wed in enumerate(wednesdays, 1):
-            label = wed.strftime('%A, %Y-%m-%d')
-            tk.Label(body, text=label, width=24, anchor='w',
-                     font=('Helvetica', 9), bg='#f0f0f0'
-                     ).grid(row=i, column=0, pady=5)
+        for i, wed in enumerate(wednesdays, 2):
+            label_date = wed.strftime('%a, %b %-d')
+            label_full = wed.strftime('%Y-%m-%d')
+
+            date_frame = tk.Frame(body, bg=_T['bg'])
+            date_frame.grid(row=i, column=0, sticky='w', pady=5)
+            tk.Label(date_frame, text=label_date, width=14, anchor='w',
+                     font=('Helvetica', 10), bg=_T['bg'], fg=_T['text']).pack(anchor='w')
+            tk.Label(date_frame, text=label_full, anchor='w',
+                     font=('Helvetica', 8), bg=_T['bg'], fg=_T['text_faint']).pack(anchor='w')
 
             var = tk.StringVar(value='0')
-            ttk.Spinbox(body, from_=0, to=capacity, textvariable=var, width=7
+            ttk.Spinbox(body, from_=0, to=capacity, textvariable=var, width=6
                         ).grid(row=i, column=1, pady=5)
             entries[wed] = var
 
-            rl = tk.Label(body, text=str(capacity), width=12, anchor='center',
-                          font=('Helvetica', 9), bg='#f0f0f0', fg='#27ae60')
+            rl = tk.Label(body, text=str(capacity), width=10, anchor='center',
+                          font=('Helvetica', 10), bg=_T['bg'], fg=_T['accent_text'])
             rl.grid(row=i, column=2)
 
-            sl = tk.Label(body, text='🟢 Open', width=14, anchor='center',
-                          font=('Helvetica', 9), bg='#f0f0f0', fg='#27ae60')
+            sl = tk.Label(body, text='● Open', width=12, anchor='center',
+                          font=('Helvetica', 10), bg=_T['bg'], fg=_T['accent'])
             sl.grid(row=i, column=3)
 
             var.trace_add('write', lambda *_, w=wed, v=var, r=rl, s=sl:
@@ -8388,77 +8645,90 @@ def run_pipeline_gui():
             state['full_behavior_dates'] = full_dates if full_dates else None
             _switch(screen_progress)
 
-        foot = tk.Frame(root, bg='#ecf0f1', pady=10)
-        foot.pack(fill='x', padx=24)
-        tk.Button(foot, text='← Back',
-                  command=lambda: _switch(screen_file_setup),
-                  font=('Helvetica', 10), bg='#95a5a6', fg='white',
-                  relief='flat', padx=12, pady=6, cursor='hand2').pack(side='left')
-        tk.Button(foot, text='Run Pipeline  →',
-                  command=_proceed,
-                  font=('Helvetica', 11, 'bold'), bg='#27ae60', fg='white',
-                  relief='flat', padx=16, pady=7, cursor='hand2').pack(side='right')
+        foot = _make_footer()
+        _make_styled_button(foot, '← Back',
+                            command=lambda: _switch(screen_file_setup),
+                            style='ghost').pack(side='left', padx=8)
+        _make_styled_button(foot, 'Run pipeline  →',
+                            command=_proceed, style='primary').pack(side='right', padx=8)
 
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 3: Progress + mid-run dialogs
     # ─────────────────────────────────────────────────────────────────────────
     def screen_progress():
-        root.title('Sing Lab Scheduler — Running…')
+        root.title('SING Pipeline Scheduler — Running…')
         root.geometry('760x560')
 
-        hdr = tk.Frame(root, bg='#2c3e50', pady=10)
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=14)
         hdr.pack(fill='x')
-        tk.Label(hdr, text='Pipeline Running',
+        hdr_inner = tk.Frame(hdr, bg=_T['hdr_bg'])
+        hdr_inner.pack(fill='x', padx=24)
+        tk.Label(hdr_inner, text='Pipeline running',
                  font=('Helvetica', 14, 'bold'),
-                 bg='#2c3e50', fg='white').pack()
+                 bg=_T['hdr_bg'], fg=_T['text']).pack(side='left')
         status_var = tk.StringVar(value='Starting up…')
-        tk.Label(hdr, textvariable=status_var,
-                 font=('Helvetica', 9), bg='#2c3e50', fg='#bdc3c7').pack()
+        tk.Label(hdr_inner, textvariable=status_var,
+                 font=('Helvetica', 9), bg=_T['hdr_bg'],
+                 fg=_T['text_muted']).pack(side='right')
+        tk.Frame(root, bg=_T['border'], height=1).pack(fill='x')
 
         log_widget = scrolledtext.ScrolledText(
-            root, font=('Courier', 9), bg='#1e1e1e', fg='#d4d4d4',
-            insertbackground='white', wrap='word', state='disabled'
+            root, font=('Courier', 9), bg='#0f1117', fg='#7ec8a4',
+            insertbackground='white', wrap='word', state='disabled',
+            relief='flat', bd=0,
         )
-        log_widget.pack(fill='both', expand=True, padx=12, pady=(8, 4))
+        log_widget.pack(fill='both', expand=True, padx=16, pady=(12, 4))
+        log_widget.tag_config('err', foreground='#f87171')
 
-        foot = tk.Frame(root, bg='#ecf0f1', pady=8)
-        foot.pack(fill='x', padx=12)
+        foot = _make_footer()
 
         def _append_log(text):
             log_widget.configure(state='normal')
-            log_widget.insert('end', text + '\n')
+            if 'ERROR' in text or '✗' in text:
+                log_widget.insert('end', text + '\n', 'err')
+            else:
+                log_widget.insert('end', text + '\n')
             log_widget.see('end')
             log_widget.configure(state='disabled')
 
-        # ── Mid-run dialog: sample number ─────────────────────────────────────
-        def _ask_sample_number():
+        # ── Mid-run dialog helper ─────────────────────────────────────────────
+        def _make_dialog(title_text, body_text):
+            """Create a clean modal dialog, returning (dlg, frame_for_inputs)."""
             dlg = tk.Toplevel(root)
-            dlg.title('Starting Sample Number')
-            dlg.configure(bg='#f0f0f0')
+            dlg.title(title_text)
+            dlg.configure(bg=_T['bg'])
             dlg.grab_set()
             dlg.resizable(False, False)
-
-            tk.Label(dlg, text='Sample Number Setup',
+            tk.Frame(dlg, bg=_T['border'], height=1).pack(fill='x')
+            tk.Label(dlg, text=title_text,
                      font=('Helvetica', 12, 'bold'),
-                     bg='#f0f0f0').pack(pady=(16, 4), padx=20)
-            tk.Label(dlg,
-                     text='Enter the last sample number used.\nThe next run will start from that number + 1.',
-                     font=('Helvetica', 9), bg='#f0f0f0', justify='center').pack(padx=20)
+                     bg=_T['bg'], fg=_T['text']).pack(pady=(16, 4), padx=24)
+            tk.Label(dlg, text=body_text,
+                     font=('Helvetica', 9), bg=_T['bg'],
+                     fg=_T['text_muted'], justify='center').pack(padx=24)
+            inner = tk.Frame(dlg, bg=_T['bg'])
+            inner.pack(pady=12, padx=24)
+            return dlg, inner
 
-            frame = tk.Frame(dlg, bg='#f0f0f0')
-            frame.pack(pady=12, padx=20)
-            tk.Label(frame, text='Last sample number used:',
-                     font=('Helvetica', 9), bg='#f0f0f0').grid(row=0, column=0, padx=(0, 8))
+        # ── Mid-run dialog: sample number ─────────────────────────────────────
+        def _ask_sample_number():
+            dlg, inner = _make_dialog(
+                'Sample number setup',
+                'Enter the last sample number used.\nThe next run will start from that number + 1.'
+            )
+            tk.Label(inner, text='Last sample number used:',
+                     font=('Helvetica', 9), bg=_T['bg'],
+                     fg=_T['text_muted']).grid(row=0, column=0, padx=(0, 8))
             var = tk.StringVar()
-            e = ttk.Entry(frame, textvariable=var, width=10)
+            e = ttk.Entry(inner, textvariable=var, width=10)
             e.grid(row=0, column=1)
             e.focus()
 
             preview = tk.Label(dlg, text='', font=('Helvetica', 9, 'italic'),
-                               bg='#f0f0f0', fg='#27ae60')
+                               bg=_T['bg'], fg=_T['accent'])
             preview.pack()
             err_lbl = tk.Label(dlg, text='', font=('Helvetica', 9),
-                                bg='#f0f0f0', fg='#c0392b')
+                               bg=_T['bg'], fg=_T['red'])
             err_lbl.pack()
 
             def _update_preview(*_):
@@ -8479,9 +8749,8 @@ def run_pipeline_gui():
                 except ValueError:
                     err_lbl.configure(text='Please enter a valid whole number.')
 
-            tk.Button(dlg, text='Confirm', command=_ok,
-                      font=('Helvetica', 10, 'bold'), bg='#27ae60', fg='white',
-                      relief='flat', padx=14, pady=5, cursor='hand2').pack(pady=(6, 16))
+            _make_styled_button(dlg, 'Confirm', _ok,
+                                style='primary').pack(pady=(6, 16))
             dlg.bind('<Return>', lambda e: _ok())
 
             dlg.update_idletasks()
@@ -8492,31 +8761,21 @@ def run_pipeline_gui():
 
         # ── Mid-run dialog: label offset ──────────────────────────────────────
         def _ask_label_offset(sheet_num, labels_remaining):
-            dlg = tk.Toplevel(root)
-            dlg.title(f'Label Sheet {sheet_num}')
-            dlg.configure(bg='#f0f0f0')
-            dlg.grab_set()
-            dlg.resizable(False, False)
-
-            tk.Label(dlg, text=f'Label Sheet {sheet_num}',
-                     font=('Helvetica', 12, 'bold'),
-                     bg='#f0f0f0').pack(pady=(16, 4), padx=20)
-            tk.Label(dlg,
-                     text=f'{labels_remaining} labels remaining to place.\n'
-                          f'How many label slots are already used on this sheet?\n'
-                          f'(Enter 0 if the sheet is blank.)',
-                     font=('Helvetica', 9), bg='#f0f0f0', justify='center').pack(padx=20)
-
-            frame = tk.Frame(dlg, bg='#f0f0f0')
-            frame.pack(pady=12, padx=20)
-            tk.Label(frame, text='Labels already used:',
-                     font=('Helvetica', 9), bg='#f0f0f0').grid(row=0, column=0, padx=(0, 8))
+            dlg, inner = _make_dialog(
+                f'Label sheet {sheet_num}',
+                f'{labels_remaining} labels remaining to place.\n'
+                f'How many slots are already used on this sheet?\n'
+                f'(Enter 0 if the sheet is blank.)'
+            )
+            tk.Label(inner, text='Labels already used:',
+                     font=('Helvetica', 9), bg=_T['bg'],
+                     fg=_T['text_muted']).grid(row=0, column=0, padx=(0, 8))
             var = tk.StringVar(value='0')
-            ttk.Spinbox(frame, from_=0, to=LABELS_PER_PAGE - 1,
+            ttk.Spinbox(inner, from_=0, to=LABELS_PER_PAGE - 1,
                         textvariable=var, width=6).grid(row=0, column=1)
 
             err_lbl = tk.Label(dlg, text='', font=('Helvetica', 9),
-                                bg='#f0f0f0', fg='#c0392b')
+                               bg=_T['bg'], fg=_T['red'])
             err_lbl.pack()
 
             def _ok():
@@ -8530,9 +8789,8 @@ def run_pipeline_gui():
                 except ValueError:
                     err_lbl.configure(text='Please enter a valid number.')
 
-            tk.Button(dlg, text='Confirm', command=_ok,
-                      font=('Helvetica', 10, 'bold'), bg='#27ae60', fg='white',
-                      relief='flat', padx=14, pady=5, cursor='hand2').pack(pady=(6, 16))
+            _make_styled_button(dlg, 'Confirm', _ok,
+                                style='primary').pack(pady=(6, 16))
             dlg.bind('<Return>', lambda e: _ok())
 
             dlg.update_idletasks()
@@ -8543,26 +8801,16 @@ def run_pipeline_gui():
 
         # ── Mid-run dialog: label continue ────────────────────────────────────
         def _ask_label_continue(sheet_num):
-            dlg = tk.Toplevel(root)
-            dlg.title('Load Next Sheet')
-            dlg.configure(bg='#f0f0f0')
-            dlg.grab_set()
-            dlg.resizable(False, False)
-
-            tk.Label(dlg, text=f'Ready for Sheet {sheet_num}?',
-                     font=('Helvetica', 12, 'bold'),
-                     bg='#f0f0f0').pack(pady=(16, 4), padx=20)
-            tk.Label(dlg,
-                     text='Load the next label sheet into your printer, then click Continue.',
-                     font=('Helvetica', 9), bg='#f0f0f0').pack(padx=20, pady=4)
-
+            dlg, _ = _make_dialog(
+                f'Ready for sheet {sheet_num}?',
+                'Load the next label sheet into your printer, then click Continue.'
+            )
             def _ok():
                 _gui_respond(True)
                 dlg.destroy()
 
-            tk.Button(dlg, text='Continue  →', command=_ok,
-                      font=('Helvetica', 10, 'bold'), bg='#27ae60', fg='white',
-                      relief='flat', padx=14, pady=5, cursor='hand2').pack(pady=(12, 16))
+            _make_styled_button(dlg, 'Continue  →', _ok,
+                                style='primary').pack(pady=(12, 16))
             dlg.bind('<Return>', lambda e: _ok())
 
             dlg.update_idletasks()
@@ -8591,7 +8839,7 @@ def run_pipeline_gui():
                             status_var.set('✗ Error — see log')
                             _append_log(f'\n✗ ERROR: {pipeline_done["error"]}')
                             _add_close_button()
-                        return   # stop polling
+                        return
                     elif msg['kind'] == _MSG_REQUEST:
                         rtype = msg['type']
                         if rtype == 'sample_number':
@@ -8605,9 +8853,8 @@ def run_pipeline_gui():
             root.after(120, _poll)
 
         def _add_close_button():
-            tk.Button(foot, text='Close', command=root.destroy,
-                      font=('Helvetica', 10), bg='#e74c3c', fg='white',
-                      relief='flat', padx=12, pady=5).pack(side='right')
+            _make_styled_button(foot, 'Close', root.destroy,
+                                style='secondary').pack(side='right', padx=8)
 
         # ── Pipeline thread ───────────────────────────────────────────────────
         def _run_pipeline():
@@ -8618,22 +8865,21 @@ def run_pipeline_gui():
                 setup_logging(script_dir, CONFIG['LOG_LEVEL'])
 
                 schedule_file, assignments_df = create_complete_schedule(
-                    animal_file       = state['animal_file'],
-                    tracking_file     = state.get('tracking_file'),
-                    births_file       = state.get('births_file'),
-                    output_dir        = script_dir,
-                    birth_date_start  = None,
-                    birth_date_end    = None,
+                    animal_file         = state['animal_file'],
+                    tracking_file       = state.get('tracking_file'),
+                    births_file         = state.get('births_file'),
+                    output_dir          = script_dir,
+                    birth_date_start    = None,
+                    birth_date_end      = None,
                     behavior_date_start = None,
                     behavior_date_end   = None,
                     full_behavior_dates = state.get('full_behavior_dates'),
                 )
 
                 timestamp = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
-
                 output_files = [schedule_file]
 
-                if assignments_df is not None and len(assignments_df) > 0:
+                if assignments_df is not None and not assignments_df.empty:
                     if 'Line' not in assignments_df.columns:
                         if 'Strain' in assignments_df.columns:
                             assignments_df['Line'] = assignments_df['Strain']
@@ -8678,46 +8924,65 @@ def run_pipeline_gui():
     # SCREEN 4: Summary
     # ─────────────────────────────────────────────────────────────────────────
     def screen_summary(result):
-        root.title('Sing Lab Scheduler — Complete')
-        root.geometry('640x420')
+        root.title('SING Pipeline Scheduler — Complete')
+        root.geometry('640x440')
 
-        hdr = tk.Frame(root, bg='#27ae60', pady=14)
+        # Header with green accent on title
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=16)
         hdr.pack(fill='x')
-        tk.Label(hdr, text='✓  Pipeline Complete',
+        tk.Frame(root, bg=_T['border'], height=1).pack(fill='x')
+        title_row = tk.Frame(hdr, bg=_T['hdr_bg'])
+        title_row.pack()
+        tk.Label(title_row, text='✓',
+                 font=('Helvetica', 14), bg=_T['hdr_bg'],
+                 fg=_T['accent']).pack(side='left', padx=(0, 6))
+        tk.Label(title_row, text='Pipeline complete',
                  font=('Helvetica', 16, 'bold'),
-                 bg='#27ae60', fg='white').pack()
+                 bg=_T['hdr_bg'], fg=_T['text']).pack(side='left')
+        tk.Label(hdr, text='Output files saved to the script folder.',
+                 font=('Helvetica', 10), bg=_T['hdr_bg'],
+                 fg=_T['text_muted']).pack(pady=(2, 0))
 
-        body = tk.Frame(root, bg='#f0f0f0', padx=24, pady=16)
+        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=14)
         body.pack(fill='both', expand=True)
 
-        tk.Label(body, text='Output files saved to:',
-                 font=('Helvetica', 10, 'bold'),
-                 bg='#f0f0f0', fg='#2c3e50').pack(anchor='w')
-        tk.Label(body, text=script_dir,
-                 font=('Helvetica', 9), bg='#f0f0f0', fg='#7f8c8d').pack(anchor='w', pady=(0, 12))
+        # Folder path strip
+        path_strip = tk.Frame(body, bg=_T['bg_inset'], padx=10, pady=6)
+        path_strip.pack(fill='x', pady=(0, 12))
+        tk.Label(path_strip, text=script_dir,
+                 font=('Courier', 8), bg=_T['bg_inset'],
+                 fg=_T['text_muted'], anchor='w').pack(fill='x')
 
+        # File list
         files = result.get('output_files', [])
         for fpath in files:
             name = _os.path.basename(fpath)
             try:
-                size = _os.path.getsize(fpath)
+                size  = _os.path.getsize(fpath)
                 size_str = f'{size:,} bytes'
             except Exception:
                 size_str = ''
-            row = tk.Frame(body, bg='#ffffff', padx=8, pady=4,
-                           relief='solid', bd=1)
-            row.pack(fill='x', pady=2)
-            tk.Label(row, text=f'📄 {name}', font=('Helvetica', 9),
-                     bg='#ffffff', fg='#2c3e50', anchor='w').pack(side='left')
-            if size_str:
-                tk.Label(row, text=size_str, font=('Helvetica', 8),
-                         bg='#ffffff', fg='#95a5a6').pack(side='right')
 
-        foot = tk.Frame(root, bg='#ecf0f1', pady=10)
-        foot.pack(fill='x', padx=24)
+            row = tk.Frame(body, bg=_T['bg'], pady=5)
+            row.pack(fill='x')
+            tk.Frame(row, bg=_T['border'], height=1).pack(fill='x', pady=(0, 5))
+
+            inner = tk.Frame(row, bg=_T['bg'])
+            inner.pack(fill='x')
+
+            # Checkmark
+            tk.Label(inner, text='✓', font=('Helvetica', 10),
+                     bg=_T['bg'], fg=_T['accent'],
+                     width=2).pack(side='left')
+            tk.Label(inner, text=name, font=('Helvetica', 9),
+                     bg=_T['bg'], fg=_T['text'], anchor='w').pack(side='left', fill='x', expand=True)
+            if size_str:
+                tk.Label(inner, text=size_str, font=('Helvetica', 8),
+                         bg=_T['bg'], fg=_T['text_faint']).pack(side='right')
+
+        foot = _make_footer()
 
         def _run_again():
-            # Clear queues
             for q in (_pipeline_queue, _response_queue):
                 while not q.empty():
                     try:
@@ -8726,22 +8991,18 @@ def run_pipeline_gui():
                         pass
             _switch(screen_file_setup)
 
-        tk.Button(foot, text='Run Again',
-                  command=_run_again,
-                  font=('Helvetica', 10), bg='#3498db', fg='white',
-                  relief='flat', padx=12, pady=6, cursor='hand2').pack(side='left')
-        tk.Button(foot, text='Close',
-                  command=root.destroy,
-                  font=('Helvetica', 11, 'bold'), bg='#27ae60', fg='white',
-                  relief='flat', padx=16, pady=6, cursor='hand2').pack(side='right')
+        _make_styled_button(foot, 'Run again', _run_again,
+                            style='secondary').pack(side='left', padx=8)
+        _make_styled_button(foot, 'Close', root.destroy,
+                            style='primary').pack(side='right', padx=8)
 
     # ── Start on screen 1 ────────────────────────────────────────────────────
-    w = min(root.winfo_screenwidth() - 100, 760)
+    w = min(root.winfo_screenwidth() - 100, 720)
     h = min(root.winfo_screenheight() - 100, 560)
     x = (root.winfo_screenwidth()  - w) // 2
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f'{w}x{h}+{x}+{y}')
-    root.minsize(560, 380)
+    root.minsize(560, 400)
 
     screen_file_setup()
     root.mainloop()
