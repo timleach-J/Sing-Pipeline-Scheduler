@@ -204,13 +204,22 @@ def setup_logging(output_dir: str, level: str = 'INFO') -> logging.Logger:
     logger_instance.handlers.clear()
 
     if CONFIG['LOG_TO_FILE']:
-        file_handler = RotatingFileHandler(log_file, maxBytes=10*1024*1024, backupCount=5)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
         file_handler.setLevel(getattr(logging, level.upper()))
         file_handler.setFormatter(formatter)
         logger_instance.addHandler(file_handler)
 
     if CONFIG['LOG_TO_CONSOLE']:
-        console_handler = logging.StreamHandler()
+        import sys as _sys
+        stream = _sys.stdout
+        # On Windows, wrap stream to handle Unicode safely
+        if hasattr(stream, 'reconfigure'):
+            try:
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
+        console_handler = logging.StreamHandler(stream)
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(formatter)
         logger_instance.addHandler(console_handler)
@@ -742,6 +751,7 @@ def read_animal_data(filename: str) -> pd.DataFrame:
     df['Birth ID'] = df['Birth ID'].astype(str)
 
     df['Genotype'] = df['Genotype'].apply(normalize_genotype)
+    df['Raw_Genotype'] = df['Genotype'].copy()  # preserve before canonicalization
     df['Genotype'] = df.apply(
         lambda row: canonicalize_genotype(row['Genotype'], row.get('Line (Short)', '')),
         axis=1
@@ -2505,7 +2515,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         assignments_df['Assigned_Timepoint'].isin(['P14', 'P56'])
     ].copy()
 
-    if schedulable.empty:
+    if len(schedulable) == 0:
         return {}
 
     # Compute auto-suggested types
@@ -2550,8 +2560,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     left_frame.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
     # Column headers
-    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Harvest Type']
-    col_widths = [18, 12, 8, 10, 16]
+    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Harvest Type']
+    col_widths = [18, 12, 8, 10, 12, 16]
 
     hdr_row = tk.Frame(left_frame, bg='#2c3e50')
     hdr_row.pack(fill='x')
@@ -2560,6 +2570,23 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
             hdr_row, text=h, width=w, anchor='w',
             font=('Helvetica', 9, 'bold'),
             bg='#2c3e50', fg='white', padx=4, pady=4
+        ).pack(side='left')
+
+    # ── Color key ─────────────────────────────────────────────────────────────
+    key_frame = tk.Frame(left_frame, bg='#e8e8e8', pady=3)
+    key_frame.pack(fill='x')
+    tk.Label(
+        key_frame, text='Row color = selected harvest type:',
+        font=('Helvetica', 8, 'italic'), bg='#e8e8e8', fg='#555555', padx=6
+    ).pack(side='left')
+    for label, color in OPTION_COLORS.items():
+        swatch = tk.Frame(key_frame, bg=color, width=12, height=12,
+                          relief='solid', bd=1)
+        swatch.pack(side='left', padx=(4, 1), pady=2)
+        swatch.pack_propagate(False)
+        tk.Label(
+            key_frame, text=label,
+            font=('Helvetica', 8), bg='#e8e8e8', fg='#333333', padx=2
         ).pack(side='left')
 
     # Scrollable rows
@@ -2591,11 +2618,27 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     sorted_rows = sorted(schedulable.to_dict('records'), key=_harvest_sort_key)
 
     # Store StringVars so we can read them later
-    selection_vars = {}   # name → StringVar
-    row_frames     = {}   # name → tk.Frame (for recoloring)
+    selection_vars   = {}   # name → StringVar
+    selection_values = {}   # name → current value (always in sync, avoids tkinter canvas StringVar decouple bug)
+    selection_menus  = {}   # name → Combobox widget (for direct .get() at confirm time)
+    row_frames       = {}   # name → tk.Frame (for recoloring)
+
+    def _on_type_change_cb(name, combobox, frame):
+        """Called on <<ComboboxSelected>> — reads directly from combobox widget."""
+        val = combobox.get()
+        selection_values[name] = val   # store in plain dict (reliable)
+        color = OPTION_COLORS.get(val, '#ffffff')
+        frame.configure(bg=color)
+        for w in frame.winfo_children():
+            try:
+                w.configure(bg=color)
+            except Exception:
+                pass
+        _refresh_quota_panel()
 
     def _on_type_change(name, var, frame):
         val = var.get()
+        selection_values[name] = val
         color = OPTION_COLORS.get(val, '#ffffff')
         frame.configure(bg=color)
         for w in frame.winfo_children():
@@ -2614,13 +2657,27 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
+        selection_values[name] = default   # seed plain-dict copy
 
         bg = '#ffffff' if i % 2 == 0 else '#f7f7f7'
         frame = tk.Frame(rows_frame, bg=bg)
         frame.pack(fill='x')
         row_frames[name] = frame
 
-        for val, w in zip([name, strain, sex, timepoint], col_widths[:4]):
+        # Pick the relevant date: P14 -> harvest date, P56 -> behavior date
+        # A missing date here means a scheduling logic error — flag it clearly
+        if timepoint == 'P14':
+            raw_date = str(row.get('P14_Date', '') or '')
+        else:
+            raw_date = str(row.get('P56_Behavior_Date', '') or '')
+        try:
+            from datetime import datetime as _dt
+            display_date = _dt.strptime(raw_date, '%Y-%m-%d').strftime('%m/%d/%y')
+        except Exception:
+            display_date = '⚠ NO DATE'
+            logger.warning(f"Animal {name} ({timepoint}) is scheduled but has no date — check scheduling logic")
+
+        for val, w in zip([name, strain, sex, timepoint, display_date], col_widths[:5]):
             tk.Label(
                 frame, text=val, width=w, anchor='w',
                 font=('Helvetica', 9), bg=bg, padx=4, pady=3
@@ -2632,8 +2689,9 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
             state='readonly', width=col_widths[4] - 2
         )
         menu.pack(side='left', padx=2, pady=2)
+        selection_menus[name] = menu  # store widget ref for direct read at confirm
         menu.bind('<<ComboboxSelected>>',
-                  lambda e, n=name, v=var, f=frame: _on_type_change(n, v, f))
+                  lambda e, n=name, f=frame, m=menu: _on_type_change_cb(n, m, f))
 
         # Apply initial color
         c = OPTION_COLORS.get(default, bg)
@@ -2676,7 +2734,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         for w in quota_rows_frame.winfo_children():
             w.destroy()
 
-        current = {n: v.get() for n, v in selection_vars.items()}
+        current = dict(selection_values)  # use plain-dict copy, not StringVar (avoids canvas decouple bug)
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
 
         if not quota_data:
@@ -2728,19 +2786,31 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     def _reset_to_auto():
         for name, var in selection_vars.items():
-            var.set(auto_types.get(name, 'Perfusion'))
+            val = auto_types.get(name, 'Perfusion')
+            var.set(val)
+            selection_values[name] = val  # keep plain-dict in sync
             frame = row_frames[name]
             c = OPTION_COLORS.get(var.get(), '#ffffff')
             frame.configure(bg=c)
             for w in frame.winfo_children():
                 try:
                     w.configure(bg=c)
-                except (AttributeError, TypeError) as e:
-                    logger.debug(f"auto_size_columns: skipping cell — {e}")
+                except Exception:
+                    pass
         _refresh_quota_panel()
 
     def _confirm():
-        current = {n: v.get() for n, v in selection_vars.items()}
+        # Build current from selection_values (kept in sync by _on_type_change_cb)
+        # Fall back to menu.get() for any animal not yet interacted with
+        current = {}
+        for name in selection_menus:
+            val = selection_values.get(name)
+            if not val:
+                val = selection_menus[name].get() or 'Perfusion'
+            current[name] = val
+        # Debug log all selections
+        for _n, _h in sorted(current.items()):
+            logger.info(f"CONFIRM: {_n} → {_h}")
 
         # ── Quota check (harvest types only, not Extra or Do Not Schedule) ────
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
@@ -2872,21 +2942,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
 
 def write_harvest_overrides_template(assignments_df: pd.DataFrame, overrides_file: str) -> None:
-    """
-    Write a pre-filled harvest_overrides.csv from the current auto-assignments.
-
-    Only written when the file does not already exist — so editing and re-running
-    is safe; your changes won't be stomped.
-
-    The CSV has one row per schedulable animal with the auto-assigned Harvest_Type
-    already filled in.  Edit only the rows you want to change, then re-run.
-    Rows for Unschedulable animals are included but commented out so you have
-    the full picture without them cluttering the active list.
-    """
-    if os.path.exists(overrides_file):
-        logger.info(f"harvest_overrides.csv already exists — not overwriting: {overrides_file}")
-        return
-
+    """Write confirmed assignments to harvest_overrides.csv. Always overwrites."""
     if assignments_df is None or assignments_df.empty:
         return
 
@@ -4359,7 +4415,7 @@ def create_p56_schedule(assignments_df: pd.DataFrame) -> pd.DataFrame:
                     if a.get('Harvest_Type') not in ('COMPLETE (Quota Filled)',)
                 ])
 
-    if kept_animals.empty:
+    if not kept_animals:
         return pd.DataFrame()
 
     p56_filtered = pd.DataFrame(kept_animals)
@@ -4657,6 +4713,11 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     if len(assignments) > 0:
         # Show the GUI — user reviews and confirms (or skips for auto)
         gui_selections = prompt_harvest_assignments_gui(assignments, remaining_needs)
+
+        # Log exactly what the GUI returned
+        print(f"\n  GUI returned {len(gui_selections)} selections:")
+        for _n, _h in sorted(gui_selections.items()):
+            print(f"    {_n}: {_h}")
 
         # Separate out any "Do Not Schedule" animals
         do_not_schedule = {
@@ -6885,7 +6946,7 @@ def run_harvest_and_samples(working_df, timestamp):
             'Line': row.get('Line (Short)', ''),
             'BD': birth_date_str,
             'Housing': row.get('Housing ID', ''),
-            'Identification': row.get('Marker_Type', ''),
+            'Identification': row.get('Marker', row.get('Marker_Type', '')),
             'Sex': row.get('Sex', ''),
             'Age (Days)': row.get('Age_Days', ''),
             'Envision Date': envision_date_str,
@@ -7102,9 +7163,12 @@ class MultiSheetExporter:
                 self._safe_get(row, 'Birth_Date'),
                 self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             )
+            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint') or ''
+            harvest_date = self._safe_get(row, 'Harvest Date', 'Harvest_Date')
+            wean_date = harvest_date if str(timepoint).strip() == 'P14' else self._safe_get(row, 'Wean Date')
             tracking_data.append({
                 'Name_sample': self._safe_get(row, 'Sample_Name'),
-                'Harvest Date': self._safe_get(row, 'Harvest Date', 'Harvest_Date'),
+                'Harvest Date': harvest_date,
                 'Age (weeks)_sample': age_weeks,
                 'Name_subject': self._safe_get(row, 'Animal_Name'),
                 'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
@@ -7112,10 +7176,10 @@ class MultiSheetExporter:
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse',
-                'Genotype': self._safe_get(row, 'Genotype', 'Genotype_animal', 'Genotype_sample'),
+                'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
                 'Birth Date': self._safe_get(row, 'Birth_Date'),
-                'Wean Date': self._safe_get(row, 'Wean Date'),
-                'Harvest Timepoint': self._safe_get(row, 'Assigned_Timepoint')
+                'Wean Date': wean_date,
+                'Harvest Timepoint': timepoint
             })
 
         column_order = [
@@ -7157,6 +7221,9 @@ class MultiSheetExporter:
                 self._safe_get(row, 'Birth_Date'),
                 self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             )
+            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint') or ''
+            harvest_date = self._safe_get(row, 'Harvest Date', 'Harvest_Date')
+            wean_date = harvest_date if str(timepoint).strip() == 'P14' else self._safe_get(row, 'Wean Date')
             tracker_data.append({
                 'Name_sample': self._safe_get(row, 'Sample_Name'),
                 'Age (weeks)_sample': age_weeks,
@@ -7166,15 +7233,15 @@ class MultiSheetExporter:
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse',
-                'Genotype': self._safe_get(row, 'Genotype', 'Genotype_animal', 'Genotype_sample'),
+                'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
                 'Birth Date': self._safe_get(row, 'Birth_Date'),
-                'Wean Date': self._safe_get(row, 'Wean Date'),
-                'Dissect Date': self._safe_get(row, 'Harvest Date', 'Harvest_Date')
+                'Wean Date': wean_date,
+                'Dissect Date': harvest_date
             })
 
         column_order = [
-            'Name_sample', 'Age (weeks)_sample', 'Name_subject', 'Sex',
-            'Line_subject', 'Line (Short)', 'Line (Stock)', 'Species_subject',
+            'Name_sample', 'Line (Short)', 'Age (weeks)_sample', 'Sex',
+            'Name_subject', 'Line_subject', 'Line (Stock)', 'Species_subject',
             'Genotype', 'Birth Date', 'Wean Date', 'Dissect Date'
         ]
         df = pd.DataFrame(tracker_data)
@@ -7211,6 +7278,9 @@ class MultiSheetExporter:
                 self._safe_get(row, 'Birth_Date'),
                 self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             )
+            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint') or ''
+            harvest_date = self._safe_get(row, 'Harvest Date', 'Harvest_Date')
+            wean_date = harvest_date if str(timepoint).strip() == 'P14' else self._safe_get(row, 'Wean Date')
             tracker_data.append({
                 'Name_sample': self._safe_get(row, 'Sample_Name'),
                 'Age (weeks)_sample': age_weeks,
@@ -7220,10 +7290,10 @@ class MultiSheetExporter:
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse',
-                'Genotype': self._safe_get(row, 'Genotype', 'Genotype_animal', 'Genotype_sample'),
+                'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
                 'Birth Date': self._safe_get(row, 'Birth_Date'),
-                'Wean Date': self._safe_get(row, 'Wean Date'),
-                'Dissect Date': self._safe_get(row, 'Harvest Date', 'Harvest_Date')
+                'Wean Date': wean_date,
+                'Dissect Date': harvest_date
             })
 
         column_order = [
@@ -8061,7 +8131,7 @@ _T = {
     # Borders
     'border':      '#e5e7eb',
     'border_mid':  '#d1d5db',
-    # Accent (teal, matches mockup)
+    # Accent (teal)
     'accent':      '#1D9E75',
     'accent_lt':   '#EAF3DE',
     'accent_text': '#3B6D11',
@@ -8153,16 +8223,19 @@ def run_pipeline_gui():
     # SCREEN 1: File Setup
     # ─────────────────────────────────────────────────────────────────────────
     def screen_file_setup():
-        root.title('SING Pipeline Scheduler')
-        root.geometry('680x540')
+        root.title('Sing Lab Scheduler')
+        root.geometry('700x560')
 
-        _make_header(
-            eyebrow='SING Pipeline Scheduler',
-            title='Select input files',
-            subtitle='Files are detected automatically from the script folder.',
-        )
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = tk.Frame(root, bg='#2c3e50', pady=18)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text='Sing Lab Scheduler',
+                 font=('Helvetica', 20, 'bold'),
+                 bg='#2c3e50', fg='white').pack()
+        tk.Label(hdr, text='Which input files do you have ready?',
+                 font=('Helvetica', 10), bg='#2c3e50', fg='#bdc3c7').pack(pady=(4, 0))
 
-        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=16)
+        body = tk.Frame(root, bg='#f0f0f0', padx=24, pady=18)
         body.pack(fill='both', expand=True)
 
         # ── File card definitions ─────────────────────────────────────────────
@@ -8171,17 +8244,17 @@ def run_pipeline_gui():
                 'key':      'animal_file',
                 'default':  CONFIG['INPUT_ANIMAL_FILE'],
                 'required': True,
-                'label':    'Animal inventory',
-                'hint':     f'Required  ·  default: {CONFIG["INPUT_ANIMAL_FILE"]}',
-                'desc':     'Alive animal export from Climb — the main colony list.',
+                'label':    'Animal Inventory',
+                'hint':     f'Required  •  usually "{CONFIG['INPUT_ANIMAL_FILE']}"',
+                'desc':     'The main list of all animals currently in the colony.',
             },
             {
                 'key':      'tracking_file',
                 'default':  CONFIG['INPUT_TRACKING_FILE'],
                 'required': False,
-                'label':    'Harvest tracking sheet',
-                'hint':     'Optional  ·  check to include in this run',
-                'desc':     'Completed harvest counts per strain.',
+                'label':    'Harvest Tracking Sheet',
+                'hint':     'Optional  •  check the box to include in this run',
+                'desc':     'Tracks how many of each strain/type have already been harvested.',
             },
             {
                 'key':      'births_file',
@@ -8377,182 +8450,6 @@ def run_pipeline_gui():
             root.geometry(f'{w}x{h}+{x}+{y}')
         root.after(10, _fit_window)
 
-        err_lbl = tk.Label(body, text='', font=('Helvetica', 9),
-                           bg=_T['bg'], fg=_T['red'])
-
-        def _update_status(key, path, lbl):
-            if not path.strip():
-                lbl.configure(text='', fg=_T['text_faint'])
-            elif _os.path.exists(path):
-                lbl.configure(text='✓  Found', fg=_T['accent'])
-            else:
-                lbl.configure(text='✗  Not found', fg=_T['red'])
-
-        def _browse(key, var, lbl, title):
-            path = filedialog.askopenfilename(
-                parent=root, title=title,
-                initialdir=_os.path.dirname(var.get()) or script_dir,
-                filetypes=[('CSV files', '*.csv'), ('All files', '*.*')]
-            )
-            if path:
-                var.set(path)
-                _update_status(key, path, lbl)
-
-        def _toggle_card(key, toggle_var, detail_frame):
-            pass
-
-        for fd in FILE_DEFS:
-            key      = fd['key']
-            required = fd['required']
-            default  = _os.path.join(script_dir, fd['default'])
-
-            exists       = _os.path.exists(default)
-            initial_path = default if exists else state.get(key, default)
-
-            # ── Card ─────────────────────────────────────────────────────────
-            card = tk.Frame(body, bg=_T['bg'], relief='solid', bd=1,
-                            highlightbackground=_T['border'],
-                            highlightthickness=1, padx=14, pady=10)
-            card.pack(fill='x', pady=5)
-            card.configure(highlightbackground=_T['border'])
-
-            # Top row: checkbox + label + badge + status
-            top_row = tk.Frame(card, bg=_T['bg'])
-            top_row.pack(fill='x')
-
-            tvar = tk.BooleanVar(value=exists or required)
-            toggle_vars[key] = tvar
-
-            chk = tk.Checkbutton(
-                top_row, variable=tvar,
-                bg=_T['bg'], activebackground=_T['bg'],
-                selectcolor=_T['bg'],
-                cursor='hand2' if not required else 'arrow',
-                state='normal' if not required else 'disabled',
-            )
-            chk.pack(side='left', padx=(0, 4))
-
-            tk.Label(top_row, text=fd['label'],
-                     font=('Helvetica', 11, 'bold'),
-                     bg=_T['bg'], fg=_T['text']).pack(side='left')
-
-            badge_text  = '  Required  ' if required else '  Optional  '
-            badge_bg    = _T['red_lt']    if required else _T['bg_inset']
-            badge_fg    = _T['red']       if required else _T['text_muted']
-            tk.Label(top_row, text=badge_text,
-                     font=('Helvetica', 8), bg=badge_bg, fg=badge_fg,
-                     padx=2).pack(side='left', padx=8)
-
-            # desc line
-            tk.Label(card, text=fd['desc'],
-                     font=('Helvetica', 9), bg=_T['bg'],
-                     fg=_T['text_muted'], anchor='w').pack(fill='x', pady=(2, 0))
-
-            # Path inset row
-            inset = tk.Frame(card, bg=_T['bg_inset'], padx=8, pady=6)
-            inset.pack(fill='x', pady=(8, 0))
-            detail_frames[key] = inset
-
-            tk.Label(inset, text=fd['hint'],
-                     font=('Helvetica', 8), bg=_T['bg_inset'],
-                     fg=_T['text_faint'], anchor='w').pack(fill='x', pady=(0, 4))
-
-            entry_row = tk.Frame(inset, bg=_T['bg_inset'])
-            entry_row.pack(fill='x')
-
-            pvar = tk.StringVar(value=initial_path)
-            path_vars[key] = pvar
-            state[key] = initial_path
-
-            slbl = tk.Label(entry_row, text='', font=('Helvetica', 9),
-                            bg=_T['bg_inset'], width=12, anchor='w')
-            status_lbls[key] = slbl
-
-            _make_styled_button(
-                entry_row, 'Browse…',
-                command=lambda k=key, v=pvar, l=slbl, t=fd['label']:
-                    _browse(k, v, l, f'Select {t}'),
-                style='secondary'
-            ).pack(side='right', padx=(4, 0))
-
-            slbl.pack(side='right', padx=(6, 0))
-
-            entry = tk.Entry(entry_row, textvariable=pvar,
-                             font=('Helvetica', 9), relief='flat',
-                             bg=_T['bg'], fg=_T['text'],
-                             insertbackground=_T['text'],
-                             highlightthickness=1,
-                             highlightbackground=_T['border_mid'])
-            entry.pack(side='left', fill='x', expand=True, ipady=3)
-
-            pvar.trace_add('write', lambda *_, k=key, v=pvar, l=slbl:
-                           _update_status(k, v.get(), l))
-            _update_status(key, initial_path, slbl)
-
-            tvar.trace_add('write', lambda *_, k=key, tv=tvar, df=inset:
-                           _toggle_card(k, tv, df))
-
-        err_lbl.pack(fill='x', pady=(4, 0))
-
-        # ── Footer ────────────────────────────────────────────────────────────
-        foot = _make_footer()
-
-        def _proceed():
-            err_lbl.configure(text='')
-
-            animal = path_vars['animal_file'].get().strip()
-            if not toggle_vars['animal_file'].get() or not animal:
-                err_lbl.configure(text='⚠  The Animal Inventory file is required to continue.')
-                return
-            if not _os.path.exists(animal):
-                err_lbl.configure(text=f'⚠  Animal Inventory not found: {animal}')
-                return
-
-            try:
-                import pandas as _pd
-                test_df = _pd.read_csv(animal, nrows=2)
-                missing = [c for c in CONFIG.get('REQUIRED_ANIMAL_COLUMNS', [])
-                           if c not in test_df.columns]
-                if missing:
-                    err_lbl.configure(text=f'⚠  Animal file missing columns: {missing}')
-                    return
-            except Exception as ex:
-                err_lbl.configure(text=f'⚠  Cannot read Animal Inventory: {ex}')
-                return
-
-            state['animal_file'] = animal
-
-            for key in ('tracking_file', 'births_file'):
-                if toggle_vars[key].get():
-                    p = path_vars[key].get().strip()
-                    state[key] = p if _os.path.exists(p) else None
-                    if toggle_vars[key].get() and not _os.path.exists(p):
-                        err_lbl.configure(
-                            text=f'⚠  File checked but not found:\n{p}\n'
-                                 f'Browse to it or uncheck the box.'
-                        )
-                        return
-                else:
-                    state[key] = None
-
-            _switch(screen_wednesday)
-
-        tk.Label(foot, text='v2.0', font=('Helvetica', 9),
-                 bg=_T['bg_subtle'], fg=_T['text_faint']).pack(side='left', padx=8)
-        _make_styled_button(foot, 'Next: Wednesday capacity  →',
-                            command=_proceed, style='primary').pack(side='right', padx=8)
-
-        def _fit_window():
-            root.update_idletasks()
-            w = root.winfo_width()
-            h = root.winfo_reqheight()
-            screen_h = root.winfo_screenheight()
-            h = min(h + 20, screen_h - 80)
-            x = (root.winfo_screenwidth()  - w) // 2
-            y = (root.winfo_screenheight() - h) // 2
-            root.geometry(f'{w}x{h}+{x}+{y}')
-        root.after(10, _fit_window)
-
 
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 2: Wednesday Capacity
@@ -8606,7 +8503,7 @@ def run_pipeline_gui():
                 rl.configure(fg=_T['accent_text'])
 
         for i, wed in enumerate(wednesdays, 2):
-            label_date = wed.strftime('%a, %b %-d')
+            label_date = wed.strftime('%a, %b ') + str(wed.day)
             label_full = wed.strftime('%Y-%m-%d')
 
             date_frame = tk.Frame(body, bg=_T['bg'])
@@ -8998,11 +8895,11 @@ def run_pipeline_gui():
 
     # ── Start on screen 1 ────────────────────────────────────────────────────
     w = min(root.winfo_screenwidth() - 100, 720)
-    h = min(root.winfo_screenheight() - 100, 560)
+    h = min(root.winfo_screenheight() - 100, 660)
     x = (root.winfo_screenwidth()  - w) // 2
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f'{w}x{h}+{x}+{y}')
-    root.minsize(560, 400)
+    root.minsize(560, 600)
 
     screen_file_setup()
     root.mainloop()
