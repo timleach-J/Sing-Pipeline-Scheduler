@@ -1391,6 +1391,20 @@ def calculate_remaining_needs(requirements: Dict) -> Dict:
     return remaining
 
 
+def resolve_strain_key(strain: str, genotype: str, remaining_needs: Dict) -> str:
+    """Return the requirements key for a strain+genotype combo.
+
+    Tries 'STRAIN-GENOTYPE' first (e.g. 'SHANK3-HET'), falls back to
+    'STRAIN' (e.g. 'SHANK3') if the composite key isn't in the tracking sheet.
+    """
+    base = str(strain).strip().upper()
+    geno = str(genotype).strip().upper()
+    composite = f"{base}-{geno}"
+    if composite in remaining_needs:
+        return composite
+    return base
+
+
 def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict) -> bool:
     strain_upper = str(strain).strip().upper()
     if strain_upper in _B6_STRAINS_UPPER:
@@ -2365,29 +2379,43 @@ import copy as _copy
 
 def _compute_auto_types(schedulable_df, remaining_needs):
     """
-    Run the same quota logic as assign_harvest_types but just return a
-    name → type dict without modifying the real assignments.
+    Suggest harvest type per animal based on remaining quota needs.
+    - MERFISH/RNAseq/Perfusion: fills the remaining quota for that type
+    - Extra: all quotas filled for this strain/sex/timepoint
+    B6/B6NJ check quota needs before defaulting to Perfusion.
     """
     working = _copy.deepcopy(remaining_needs)
     result = {}
 
     sorted_df = schedulable_df.sort_values(
-        ['Strain', 'Sex', 'Assigned_Timepoint', 'Animal_Name']
+        ['Assigned_Timepoint', 'Strain', 'Sex', 'Animal_Name']
     ).reset_index(drop=True)
 
     for _, row in sorted_df.iterrows():
-        name      = str(row.get('Animal_Name', '')).strip()
-        strain    = row.get('Strain', '')
-        sex       = row.get('Sex', '')
-        timepoint = row.get('Assigned_Timepoint', '')
-        strain_key = str(strain).strip().upper()
+        name       = str(row.get('Animal_Name', '')).strip()
+        strain     = row.get('Strain', '')
+        sex        = row.get('Sex', '')
+        timepoint  = row.get('Assigned_Timepoint', '')
+        genotype   = row.get('Genotype', '')
+        strain_key = resolve_strain_key(strain, genotype, working)
 
+        # B6/B6NJ — check quota first, then default to Perfusion
         if strain_key in _B6_STRAINS_UPPER:
+            if strain_key in working:
+                needs = working[strain_key][timepoint][sex]
+                if needs['MERFISH']['needed'] > 0:
+                    result[name] = 'MERFISH'
+                    needs['MERFISH']['needed'] -= 1
+                    continue
+                elif needs['RNAseq']['needed'] > 0:
+                    result[name] = 'RNAseq'
+                    needs['RNAseq']['needed'] -= 1
+                    continue
             result[name] = 'Perfusion'
             continue
 
         if strain_key not in working:
-            result[name] = 'Perfusion'
+            result[name] = 'Extra'
             continue
 
         needs = working[strain_key][timepoint][sex]
@@ -2402,7 +2430,7 @@ def _compute_auto_types(schedulable_df, remaining_needs):
             result[name] = 'Perfusion'
             needs['Perfusion']['needed'] -= 1
         else:
-            result[name] = 'Perfusion'   # over-quota default
+            result[name] = 'Extra'  # all quotas filled
 
     return result
 
@@ -2428,16 +2456,12 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         row = df_map.get(name)
         if row is None:
             continue
-        strain_key = str(row.get('Strain', '')).strip().upper()
+        strain_key = resolve_strain_key(row.get('Strain', ''), row.get('Genotype', ''), remaining_needs)
         timepoint  = str(row.get('Assigned_Timepoint', '')).strip()
         sex        = str(row.get('Sex', '')).strip()
         key = (strain_key, timepoint, sex, htype)
         counts[key] = counts.get(key, 0) + 1
 
-    # Build the set of (strain, timepoint, sex) combos that have at least
-    # one animal actually being harvested (not Extra or Do Not Schedule).
-    # This ensures we only flag quota mismatches for groups with real
-    # harvest animals in this run.
     present_combos = set()
     for name, htype in selections.items():
         if htype in ('Do Not Schedule', 'Extra'):
@@ -2445,7 +2469,7 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         row = df_map.get(name)
         if row is None:
             continue
-        sk = str(row.get('Strain', '')).strip().upper()
+        sk = resolve_strain_key(row.get('Strain', ''), row.get('Genotype', ''), remaining_needs)
         tp = str(row.get('Assigned_Timepoint', '')).strip()
         sx = str(row.get('Sex', '')).strip()
         if tp in ('P14', 'P56'):
@@ -3163,7 +3187,7 @@ def assign_harvest_types(assignments_df: pd.DataFrame,
             })
             continue
 
-        strain_key = str(strain).strip().upper()
+        strain_key = resolve_strain_key(strain, genotype, working_needs)
 
         if strain_key in _B6_STRAINS_UPPER:
             assignments_with_types.append({
