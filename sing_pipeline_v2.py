@@ -4728,7 +4728,11 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
             logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
             assignments = assignments[
-                ~assignments['Animal_Name'].isin(do_not_schedule)
+                ~assignments['Animal_Name'].astype(str).isin({str(n) for n in do_not_schedule})
+            ].copy()
+            # Also remove from eligibility so B6 enforcer can't re-add them
+            eligibility = eligibility[
+                ~eligibility['Animal_Name'].astype(str).isin({str(n) for n in do_not_schedule})
             ].copy()
 
         # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
