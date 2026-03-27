@@ -18,8 +18,8 @@ Built and maintained by Tim Leach, Research Technician, Kumar Lab.
 
 | File | Version | Status | Notes |
 |---|---|---|---|
-| `sing_pipeline.py` | v1.6 | Stable | Production version — use this if v2.0 has issues |
-| `sing_pipeline_v2.py` | v2.0 | Current | Python Expert refactor — correctness, performance, documentation |
+| `sing_pipeline.py` | v1.7 | Stable | Previous production version — fallback if needed |
+| `sing_pipeline_v2.py` | v2.0 | Current | Active production version |
 
 ---
 
@@ -40,6 +40,24 @@ pip install pandas openpyxl tqdm
 
 ---
 
+## Running the Pipeline
+
+Double-click `sing_pipeline_v2.py`, or run from the command line:
+
+```bash
+python sing_pipeline_v2.py
+```
+
+The GUI walks through four screens:
+
+1. **File Setup** — select input files (auto-detected from the script folder)
+2. **Wednesday Capacity** — enter how many behavior slots are already booked per Wednesday
+3. **Harvest Assignment Review** — review and adjust harvest type per animal, then confirm
+4. **Running** — pipeline executes with live log output
+5. **Summary** — output files listed with file sizes
+
+---
+
 ## Input Files
 
 Place these in the same folder as the script before running:
@@ -49,24 +67,7 @@ Place these in the same folder as the script before running:
 | `animals.csv` | Alive animal export from Climb |
 | `Sing Harvest Sheet - Summary Sheet.csv` | Tracking sheet with completed harvest counts per strain |
 | `births.csv` | Birth records export from Climb |
-| `harvest_overrides.csv` | *(Optional)* Manual harvest date overrides — leave rows blank for auto-assignment |
-
----
-
-## Running the Pipeline
-
-Double-click either `.py` file, or run from the command line:
-
-```bash
-python sing_pipeline_v2.py
-```
-
-The GUI walks through four screens:
-
-1. **File Setup** — select input files
-2. **Harvest Type** — choose Perfusion, MERFISH-OCT, or RNA-Seq
-3. **Running** — pipeline executes with live log output
-4. **Summary** — output files listed with file sizes
+| `harvest_overrides.csv` | Auto-generated after each run — shows confirmed assignments for reference |
 
 ---
 
@@ -76,13 +77,30 @@ All outputs are saved to the same directory as the script, timestamped:
 
 | Output | Description |
 |---|---|
-| `SING_Schedule_*.xlsx` | Master harvest schedule |
-| `Harvest_Sheet_*.xlsx` | Per-date harvest sheets |
-| `Samples_*.xlsx` | Sample tracking sheets |
-| `Envision_Import_*.xlsx` | Climb-to-Envision tag import file |
-| `Labels_*.xlsx` | Printable sample labels |
-| `Perfusion_Labels_*.xlsx` | Combined perfusion label sheet (single file, all dates) |
-| `logs/scheduler_*.log` | Run log with full diagnostics |
+| `Complete_Schedule_*.xlsx` | Master harvest schedule |
+| `Harvest_Sheet_Import_*.xlsx` | Per-date harvest sheets |
+| `Climb_Sample_Import_*.xlsx` | Sample import file for Climb |
+| `Lab_Data_Export_*.xlsx` | Deliverables tracker (Perfusion, MERFISH, RNAseq sheets) |
+| `Envision_*.xlsx` | Climb-to-Envision tag import file |
+| `Labels_Mailmerge_*.xlsx` | Printable sample labels |
+| `harvest_overrides.csv` | Confirmed harvest type assignments from the GUI review |
+| `logs/scheduler_*.log` | Full run log with diagnostics |
+
+---
+
+## Harvest Assignment Review
+
+The review screen shows every schedulable animal with its auto-suggested harvest type. You can:
+
+- Change any animal's harvest type using the dropdown
+- Mark animals as **Do Not Schedule** to exclude them from this run
+- Mark animals as **Extra** to include them outside the quota
+- Use **Reset to Suggested** to revert all changes
+- Use **Skip / Use Auto-Assignments** to bypass the review entirely
+
+Row colors indicate the current harvest type assignment. The color key is shown at the bottom of the animal list.
+
+The Quota Comparison panel on the right shows how your selections track against the remaining needs from the tracking sheet. A warning will appear if any harvest type is assigned more times than needed (over quota).
 
 ---
 
@@ -92,7 +110,7 @@ All outputs are saved to the same directory as the script, timestamped:
 - **P56 behavior**: First Wednesday falling in the P42–P49 window (age in days).
 - **P56 harvest**: Behavior date + 14 days (always exactly 2 weeks later).
 - **Envision tagging**: Always exactly 2 weeks before the harvest date.
-- **Capacity**: Wednesday behavior sessions capped at 18 animals (`WEDNESDAY_CAPACITY` in CONFIG).
+- **Capacity**: Wednesday behavior sessions capped at 18 animals per Wednesday.
 - **Toe clip animals**: Excluded from P56/behavior (gait effects). Ear-notched animals used for P56.
 
 ### P56 Behavior-Complete Strains
@@ -122,24 +140,36 @@ All tunable parameters live in the `CONFIG` dict near the top of the script. Key
 
 ## Version History
 
-### v2.0 — 2026-03-24 (`sing_pipeline_v2.py`)
-Python Expert refactor. No logic changes — all behavioral output is identical to v1.6.
+### v2.0 — 2026-03-27 (`sing_pipeline_v2.py`)
 
-- Narrowed `warnings.filterwarnings` — no longer silences all warnings globally
-- Fixed bare `except` clauses in `auto_size_columns` and `_run_again`
-- Removed redundant `date as date_type` alias — all type hints now use `date` directly
-- Removed unused `timezone` import
-- Moved `import unittest` out of top-level imports
-- Added `Any` to typing imports
-- Documented unused `sex` param in `get_strain_breeding_type`
-- Replaced convoluted `argsort` sort with `sort_values(key=...)` in `build_births_sexing_schedule`
-- Simplified `process_large_dataset` — removed unnecessary line-count pre-pass
-- Vectorized `filter_animals_by_use` excluded record construction (removed `iterrows`)
-- Added docstrings to `to_date`, `validate_config_advanced`, `auto_size_columns`, `get_strain_breeding_type`, `process_large_dataset`, `filter_animals_by_use`
+**GUI**
+- Harvest Assignment Review: fixed selection capture — user choices now reliably carry through to outputs
+- Harvest Assignment Review: date of harvest/behavior now shown per animal
+- Harvest Assignment Review: row colors update when harvest type is changed
+- Harvest Assignment Review: color key legend added
+- Harvest Assignment Review: quota warning only fires when over quota (not under)
+- Harvest Assignment Review: Do Not Schedule correctly excludes animals from the run
+- `harvest_overrides.csv` always written after GUI confirmation, reflecting actual selections
+- Wednesday capacity screen: cleaner layout with text status indicators
+- Screen 1: auto-detects input files from script folder
+
+**Outputs**
+- Genotype column in deliverables now shows the raw Climb genotype string, not the canonical label
+- Identification column in harvest sheet reads from `Marker` column (not `Marker Type`)
+- MERFISH sample tracker: column order updated to match submission format
+- Wean Date for P14 animals set to harvest date across all tracker sheets
+
+**Code quality (Python Expert refactor)**
+- Narrowed `warnings.filterwarnings` scope
+- Fixed bare `except` clauses
+- Removed redundant `date as date_type` alias and unused `timezone` import
+- Added docstrings to key functions
 - Replaced ~30 `len(df) == 0` checks with `df.empty`
+- Vectorized `filter_animals_by_use`
+- Fixed Windows Unicode crash from emoji in log output
 
-### v1.6 — 2025 (`sing_pipeline.py`)
-Production-stable version. See inline comments for full change history.
+### v1.7 (`sing_pipeline.py`)
+Previous production version — kept as fallback.
 
 ---
 
