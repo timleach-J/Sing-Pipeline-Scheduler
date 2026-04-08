@@ -8,7 +8,7 @@ NIH-funded, 2024–2029
 
 ## Overview
 
-The SING Pipeline Scheduler is a Python/tkinter GUI tool that automates harvest scheduling, Envision tagging prep, sample tracking, and output file generation for the SING project. It processes animal colony data exported from Climb/Envision and produces a complete set of Excel files ready for the harvest workflow.
+The SING Pipeline Scheduler is a Python/tkinter GUI tool that automates harvest scheduling, Envision tagging prep, sample tracking, and output file generation for the SING project. It processes animal colony data exported from Climb/Envision and produces a complete set of Excel and CSV files ready for the harvest workflow.
 
 Built and maintained by Tim Leach, Research Technician, Kumar Lab.
 
@@ -19,7 +19,7 @@ Built and maintained by Tim Leach, Research Technician, Kumar Lab.
 | File | Version | Status | Notes |
 |---|---|---|---|
 | `sing_pipeline.py` | v1.7 | Stable | Previous production version — fallback if needed |
-| `sing_pipeline_v2.py` | v2.0 | Current | Active production version |
+| `sing_pipeline_v2.py` | v2.1 | Current | Active production version |
 
 ---
 
@@ -77,11 +77,11 @@ All outputs are saved to the same directory as the script, timestamped:
 
 | Output | Description |
 |---|---|
-| `Complete_Schedule_*.xlsx` | Master harvest schedule |
-| `Harvest_Sheet_Import_*.xlsx` | Per-date harvest sheets |
-| `Climb_Sample_Import_*.xlsx` | Sample import file for Climb |
-| `Lab_Data_Export_*.xlsx` | Deliverables tracker (Perfusion, MERFISH, RNAseq sheets) |
-| `Envision_*.xlsx` | Climb-to-Envision tag import file |
+| `Complete_Schedule_*.xlsx` | Master schedule with tabs: Summary, P14 Schedule, P56 Schedule, Genotype Excluded Details, All Animals |
+| `Harvest_Sheet_Import_*.xlsx` | Per-date harvest sheets for use at the bench |
+| `Climb_Sample_Import_*.csv` | Sample import file for Climb |
+| `Lab_Data_Export_*.xlsx` | Deliverables tracker (Animal and Sample Tracking, MERFISH Sample Tracker, RNASeq Sample Tracker) |
+| `Envision_*.xlsx` | Climb-to-Envision tag import file (NB animals excluded) |
 | `Labels_Mailmerge_*.xlsx` | Printable sample labels |
 | `harvest_overrides.csv` | Confirmed harvest type assignments from the GUI review |
 | `logs/scheduler_*.log` | Full run log with diagnostics |
@@ -90,34 +90,66 @@ All outputs are saved to the same directory as the script, timestamped:
 
 ## Harvest Assignment Review
 
-The review screen shows every schedulable animal with its auto-suggested harvest type. You can:
+### Pass 1
+The review screen shows every P14 and P56 assigned animal with its auto-suggested harvest type. You can:
 
 - Change any animal's harvest type using the dropdown
-- Mark animals as **Do Not Schedule** to exclude them from this run
-- Mark animals as **Extra** to include them outside the quota
+- Mark animals as **Do Not Schedule (DNS)** to exclude them from this run
+- Mark animals as **Extra** to include them as cage-fillers
+- Assign **NB types** (Perfusion NB, MERFISH NB, RNAseq NB) for animals without a behavior session
 - Use **Reset to Suggested** to revert all changes
-- Use **Skip / Use Auto-Assignments** to bypass the review entirely
+- Use **Skip / Use Auto-Assignments** to bypass the review
 
-Row colors indicate the current harvest type assignment. The color key is shown at the bottom of the animal list.
+The **Group** column shows group size per P56 Wednesday session:
+- `✓ 3` — complete group of 3
+- `⚠ 2` — incomplete group (flagged for NB consideration)
 
-The Quota Comparison panel on the right shows how your selections track against the remaining needs from the tracking sheet. A warning will appear if any harvest type is assigned more times than needed (over quota).
+### Pass 2 (automatic, if DNS animals exist)
+If any animals are marked DNS, a second GUI appears automatically showing all animals with:
+- Pass 1 choices pre-filled for all non-DNS animals
+- DNS animals re-offered blank for potential NB assignment
+- All choices still editable
+
+### NB Harvest Types
+NB (No Behavior) types are for adult animals that cannot complete a full behavior group but may still be useful for harvest:
+- Same protocols as regular types
+- Envision Date shows `NB` instead of a behavior date
+- **Excluded from Envision output** — no tagging session needed
+- Still appear in Harvest Sheet and Labels
+
+### Row colors
+Indicate the current harvest type:
+- Green = Perfusion, Blue = MERFISH, Yellow = RNAseq
+- Purple = Extra, Darker shades = NB variants, Red = Do Not Schedule
 
 ---
 
 ## Key Scheduling Logic
 
-- **P14 harvest**: Birth date + 14 days. Must fall Mon–Fri. Has a strict 2-hour collection window — must be scheduled in advance.
+- **P14 harvest**: Birth date + 14 days. Must fall Mon–Fri. Individual animals — no group requirement.
 - **P56 behavior**: First Wednesday falling in the P42–P49 window (age in days).
 - **P56 harvest**: Behavior date + 14 days (always exactly 2 weeks later).
 - **Envision tagging**: Always exactly 2 weeks before the harvest date.
-- **Capacity**: Wednesday behavior sessions capped at 18 animals per Wednesday.
+- **Capacity**: Wednesday behavior sessions capped at 18 animals (`WEDNESDAY_CAPACITY` in CONFIG).
+- **Minimum group size**: P56 animals must be in groups of 3 to be scheduled. Incomplete groups go to Unschedulable unless assigned an NB type.
 - **Toe clip animals**: Excluded from P56/behavior (gait effects). Ear-notched animals used for P56.
 
-### P56 Behavior-Complete Strains
+### Quota and Flex Slot
+- Target: 5 Male + 5 Female Perfusion per strain per timepoint
+- **+1 flex slot**: Once either sex hits its quota, one additional animal of that sex is allowed (the 11th animal)
+- The flex slot is tracked across runs — if already used (completed > target + 1), no further overages allowed
+- MERFISH and RNAseq quotas are tracked separately (1 per sex per timepoint)
 
-These strains have completed behavior and are blocked from new P56 scheduling:
+### SHANK3 Split Quotas
+SHANK3-Het and SHANK3-Hom are tracked as separate strains in the tracking sheet and pipeline. The pipeline tries `STRAIN-HET` / `STRAIN-HOM` keys first, falling back to `STRAIN` for all other strains.
 
-`CDKL5, C3, GRN, FMR1, KCND3, FBN1, SHANK3, CNTNAP2, CACNA1A`
+### All Animals Tab
+The All Animals tab in Complete_Schedule.xlsx contains every animal from the input file with:
+- Scheduling result columns (Assigned_Timepoint, Harvest_Type, Assignment_Reason) joined from pipeline results
+- `P14_Date` shows `Too Old` for animals that missed the P14 window
+- `Assigned_Timepoint` always filled: P14, P56, or Unschedulable
+- `Harvest_Type` always filled: harvest type or N/A
+- `Assignment_Reason` always filled with a specific explanation
 
 ---
 
@@ -127,7 +159,7 @@ All tunable parameters live in the `CONFIG` dict near the top of the script. Key
 
 ```python
 'WEDNESDAY_CAPACITY': 18,       # Max animals per behavior Wednesday
-'CAGE_SIZE': 3,                 # Animals per cage
+'CAGE_SIZE': 3,                 # Animals per cage (minimum group size)
 'P14_VALID_DAYS': [0,1,2,3,4], # Mon–Fri
 'HARVEST_TARGETS': {            # Per-strain per-sex targets
     'Perfusion': 5,
@@ -140,33 +172,39 @@ All tunable parameters live in the `CONFIG` dict near the top of the script. Key
 
 ## Version History
 
-### v2.0 — 2026-03-27 (`sing_pipeline_v2.py`)
+### v2.1 — 2026-04-08 (`sing_pipeline_v2.py`)
 
-**GUI**
-- Harvest Assignment Review: fixed selection capture — user choices now reliably carry through to outputs
-- Harvest Assignment Review: date of harvest/behavior now shown per animal
-- Harvest Assignment Review: row colors update when harvest type is changed
-- Harvest Assignment Review: color key legend added
-- Harvest Assignment Review: quota warning only fires when over quota (not under)
-- Harvest Assignment Review: Do Not Schedule correctly excludes animals from the run
-- `harvest_overrides.csv` always written after GUI confirmation, reflecting actual selections
-- Wednesday capacity screen: cleaner layout with text status indicators
-- Screen 1: auto-detects input files from script folder
+**Harvest Review GUI**
+- Added NB harvest types (Perfusion NB, MERFISH NB, RNAseq NB) for animals without behavior
+- Added Group column showing group size per P56 session (✓ 3 or ⚠ N)
+- Two-pass review: Pass 2 automatically launches when DNS animals exist, with Pass 1 choices pre-filled
+- DNS animals re-offered in Pass 2 for potential NB assignment
+- Incomplete P56 groups (< 3 animals) shown with NB suggestion for non-B6 strains
+- B6/B6NJ incomplete groups go to Unschedulable (always need groups of 3)
+- Extra animals always included in P56 schedule
+
+**Quota / Scheduling Logic**
+- P14 quota limit: stops scheduling once per-sex quota is met
+- Flex slot (+1): fires as soon as one sex hits its quota; blocked if already used in previous run (total completed ≥ target×2+1)
+- Composite strain key: SHANK3-Het and SHANK3-Hom tracked as separate quotas
+- Auto-type suggestions: over-quota animals now correctly suggest Extra or NB
+- Incomplete groups (non-B6) go straight to Unschedulable
+- B6 monthly minimum enforcement disabled — managed manually
 
 **Outputs**
-- Genotype column in deliverables now shows the raw Climb genotype string, not the canonical label
-- Identification column in harvest sheet reads from `Marker` column (not `Marker Type`)
-- MERFISH sample tracker: column order updated to match submission format
-- Wean Date for P14 animals set to harvest date across all tracker sheets
+- All Animals tab: all 113 animals from input file, scheduling data merged in, Assignment_Reason always populated, P14_Date shows "Too Old" where applicable
+- Complete_Schedule.xlsx: removed Wednesday Capacity, Requirements Status, Strain Summary tabs — now shows only Summary, P14, P56, Genotype Excluded, All Animals
+- Lab_Data_Export.xlsx: removed Sing Harvest Sheet tab (use Harvest_Sheet_Import file instead)
+- NB animals excluded from Envision output; Envision Date shows "NB"
+- Climb Sample Import saved as .csv
 
-**Code quality (Python Expert refactor)**
-- Narrowed `warnings.filterwarnings` scope
-- Fixed bare `except` clauses
-- Removed redundant `date as date_type` alias and unused `timezone` import
-- Added docstrings to key functions
-- Replaced ~30 `len(df) == 0` checks with `df.empty`
-- Vectorized `filter_animals_by_use`
-- Fixed Windows Unicode crash from emoji in log output
+**Code**
+- `resolve_strain_key()` helper for composite strain+genotype quota lookup
+- `harvest_overrides.csv` always overwritten after GUI confirmation
+- Genotype canonicalization: HET1, HET2, HOM1, HOM2 patterns now correctly recognized
+
+### v2.0 (`sing_pipeline_v2.py`)
+Harvest review selection capture fixed, GUI improvements, output format fixes, Python Expert refactor.
 
 ### v1.7 (`sing_pipeline.py`)
 Previous production version — kept as fallback.
@@ -175,7 +213,7 @@ Previous production version — kept as fallback.
 
 ## Project Context
 
-SING spans three institutions — JAX (Kumar Lab), Penn State (Paul Lab), and NYU — and tracks 8 active strains out of 114 total over the project lifetime. Animals are housed in rooms B6 and F29.
+SING spans three institutions — JAX (Kumar Lab), Penn State (Paul Lab), and NYU — and tracks active strains out of 114 total over the project lifetime. Animals are housed in rooms B6 and F29.
 
 **Key collaborators:** Marina Santos (OFA behavior), Tuan Nguyen (data analysis), Fionna Kennedy (Envision tagging and animal entry), Sean Deats (harvester).
 

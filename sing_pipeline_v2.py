@@ -420,12 +420,14 @@ def canonicalize_genotype(genotype, strain: str = '') -> str:
 
     hom_patterns = [
         r'-/-', r'\bhom\b', r'\bhomozygous\b', r'mut/mut', r'ko/ko',
+        r'\bhom\d',  # matches HOM1, HOM2 etc
     ]
     if any(re.search(p, gl) for p in hom_patterns):
         return GENOTYPE_HOM
 
     het_patterns = [
         r'-/\+', r'\+/-', r'\bhet\b', r'\bheterozygous\b', r'\bcarrier\b',
+        r'\bhet\d',  # matches HET1, HET2 etc (Climb numbering style)
     ]
     if any(re.search(p, gl) for p in het_patterns):
         return GENOTYPE_HET
@@ -1889,6 +1891,9 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
     tier5 = eligibility_df[~is_prio & (bt == 'Unknown')].copy()
 
     all_assignments = []
+    # Track the +1 flex Perfusion slot per strain per timepoint (either sex)
+    # Once both sexes hit their Perfusion quota, one extra animal of either sex is allowed
+    perfusion_flex_used: Dict[tuple, bool] = {}  # (strain_key, timepoint) → used
 
     tier_names = [
         "🔴 SUPER PRIORITY - Half (Het×WT) - HIGHEST",
@@ -1949,10 +1954,37 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
             animals = group_sorted.to_dict('records')
 
             if not group_has_quota(strain, sex, 'P56', remaining_needs):
-                for animal in animals:
-                    animal['_quota_limited_complete_group'] = True
-                    animal['_incomplete_group'] = False
-                    p56_fallback.append(animal)
+                strain_key_flex = resolve_strain_key(strain, '', remaining_needs)
+                flex_key = (strain_key_flex, 'P56')
+                # Check if flex already consumed in a previous run (completed > target)
+                already_over = False
+                if remaining_needs and strain_key_flex in remaining_needs and strain_key_flex not in _B6_STRAINS_UPPER:
+                    perf_m = remaining_needs[strain_key_flex]['P56']['Male']['Perfusion']
+                    perf_f = remaining_needs[strain_key_flex]['P56']['Female']['Perfusion']
+                    total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
+                    total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
+                    already_over = total_completed >= total_target + 1
+                # Allow flex only if not B6, not already over, and not yet used this run
+                if (strain_key_flex not in _B6_STRAINS_UPPER
+                        and not already_over
+                        and not perfusion_flex_used.get(flex_key, False)):
+                    perfusion_flex_used[flex_key] = True
+                    flex_animals = animals[:CONFIG['CAGE_SIZE']]
+                    for animal in flex_animals:
+                        animal['_flex_slot'] = True
+                        p56_assignments.append({
+                            **animal,
+                            'Assigned_Timepoint': 'P56',
+                            'Assignment_Reason': 'P56 flex slot (+1 over quota)',
+                        })
+                    for animal in animals[CONFIG['CAGE_SIZE']:]:
+                        animal['_quota_limited_complete_group'] = True
+                        p56_fallback.append(animal)
+                else:
+                    for animal in animals:
+                        animal['_quota_limited_complete_group'] = True
+                        animal['_incomplete_group'] = False
+                        p56_fallback.append(animal)
                 continue
 
             num_complete_groups = len(animals) // CONFIG['CAGE_SIZE']
@@ -1977,10 +2009,19 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                 for animal in leftover:
                     birth_groups[animal.get('Birth_ID', 'Unknown')].append(animal)
                 for bid, ba in birth_groups.items():
+                    is_complete = len(ba) >= CONFIG['CAGE_SIZE']
                     for animal in ba:
-                        animal['_quota_limited_complete_group'] = len(ba) >= CONFIG['CAGE_SIZE']
-                        animal['_incomplete_group'] = len(ba) < CONFIG['CAGE_SIZE']
-                        p56_fallback.append(animal)
+                        animal['_quota_limited_complete_group'] = is_complete
+                        animal['_incomplete_group'] = not is_complete
+                        if not is_complete:
+                            # Incomplete group — unschedulable, no P14 fallback
+                            unschedulable.append({
+                                **animal,
+                                'Assigned_Timepoint': 'Unschedulable',
+                                'Assignment_Reason': f'Incomplete P56 group ({len(ba)} of {CONFIG["CAGE_SIZE"]})',
+                            })
+                        else:
+                            p56_fallback.append(animal)
 
         # Handle P56 blocked by full date
         if len(p56_blocked_by_full_date) > 0:
@@ -2027,23 +2068,31 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                             })
                 else:
                     for animal in animals:
-                        if animal['P14_Eligible']:
-                            animal['_incomplete_group'] = True
-                            animal['_full_date_complete'] = False
-                            animal['_quota_limited_complete_group'] = False
-                            p56_fallback.append(animal)
-                        else:
-                            unschedulable.append({
-                                **animal,
-                                'Assigned_Timepoint': 'Unschedulable',
-                                'Assignment_Reason': (
-                                    f'Incomplete P56 group; P14 unavailable: {animal["P14_Reason"]}'
-                                ),
-                            })
+                        unschedulable.append({
+                            **animal,
+                            'Assigned_Timepoint': 'Unschedulable',
+                            'Assignment_Reason': (
+                                f'Incomplete P56 group ({len(animals)} of {CONFIG["CAGE_SIZE"]}); '
+                                f'P14 unavailable: {animal["P14_Reason"]}'
+                                if not animal['P14_Eligible']
+                                else f'Incomplete P56 group ({len(animals)} of {CONFIG["CAGE_SIZE"]})'
+                            ),
+                        })
 
         # P14 fallback
         p14_assignments = []
+        p14_quota_used: Dict[tuple, int] = {}
+
         for animal in sorted(p56_fallback, key=lambda x: not is_heterozygous(x.get('Genotype', ''))):
+            # Incomplete groups never get reassigned to P14 — just unschedulable
+            if animal.get('_incomplete_group'):
+                unschedulable.append({
+                    **animal,
+                    'Assigned_Timepoint': 'Unschedulable',
+                    'Assignment_Reason': 'Incomplete P56 group — fewer than 3 animals available',
+                })
+                continue
+
             if not animal.get('P14_Eligible', False):
                 if animal.get('_quota_limited_complete_group'):
                     reason_prefix = 'P56 quota filled (complete cage not needed)'
@@ -2058,10 +2107,26 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                 })
                 continue
 
-            strain = animal.get('Strain', '')
-            sex = animal.get('Sex', '')
+            strain   = animal.get('Strain', '')
+            sex      = animal.get('Sex', '')
+            genotype = animal.get('Genotype', '')
+            strain_key = resolve_strain_key(strain, genotype, remaining_needs)
 
-            if group_has_quota(strain, sex, 'P14', remaining_needs):
+            # Check quota with decrement tracking
+            has_quota = False
+            if not remaining_needs or strain_key not in remaining_needs:
+                has_quota = True  # untracked / B6 — always allow
+            else:
+                needs = remaining_needs[strain_key]['P14'][sex]
+                total_needed = (needs['Perfusion']['needed'] +
+                                needs['MERFISH']['needed'] +
+                                needs['RNAseq']['needed'])
+                used = p14_quota_used.get((strain_key, sex), 0)
+                if used < total_needed:
+                    has_quota = True
+                    p14_quota_used[(strain_key, sex)] = used + 1
+
+            if has_quota:
                 if animal.get('_quota_limited_complete_group'):
                     reason = 'P56 quota filled for strain — reassigned to P14'
                 elif animal.get('_full_date_complete'):
@@ -2086,7 +2151,7 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                     'Assignment_Reason': unsched,
                 })
 
-        # P14-only animals
+        # P14-only animals — stop assigning when quota is met
         p14_only = animals_batch[
             animals_batch['P14_Eligible'] &
             ~animals_batch['P56_Eligible'] &
@@ -2094,20 +2159,58 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
         ].copy().sort_values('is_het', ascending=False)
 
         for idx2, animal in p14_only.iterrows():
-            strain = animal['Strain']
-            sex = animal['Sex']
-            if group_has_quota(strain, sex, 'P14', remaining_needs):
+            strain   = animal['Strain']
+            sex      = animal['Sex']
+            genotype = animal.get('Genotype', '')
+            strain_key = resolve_strain_key(strain, genotype, remaining_needs)
+
+            if not remaining_needs or strain_key not in remaining_needs:
+                # B6 controls or untracked — always schedule
+                p14_assignments.append({
+                    **animal.to_dict(),
+                    'Assigned_Timepoint': 'P14',
+                    'Assignment_Reason': f'P14 only (P56: {animal["P56_Reason"]})',
+                })
+                continue
+
+            needs = remaining_needs[strain_key]['P14'][sex]
+            total_needed = (needs['Perfusion']['needed'] +
+                            needs['MERFISH']['needed'] +
+                            needs['RNAseq']['needed'])
+            used = p14_quota_used.get((strain_key, sex), 0)
+
+            if used < total_needed:
+                p14_quota_used[(strain_key, sex)] = used + 1
                 p14_assignments.append({
                     **animal.to_dict(),
                     'Assigned_Timepoint': 'P14',
                     'Assignment_Reason': f'P14 only (P56: {animal["P56_Reason"]})',
                 })
             else:
-                unschedulable.append({
-                    **animal.to_dict(),
-                    'Assigned_Timepoint': 'Unschedulable',
-                    'Assignment_Reason': f'P14 quota filled for {strain} {sex}',
-                })
+                # Check flex slot — triggers as soon as this sex's quota is full
+                flex_key = (strain_key, 'P14')
+                already_over = False
+                if remaining_needs and strain_key in remaining_needs:
+                    perf_m = remaining_needs[strain_key]['P14']['Male']['Perfusion']
+                    perf_f = remaining_needs[strain_key]['P14']['Female']['Perfusion']
+                    total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
+                    total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
+                    already_over = total_completed >= total_target + 1
+                if (remaining_needs and strain_key in remaining_needs
+                        and not already_over
+                        and not perfusion_flex_used.get(flex_key, False)):
+                    perfusion_flex_used[flex_key] = True
+                    p14_assignments.append({
+                        **animal.to_dict(),
+                        'Assigned_Timepoint': 'P14',
+                        'Assignment_Reason': 'P14 flex slot (+1 over quota)',
+                    })
+                else:
+                    unschedulable.append({
+                        **animal.to_dict(),
+                        'Assigned_Timepoint': 'Unschedulable',
+                        'Assignment_Reason': f'P14 quota filled for {strain} {sex}',
+                    })
 
         # Neither eligible
         neither = animals_batch[
@@ -2249,45 +2352,58 @@ def enforce_b6_monthly_minimum(assignments_df: pd.DataFrame,
             if added_this_month < shortfall:
                 p56_candidates = b6_pool[b6_pool['P56_Eligible'] == True].copy()
 
+                # Group by behavior date — only add complete groups of CAGE_SIZE
+                p56_by_date = {}
                 for _, candidate in p56_candidates.iterrows():
-                    if added_this_month >= shortfall:
-                        break
                     name = candidate['Animal_Name']
                     if name in added_names:
                         continue
-
                     p56_harvest = to_date(candidate.get('P56_Harvest_Date'))
                     if p56_harvest is None:
                         bhv = to_date(candidate.get('P56_Behavior_Date'))
                         if bhv:
                             p56_harvest = bhv + timedelta(days=P56_HARVEST_OFFSET_FROM_BEHAVIOR)
-
                     if p56_harvest is None:
                         continue
-
                     candidate_month = (p56_harvest.year, p56_harvest.month)
                     if candidate_month != month:
                         continue
+                    bhv_date = str(candidate.get('P56_Behavior_Date', ''))
+                    if bhv_date not in p56_by_date:
+                        p56_by_date[bhv_date] = []
+                    p56_by_date[bhv_date].append(candidate)
 
-                    bhv_date = to_date(candidate.get('P56_Behavior_Date'))
-
-                    new_rows.append({
-                        **candidate.to_dict(),
-                        'Assigned_Timepoint': 'P56',
-                        'Assignment_Reason': (
-                            f'B6/B6N monthly minimum top-up '
-                            f'(month {month[0]}-{month[1]:02d} had only {current_count}, '
-                            f'min={min_per_month})'
-                        ),
-                        'Harvest_Type': 'Perfusion',
-                        'Priority': 'B6_MIN',
-                        'Strain_Priority': 'B6/B6N Control',
-                        'Genotype_Priority': 'B6/B6N',
-                        'P56_Behavior_Date': bhv_date,
-                        'P56_Harvest_Date': p56_harvest,
-                    })
-                    added_names.add(name)
-                    added_this_month += 1
+                for bhv_date, group in p56_by_date.items():
+                    if added_this_month >= shortfall:
+                        break
+                    if len(group) < CONFIG['CAGE_SIZE']:
+                        logger.info(f"  Skipping B6/B6N P56 group on {bhv_date} — only {len(group)} animals (need {CONFIG['CAGE_SIZE']})")
+                        continue
+                    for candidate in group[:CONFIG['CAGE_SIZE']]:
+                        if added_this_month >= shortfall:
+                            break
+                        name = candidate['Animal_Name']
+                        bhv = to_date(candidate.get('P56_Behavior_Date'))
+                        p56_harvest = to_date(candidate.get('P56_Harvest_Date'))
+                        if p56_harvest is None and bhv:
+                            p56_harvest = bhv + timedelta(days=P56_HARVEST_OFFSET_FROM_BEHAVIOR)
+                        new_rows.append({
+                            **candidate.to_dict(),
+                            'Assigned_Timepoint': 'P56',
+                            'Assignment_Reason': (
+                                f'B6/B6N monthly minimum top-up '
+                                f'(month {month[0]}-{month[1]:02d} had only {current_count}, '
+                                f'min={min_per_month})'
+                            ),
+                            'Harvest_Type': 'Perfusion',
+                            'Priority': 'B6_MIN',
+                            'Strain_Priority': 'B6/B6N Control',
+                            'Genotype_Priority': 'B6/B6N',
+                            'P56_Behavior_Date': bhv,
+                            'P56_Harvest_Date': p56_harvest,
+                        })
+                        added_names.add(name)
+                        added_this_month += 1
 
         if added_this_month < shortfall and len(b6_unschedulable) > 0:
             for _, candidate in b6_unschedulable.iterrows():
@@ -2381,11 +2497,24 @@ def _compute_auto_types(schedulable_df, remaining_needs):
     """
     Suggest harvest type per animal based on remaining quota needs.
     - MERFISH/RNAseq/Perfusion: fills the remaining quota for that type
-    - Extra: all quotas filled for this strain/sex/timepoint
+    - Perfusion/MERFISH/RNAseq NB: incomplete group — no behavior, direct harvest
+    - Perfusion: first over-quota animal per strain/timepoint (flex slot, 5+1 rule)
+    - Extra: all quotas filled AND flex slot already used
     B6/B6NJ check quota needs before defaulting to Perfusion.
     """
     working = _copy.deepcopy(remaining_needs)
     result = {}
+    flex_used = {}  # (strain_key, timepoint) → bool
+
+    # Pre-compute group sizes by (Strain, Sex, P56_Behavior_Date) for NB flagging
+    p56_group_sizes: Dict[tuple, int] = {}
+    for _, row in schedulable_df[schedulable_df['Assigned_Timepoint'] == 'P56'].iterrows():
+        key = (
+            str(row.get('Strain', '')).strip(),
+            str(row.get('Sex', '')).strip(),
+            str(row.get('P56_Behavior_Date', '')).strip(),
+        )
+        p56_group_sizes[key] = p56_group_sizes.get(key, 0) + 1
 
     sorted_df = schedulable_df.sort_values(
         ['Assigned_Timepoint', 'Strain', 'Sex', 'Animal_Name']
@@ -2398,6 +2527,17 @@ def _compute_auto_types(schedulable_df, remaining_needs):
         timepoint  = row.get('Assigned_Timepoint', '')
         genotype   = row.get('Genotype', '')
         strain_key = resolve_strain_key(strain, genotype, working)
+
+        # Check if this P56 animal is in an incomplete group
+        nb_flag = False
+        if timepoint == 'P56':
+            grp_key = (
+                str(strain).strip(),
+                str(sex).strip(),
+                str(row.get('P56_Behavior_Date', '')).strip(),
+            )
+            if p56_group_sizes.get(grp_key, 0) < CONFIG['CAGE_SIZE']:
+                nb_flag = True
 
         # B6/B6NJ — check quota first, then default to Perfusion
         if strain_key in _B6_STRAINS_UPPER:
@@ -2415,22 +2555,37 @@ def _compute_auto_types(schedulable_df, remaining_needs):
             continue
 
         if strain_key not in working:
-            result[name] = 'Extra'
+            result[name] = 'Perfusion NB' if nb_flag else 'Extra'
             continue
 
         needs = working[strain_key][timepoint][sex]
 
         if needs['MERFISH']['needed'] > 0:
-            result[name] = 'MERFISH'
+            base = 'MERFISH'
             needs['MERFISH']['needed'] -= 1
         elif needs['RNAseq']['needed'] > 0:
-            result[name] = 'RNAseq'
+            base = 'RNAseq'
             needs['RNAseq']['needed'] -= 1
         elif needs['Perfusion']['needed'] > 0:
-            result[name] = 'Perfusion'
+            base = 'Perfusion'
             needs['Perfusion']['needed'] -= 1
         else:
-            result[name] = 'Extra'  # all quotas filled
+            # Quota filled for this sex — offer flex slot (5+1 rule)
+            flex_key = (strain_key, timepoint)
+            already_over = False
+            if strain_key in working:
+                perf_m = working[strain_key][timepoint]['Male']['Perfusion']
+                perf_f = working[strain_key][timepoint]['Female']['Perfusion']
+                total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
+                total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
+                already_over = total_completed >= total_target + 1
+            if not already_over and not flex_used.get(flex_key, False):
+                flex_used[flex_key] = True
+                base = 'Perfusion'  # flex slot
+            else:
+                base = 'Extra'
+
+        result[name] = f'{base} NB' if nb_flag and base != 'Extra' else base
 
     return result
 
@@ -2456,10 +2611,12 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
         row = df_map.get(name)
         if row is None:
             continue
+        # Strip NB suffix for quota counting purposes
+        base_htype = htype.replace(' NB', '').strip()
         strain_key = resolve_strain_key(row.get('Strain', ''), row.get('Genotype', ''), remaining_needs)
         timepoint  = str(row.get('Assigned_Timepoint', '')).strip()
         sex        = str(row.get('Sex', '')).strip()
-        key = (strain_key, timepoint, sex, htype)
+        key = (strain_key, timepoint, sex, base_htype)
         counts[key] = counts.get(key, 0) + 1
 
     present_combos = set()
@@ -2500,7 +2657,7 @@ def _compute_quota_status(selections, schedulable_df, remaining_needs):
     return rows
 
 
-def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
+def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_selections=None):
     """
     Block the pipeline and show a GUI letting the user review and confirm
     harvest type assignments for every scheduled animal.
@@ -2520,12 +2677,17 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         print("  ⚠ tkinter not available — skipping harvest assignment GUI.")
         return {}
 
-    HARVEST_OPTIONS = ['Perfusion', 'MERFISH', 'RNAseq', 'Extra', 'Do Not Schedule']
+    HARVEST_OPTIONS = ['Perfusion', 'MERFISH', 'RNAseq', 'Extra',
+                       'Perfusion NB', 'MERFISH NB', 'RNAseq NB',
+                       'Do Not Schedule']
     OPTION_COLORS   = {
         'Perfusion':        '#d4edda',
         'MERFISH':          '#cce5ff',
         'RNAseq':           '#fff3cd',
         'Extra':            '#e8d5f5',
+        'Perfusion NB':     '#a8d5b5',  # darker green — no behavior
+        'MERFISH NB':       '#7ab8f5',  # darker blue
+        'RNAseq NB':        '#f5d76e',  # darker yellow
         'Do Not Schedule':  '#f8d7da',
     }
     STATUS_COLORS = {
@@ -2557,16 +2719,21 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     # ── Header ────────────────────────────────────────────────────────────────
     header_frame = tk.Frame(root, bg='#2c3e50', pady=12)
     header_frame.pack(fill='x')
+    is_second_pass = bool(prior_selections)
     tk.Label(
         header_frame,
-        text="Harvest Assignment Review",
+        text="Harvest Assignment Review" + (" — Pass 2" if is_second_pass else ""),
         font=('Helvetica', 16, 'bold'),
         bg='#2c3e50', fg='white'
     ).pack()
+    subtitle = (
+        f"{len(schedulable)} animals  •  Prior selections pre-filled  •  DNS animals shown for NB review  •  All choices editable."
+        if is_second_pass else
+        f"{len(schedulable)} animals ready to schedule  •  Review assignments below, make any changes, then confirm."
+    )
     tk.Label(
         header_frame,
-        text=(f"{len(schedulable)} animals ready to schedule  •  "
-              f"Review assignments below, make any changes, then confirm."),
+        text=subtitle,
         font=('Helvetica', 10),
         bg='#2c3e50', fg='#bdc3c7'
     ).pack()
@@ -2584,8 +2751,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
     left_frame.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
     # Column headers
-    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Harvest Type']
-    col_widths = [18, 12, 8, 10, 12, 16]
+    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Group', 'Harvest Type']
+    col_widths = [18, 12, 8, 10, 10, 8, 16]
 
     hdr_row = tk.Frame(left_frame, bg='#2c3e50')
     hdr_row.pack(fill='x')
@@ -2641,6 +2808,17 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
     sorted_rows = sorted(schedulable.to_dict('records'), key=_harvest_sort_key)
 
+    # Pre-compute P56 group sizes by (Strain, Sex, P56_Behavior_Date)
+    p56_group_sizes_gui: Dict[tuple, int] = {}
+    for row in sorted_rows:
+        if str(row.get('Assigned_Timepoint', '')).strip() == 'P56':
+            key = (
+                str(row.get('Strain', '')).strip(),
+                str(row.get('Sex', '')).strip(),
+                str(row.get('P56_Behavior_Date', '')).strip(),
+            )
+            p56_group_sizes_gui[key] = p56_group_sizes_gui.get(key, 0) + 1
+
     # Store StringVars so we can read them later
     selection_vars   = {}   # name → StringVar
     selection_values = {}   # name → current value (always in sync, avoids tkinter canvas StringVar decouple bug)
@@ -2677,7 +2855,11 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         strain    = str(row.get('Strain', '')).strip()
         sex       = str(row.get('Sex', '')).strip()
         timepoint = str(row.get('Assigned_Timepoint', '')).strip()
-        default   = auto_types.get(name, 'Perfusion')
+        # Use prior selection if available, otherwise auto-suggest
+        if prior_selections and name in prior_selections:
+            default = prior_selections[name]
+        else:
+            default = auto_types.get(name, 'Perfusion')
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
@@ -2701,18 +2883,31 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
             display_date = '⚠ NO DATE'
             logger.warning(f"Animal {name} ({timepoint}) is scheduled but has no date — check scheduling logic")
 
-        for val, w in zip([name, strain, sex, timepoint, display_date], col_widths[:5]):
-            tk.Label(
+        # Group size indicator
+        if timepoint == 'P56':
+            grp_key = (str(strain).strip(), str(sex).strip(), raw_date)
+            grp_size = p56_group_sizes_gui.get(grp_key, 1)
+            if grp_size >= CONFIG['CAGE_SIZE']:
+                group_label = f'✓ {grp_size}'
+            else:
+                group_label = f'⚠ {grp_size}'
+        else:
+            group_label = '—'  # P14 doesn't need groups
+
+        for val, w in zip([name, strain, sex, timepoint, display_date, group_label], col_widths[:6]):
+            lbl = tk.Label(
                 frame, text=val, width=w, anchor='w',
                 font=('Helvetica', 9), bg=bg, padx=4, pady=3
-            ).pack(side='left')
+            )
+            lbl.pack(side='left')
 
         menu = ttk.Combobox(
             frame, textvariable=var,
             values=HARVEST_OPTIONS,
-            state='readonly', width=col_widths[4] - 2
+            state='readonly', width=col_widths[6] - 2
         )
         menu.pack(side='left', padx=2, pady=2)
+        menu.set(default)  # explicitly set display value after pack
         selection_menus[name] = menu  # store widget ref for direct read at confirm
         menu.bind('<<ComboboxSelected>>',
                   lambda e, n=name, f=frame, m=menu: _on_type_change_cb(n, m, f))
@@ -2836,9 +3031,14 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
         for _n, _h in sorted(current.items()):
             logger.info(f"CONFIRM: {_n} → {_h}")
 
-        # ── Quota check (harvest types only, not Extra or Do Not Schedule) ────
+        # ── Quota check — only warn on genuine over-quota (not B6, not flex slot) ────
         quota_data = _compute_quota_status(current, schedulable, remaining_needs)
-        mismatches = [r for r in quota_data if r[6] != '✓ Match']
+        mismatches = [
+            r for r in quota_data
+            if '↑' in r[6]
+            and str(r[0]).strip().upper() not in _B6_STRAINS_UPPER
+            and r[5] > r[4] + 1  # more than 1 over quota (flex slot is allowed)
+        ]
 
         if mismatches:
             lines = '\n'.join(
@@ -2878,8 +3078,10 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs):
 
         incomplete_groups = []
         for birth_id, animals in birth_groups.items():
-            # Count animals that are Harvest or Extra (not Do Not Schedule)
-            active = [a for a in animals if a[1] != 'Do Not Schedule']
+            # NB types don't need a group of 3 — exclude from this check
+            active = [a for a in animals
+                      if a[1] not in ('Do Not Schedule',)
+                      and not str(a[1]).endswith(' NB')]
             if 0 < len(active) < CONFIG['CAGE_SIZE']:
                 strain = str(df_map.get(animals[0][0], {}).get('Strain', '')).strip()
                 incomplete_groups.append(
@@ -4423,21 +4625,28 @@ def create_p56_schedule(assignments_df: pd.DataFrame) -> pd.DataFrame:
         ['P56_Behavior_Date', 'Strain', 'Genotype', 'Sex']
     ):
         animals = group.to_dict('records')
-        for i in range(0, len(animals), CONFIG['CAGE_SIZE']):
-            cage_group = animals[i:i + CONFIG['CAGE_SIZE']]
-            if len(cage_group) == CONFIG['CAGE_SIZE']:
-                all_filled = all(
-                    a.get('Harvest_Type') == 'COMPLETE (Quota Filled)'
-                    for a in cage_group
-                )
-                if not all_filled:
-                    kept_animals.extend(cage_group)
-            else:
-                # Partial cage: keep non-COMPLETE; always keep Extra (user-assigned)
-                kept_animals.extend([
-                    a for a in cage_group
-                    if a.get('Harvest_Type') not in ('COMPLETE (Quota Filled)',)
-                ])
+
+        # NB and Extra animals always kept — they don't need a full group
+        special_animals = [a for a in animals
+                          if str(a.get('Harvest_Type', '')).endswith(' NB')
+                          or str(a.get('Harvest_Type', '')).strip() == 'Extra']
+        regular_animals = [a for a in animals
+                          if not str(a.get('Harvest_Type', '')).endswith(' NB')
+                          and str(a.get('Harvest_Type', '')).strip() != 'Extra']
+        kept_animals.extend(special_animals)
+
+        for i in range(0, len(regular_animals), CONFIG['CAGE_SIZE']):
+            cage_group = regular_animals[i:i + CONFIG['CAGE_SIZE']]
+            # Skip incomplete regular groups — minimum CAGE_SIZE required
+            if len(cage_group) < CONFIG['CAGE_SIZE']:
+                logger.info(f"P56 schedule: skipping incomplete group {strain} {sex} {behavior_date} ({len(cage_group)} animals)")
+                continue
+            all_filled = all(
+                a.get('Harvest_Type') == 'COMPLETE (Quota Filled)'
+                for a in cage_group
+            )
+            if not all_filled:
+                kept_animals.extend(cage_group)
 
     if not kept_animals:
         return pd.DataFrame()
@@ -4751,13 +4960,76 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         if do_not_schedule:
             print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
             logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
-            assignments = assignments[
-                ~assignments['Animal_Name'].astype(str).isin({str(n) for n in do_not_schedule})
-            ].copy()
-            # Also remove from eligibility so B6 enforcer can't re-add them
+
+            dns_names_str = {str(n) for n in do_not_schedule}
+
+            # Check if any DNS animals could fill NB slots at their current or alternate timepoint
+            dns_rows = assignments[assignments['Animal_Name'].astype(str).isin(dns_names_str)]
+            nb_candidates = []
+            for _, row in dns_rows.iterrows():
+                name = str(row.get('Animal_Name', '')).strip()
+                current_tp = str(row.get('Assigned_Timepoint', '')).strip()
+                if current_tp == 'P56':
+                    # Could be P56 NB or offered as P14
+                    alt = row.to_dict()
+                    alt['Assignment_Reason'] = 'DNS — review for NB harvest or P14'
+                    nb_candidates.append(alt)
+                elif current_tp == 'P14':
+                    if row.get('P56_Eligible', False):
+                        alt = row.to_dict()
+                        alt['Assigned_Timepoint'] = 'P56'
+                        alt['Assignment_Reason'] = 'DNS from P14 — offered as P56 NB'
+                        nb_candidates.append(alt)
+                    else:
+                        alt = row.to_dict()
+                        alt['Assignment_Reason'] = 'DNS — review for alternate use'
+                        nb_candidates.append(alt)
+
+            if nb_candidates:
+                # Build combined df: all current assignments + NB candidates
+                # NB candidates replace their DNS version in the list
+                non_dns = assignments[~assignments['Animal_Name'].astype(str).isin(dns_names_str)].copy()
+                nb_df = pd.DataFrame(nb_candidates)
+                second_pass_df = pd.concat([non_dns, nb_df], ignore_index=True)
+
+                # Seed the GUI with first-round selections for non-DNS animals
+                # DNS animals show blank (ready for new decision)
+                prior_selections = {
+                    n: h for n, h in gui_selections.items()
+                    if h != 'DO_NOT_SCHEDULE'
+                }
+
+                print(f"\n  {len(nb_candidates)} DNS animal(s) available for NB review — showing second pass GUI...")
+                second_selections = prompt_harvest_assignments_gui(
+                    second_pass_df, remaining_needs,
+                    prior_selections=prior_selections
+                )
+
+                # Merge: second pass overrides first pass
+                gui_selections.update(second_selections)
+                do_not_schedule = {
+                    name for name, htype in gui_selections.items()
+                    if htype == 'DO_NOT_SCHEDULE'
+                }
+                dns_names_str = {str(n) for n in do_not_schedule}
+
+                # Rebuild assignments from second pass
+                assignments = second_pass_df[
+                    ~second_pass_df['Animal_Name'].astype(str).isin(dns_names_str)
+                ].copy()
+            else:
+                assignments = assignments[
+                    ~assignments['Animal_Name'].astype(str).isin(dns_names_str)
+                ].copy()
+
+            # Also remove DNS from eligibility so they can't be re-added
             eligibility = eligibility[
-                ~eligibility['Animal_Name'].astype(str).isin({str(n) for n in do_not_schedule})
+                ~eligibility['Animal_Name'].astype(str).isin(dns_names_str)
             ].copy()
+        else:
+            # No DNS — remove nothing
+            pass
+
 
         # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
         harvest_overrides = {
@@ -4777,9 +5049,9 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     write_harvest_overrides_template(assignments, overrides_file)
 
     # B6/B6N monthly minimum
-    print(f"Enforcing B6/B6N minimum ({CONFIG['B6_MIN_PER_MONTH']}/month)...")
-    if len(assignments) > 0:
-        assignments = enforce_b6_monthly_minimum(assignments, eligibility, remaining_needs)
+    # B6/B6N monthly minimum enforcement disabled — managed manually
+    # if len(assignments) > 0:
+    #     assignments = enforce_b6_monthly_minimum(assignments, eligibility, remaining_needs)
 
     # Build output sheets
     print("Creating schedule sheets...")
@@ -4795,7 +5067,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     strain_summary = create_strain_summary(assignments)
     requirements_status = create_requirements_status(remaining_needs, requirements)
     genotype_summary = summarize_genotype_exclusions(genotype_excluded)
-    b6_monthly_summary = create_b6_monthly_summary(assignments)
+    b6_monthly_summary = pd.DataFrame()  # disabled — B6 minimum managed manually
 
     # Counts for summary
     p14_count = len(p14_schedule) if len(p14_schedule) > 0 else 0
@@ -4944,6 +5216,113 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         ]
     }
 
+    # Build all_animals — raw input file with scheduling results merged in
+    sched_cols = ['Animal_Name', 'Assigned_Timepoint', 'Harvest_Type', 'Assignment_Reason',
+                  'P14_Date', 'P56_Behavior_Date', 'P56_Harvest_Date',
+                  'Strain_Priority', 'Genotype_Priority', 'Priority']
+    if len(assignments) > 0:
+        sched_subset = assignments[[c for c in sched_cols if c in assignments.columns]].copy()
+        raw_name_col = next((c for c in ['Name', 'Animal ID', 'Animal_Name'] if c in animals_df_raw.columns), None)
+        if raw_name_col:
+            raw_copy = animals_df_raw.copy()
+            raw_copy[raw_name_col] = raw_copy[raw_name_col].astype(str)
+            sched_subset['Animal_Name'] = sched_subset['Animal_Name'].astype(str)
+            if raw_name_col != 'Animal_Name':
+                sched_subset = sched_subset.rename(columns={'Animal_Name': raw_name_col})
+            all_animals_merged = raw_copy.merge(sched_subset, on=raw_name_col, how='left')
+        else:
+            all_animals_merged = animals_df_raw.copy()
+    else:
+        all_animals_merged = animals_df_raw.copy()
+
+    # Build a name → exclusion_reason lookup from all filter stages
+    exclusion_reasons: Dict[str, str] = {}
+    if len(use_excluded) > 0:
+        name_col = next((c for c in ['Name', 'Animal_Name', 'Animal ID'] if c in use_excluded.columns), None)
+        use_col  = next((c for c in ['Use'] if c in use_excluded.columns), None)
+        if name_col:
+            for _, r in use_excluded.iterrows():
+                use_val = str(r.get(use_col, '')).strip() if use_col else ''
+                exclusion_reasons[str(r[name_col])] = f'Not Sing Inventory (Use: {use_val or "blank"})'
+    if len(genotype_excluded_pass1) > 0 and 'Animal_Name' in genotype_excluded_pass1.columns:
+        for _, r in genotype_excluded_pass1.iterrows():
+            exclusion_reasons[str(r['Animal_Name'])] = f'Excluded — {r.get("Reason", "genotype issue")}'
+    if len(genotype_excluded) > 0 and 'Animal_Name' in genotype_excluded.columns:
+        for _, r in genotype_excluded.iterrows():
+            n = str(r['Animal_Name'])
+            if n not in exclusion_reasons:
+                exclusion_reasons[n] = f'Excluded — {r.get("Reason", "genotype issue")}'
+    if len(date_excluded) > 0:
+        name_col = next((c for c in ['Name', 'Animal_Name'] if c in date_excluded.columns), None)
+        if name_col:
+            for _, r in date_excluded.iterrows():
+                exclusion_reasons[str(r[name_col])] = 'Excluded — outside date filter window'
+
+    # Fill in Assignment_Reason for every animal
+    raw_name_col_fill = next((c for c in ['Name', 'Animal_Name'] if c in all_animals_merged.columns), None)
+
+    def _fill_reason(row):
+        reason = row.get('Assignment_Reason')
+        if pd.notna(reason) and str(reason).strip() not in ('', 'nan'):
+            return reason
+        name = str(row.get(raw_name_col_fill, '')).strip() if raw_name_col_fill else ''
+        if name in exclusion_reasons:
+            return exclusion_reasons[name]
+        tp = row.get('Assigned_Timepoint')
+        if pd.notna(tp) and str(tp).strip() not in ('', 'nan'):
+            return f'Scheduled — {tp}'
+        p14_reason = str(row.get('P14_Reason', '') or '').strip()
+        p56_reason = str(row.get('P56_Reason', '') or '').strip()
+        if p14_reason or p56_reason:
+            parts = []
+            if p14_reason:
+                parts.append(f'P14: {p14_reason}')
+            if p56_reason:
+                parts.append(f'P56: {p56_reason}')
+            return ' | '.join(parts)
+        return 'Not scheduled — no eligible timepoint found'
+
+    all_animals_merged['Assignment_Reason'] = all_animals_merged.apply(_fill_reason, axis=1)
+
+    # Fill Assigned_Timepoint — every animal must have one
+    def _fill_timepoint(row):
+        tp = row.get('Assigned_Timepoint')
+        if pd.notna(tp) and str(tp).strip() not in ('', 'nan'):
+            return str(tp).strip()
+        return 'Unschedulable'
+
+    all_animals_merged['Assigned_Timepoint'] = all_animals_merged.apply(_fill_timepoint, axis=1)
+
+    # Fill Harvest_Type — every animal must have one
+    def _fill_harvest_type(row):
+        ht = row.get('Harvest_Type')
+        if pd.notna(ht) and str(ht).strip() not in ('', 'nan'):
+            return str(ht).strip()
+        return 'N/A'
+
+    all_animals_merged['Harvest_Type'] = all_animals_merged.apply(_fill_harvest_type, axis=1)
+
+    # P14_Date — show "Too Old" if the animal missed the P14 window
+    if 'P14_Too_Old' in all_animals_merged.columns and 'P14_Date' in all_animals_merged.columns:
+        all_animals_merged['P14_Date'] = all_animals_merged.apply(
+            lambda r: 'Too Old' if r.get('P14_Too_Old') == True and (
+                pd.isna(r.get('P14_Date')) or str(r.get('P14_Date', '')).strip() in ('', 'nan', 'NaT')
+            ) else r.get('P14_Date'),
+            axis=1
+        )
+
+    # Column order: key SING columns first, scheduling data next, raw Climb extras at right
+    priority_cols = [
+        'Name', 'Line (Short)', 'Sex', 'Genotype', 'Birth Date', 'Age (days)',
+        'Assigned_Timepoint', 'Harvest_Type', 'Assignment_Reason',
+        'P14_Date', 'P56_Behavior_Date', 'P56_Harvest_Date',
+        'Strain_Priority', 'Genotype_Priority', 'Priority',
+        'Marker', 'Marker Type', 'Housing ID', 'Birth ID',
+    ]
+    remaining_cols = [c for c in all_animals_merged.columns if c not in priority_cols]
+    ordered_cols = [c for c in priority_cols if c in all_animals_merged.columns] + remaining_cols
+    all_animals_merged = all_animals_merged[ordered_cols]
+
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     output_filename = f'Complete_Schedule_{timestamp}.xlsx'
     output_path = os.path.join(output_dir, output_filename)
@@ -4958,9 +5337,8 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         requirements_status=requirements_status,
         unmatched_births=unmatched_births_df,
         genotype_excluded=genotype_excluded,
-        sexing_schedule=sexing_schedule_df,
         b6_monthly_summary=b6_monthly_summary,
-        all_animals=assignments,
+        all_animals=all_animals_merged,
     )
 
     print(f"\nWriting Excel: {output_filename}")
@@ -4970,20 +5348,11 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
             pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
 
-            if len(requirements_status) > 0:
-                requirements_status.to_excel(writer, sheet_name='Requirements Status', index=False)
-
             if len(p14_schedule) > 0:
                 p14_schedule.to_excel(writer, sheet_name='P14 Schedule', index=False)
 
             if len(p56_schedule) > 0:
                 p56_schedule.to_excel(writer, sheet_name='P56 Schedule', index=False)
-
-            if len(capacity) > 0:
-                capacity.to_excel(writer, sheet_name='Wednesday Capacity', index=False)
-
-            if len(sexing_schedule_df) > 0:
-                sexing_schedule_df.to_excel(writer, sheet_name='Sexing Schedule', index=False)
 
             if len(genotype_excluded) > 0:
                 genotype_excluded.to_excel(
@@ -4991,9 +5360,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
                     sheet_name=truncate_sheet_name('Genotype Excluded Details'),
                     index=False
                 )
-
-            if len(strain_summary) > 0:
-                strain_summary.to_excel(writer, sheet_name='Strain Summary', index=False)
 
             # All Animals tab
             if len(assignments) > 0:
@@ -5045,7 +5411,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
                     ordered_cols.append(col)
                     seen.add(col)
 
-                assignments[ordered_cols].to_excel(writer, sheet_name='All Animals', index=False)
+                all_animals_merged.to_excel(writer, sheet_name='All Animals', index=False)
 
             # ── Formatting ────────────────────────────────────────────────────
             wb = writer.book
@@ -6694,14 +7060,17 @@ def translate_protocol(harvest_type, timepoint):
     """Translate Harvest_Type + Assigned_Timepoint to full protocol name."""
     harvest_type = str(harvest_type).strip()
     timepoint = str(timepoint).strip()
-    if harvest_type == 'Perfusion':
+    # Strip NB suffix — same protocol as regular type
+    base = harvest_type.replace(' NB', '').strip()
+
+    if base == 'Perfusion':
         if timepoint == 'P14':
             return 'P14 - 15mL PBS 20mL 4%PFA (Plus 20mL Storage) - 4mL/min'
         else:
             return '8 Weeks - 20mL PBS 25mL 4%PFA (Plus 20mL Storage) - 6mL/min'
-    elif harvest_type == 'MERFISH':
+    elif base == 'MERFISH':
         return 'MERFISH - OCT'
-    elif harvest_type == 'RNAseq':
+    elif base == 'RNAseq':
         return 'RNA-Seq'
     elif harvest_type in ('COMPLETE (Quota Filled)', 'Extra'):
         return 'Extra - Sex & Timepoint Full'
@@ -6730,7 +7099,10 @@ def get_age_days(row):
 
 
 def get_envision_date(row):
-    """Get envision (behavior) date — only for P56."""
+    """Get envision (behavior) date — only for P56. NB animals return 'NB'."""
+    harvest_type = str(row.get('Harvest_Type', '')).strip()
+    if harvest_type.endswith(' NB'):
+        return 'NB'
     timepoint = str(row.get('Assigned_Timepoint', '')).strip()
     if timepoint == 'P56':
         return row.get('P56_Behavior_Date', '')
@@ -6835,6 +7207,14 @@ def build_working_data(all_animals_df):
     df = df[df['Assigned_Timepoint'] != 'Unschedulable'].copy()
     print(f"  Filtered: {before - len(df)} Unschedulable removed")
     print(f"  Remaining: {len(df)} animals")
+
+    # Flag NB animals — no behavior, so no Envision tagging needed
+    df['_is_nb'] = df['Harvest_Type'].apply(
+        lambda h: str(h).strip().endswith(' NB')
+    )
+    nb_count = df['_is_nb'].sum()
+    if nb_count > 0:
+        print(f"  NB animals (no behavior, no Envision): {nb_count}")
 
     df['Protocol'] = df.apply(
         lambda row: translate_protocol(
@@ -6976,7 +7356,7 @@ def run_harvest_and_samples(working_df, timestamp):
             'Housing': row.get('Housing ID', ''),
             'Identification': row.get('Marker', row.get('Marker_Type', '')),
             'Sex': row.get('Sex', ''),
-            'Age (Days)': row.get('Age_Days', ''),
+            'Age (Days)': f"P{int(row.get('Age_Days', ''))}" if row.get('Age_Days', '') != '' else '',
             'Envision Date': envision_date_str,
             'Harvest Date': harvest_date_str,
             'Harvested by': '',
@@ -7017,8 +7397,8 @@ def run_harvest_and_samples(working_df, timestamp):
     print(f"\n  📄 Saved: {harvest_file}")
 
     # Save Climb Sample Import
-    climb_file = f"Climb_Sample_Import_{timestamp}.xlsx"
-    save_df_to_excel(climb_import_df, climb_file, sheet_name='Samples')
+    climb_file = f"Climb_Sample_Import_{timestamp}.csv"
+    climb_import_df.to_csv(climb_file, index=False)
     print(f"  📄 Saved: {climb_file}")
 
     print(f"\n  ✓ Steps 0+1 complete:")
@@ -7138,9 +7518,7 @@ class MultiSheetExporter:
                         'Housing': self._safe_get(row, 'Housing ID'),
                         'Identification': self._safe_get(row, 'Marker_Type', 'Marker'),
                         'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                        'Age (Days)': self._safe_get(row, 'Age_Days',
-                                                      'P56_Age_At_Harvest_Days',
-                                                      'P14_Age_At_Harvest_Days')
+                        'Age (Days)': ('P' + str(int(float(v))) if (v := self._safe_get(row, 'Age_Days', 'P56_Age_At_Harvest_Days', 'P14_Age_At_Harvest_Days')) not in (None, '', 'None') else '')
                     }
                 }
             if sample_name:
@@ -7372,7 +7750,7 @@ class MultiSheetExporter:
         auto_width_worksheet(ws)
 
     def create_all_sheets(self):
-        self.create_sing_harvest_sheet()
+        # Sing Harvest Sheet tab removed — use Harvest_Sheet_Import file instead
         self.create_animal_sample_tracking_sheet()
         self.create_merfish_sample_tracker_sheet()
         self.create_rnaseq_sample_tracker_sheet()
@@ -8817,7 +9195,12 @@ def run_pipeline_gui():
                         harvest_df, samples_df, climb_import_df = run_harvest_and_samples(
                             working_df, timestamp)
                         run_deliverables(working_df, samples_df, timestamp)
-                        run_climb_to_envision(working_df, timestamp)
+                        # NB animals skip Envision — no behavior session needed
+                        envision_df = working_df[~working_df.get('_is_nb', pd.Series(False, index=working_df.index))].copy()
+                        if not envision_df.empty:
+                            run_climb_to_envision(envision_df, timestamp)
+                        else:
+                            print("  ⓘ No Envision output — all animals are NB type.")
                         run_labels(samples_df, working_df, timestamp)
 
                         new_files = sorted([
