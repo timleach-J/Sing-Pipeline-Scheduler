@@ -37,6 +37,7 @@ import unicodedata
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple, Union
+from sing_common import combine_sample_numbers, natural_sort_key
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
 warnings.filterwarnings('ignore', message='.*chained assignment.*')
@@ -163,7 +164,13 @@ CONFIG = {
         'TRIO': 'Half', 'U2AF2': 'Half', 'UBE3A': 'Half', 'VPS13B': 'All',
         'WAC': 'Half', 'XPO1': 'Half', 'ZBTB10': 'Half', 'ZBTB21': 'All',
         'ZFHX4': 'Half', 'ZMYM2': 'Half', 'ZNF292': 'All'
-    }
+    },
+
+    # Strains bred Het×Het — yield is 3/4 usable (1/4 Hom + 1/2 Het), 1/4 Wild
+    # Hom animals from these crosses get absolute highest scheduling priority
+    'HETXHET_STRAINS': [
+        'SHANK3', 'KDM5B',
+    ],
 }
 
 DAYS_IN_WEEK = 7
@@ -300,6 +307,7 @@ except ValueError as e:
 _PRIORITY_STRAINS_UPPER = {s.upper(): v for s, v in CONFIG['PRIORITY_STRAINS'].items()}
 _SUPER_PRIORITY_STRAINS_UPPER = frozenset(s.upper() for s in CONFIG['SUPER_PRIORITY_STRAINS'])
 _B6_STRAINS_UPPER = frozenset(s.upper() for s in CONFIG.get('B6_STRAINS', ['B6J', 'B6NJ']))
+_HETXHET_STRAINS_UPPER = frozenset(s.upper() for s in CONFIG.get('HETXHET_STRAINS', []))
 
 # ============================================================================
 # CANONICAL GENOTYPE LABELS
@@ -493,19 +501,18 @@ def is_b6_strain(strain: str) -> bool:
 
 
 def get_strain_breeding_type(strain: str, sex: Optional[str] = None) -> str:
-    """Return the breeding type ('All' or 'Half') for a given strain.
-
-    Args:
-        strain: The strain short name (e.g. 'SHANK3', 'B6J').
-        sex: Reserved for future sex-specific breeding logic. Currently unused.
+    """Return the breeding type for a given strain.
 
     Returns:
-        'All' if all pups are usable (Hom×Hom / inbred),
-        'Half' if ~50% usable (Het×WT), or 'Half' as default for unknown strains.
+        'HetxHet' if bred Het×Het (3/4 usable, Hom+Het),
+        'All'     if all pups usable (Hom×Hom / inbred),
+        'Half'    if ~50% usable (Het×WT), or default for unknown.
     """
     if pd.isna(strain):
         return 'Unknown'
     strain_upper = str(strain).strip().upper()
+    if strain_upper in _HETXHET_STRAINS_UPPER:
+        return 'HetxHet'
     return _PRIORITY_STRAINS_UPPER.get(strain_upper, 'Half')
 
 
@@ -1882,13 +1889,22 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
     is_prio = eligibility_df['Strain'].apply(is_priority_strain)
     bt = eligibility_df['breeding_type']
 
-    tier0a = eligibility_df[is_super & (bt == 'Half')].copy()
-    tier0b = eligibility_df[is_super & (bt == 'All')].copy()
-    tier1 = eligibility_df[is_prio & ~is_super & (bt == 'Half')].copy()
-    tier2 = eligibility_df[is_prio & ~is_super & (bt == 'All')].copy()
-    tier3 = eligibility_df[~is_prio & (bt == 'Half')].copy()
-    tier4 = eligibility_df[~is_prio & (bt == 'All')].copy()
-    tier5 = eligibility_df[~is_prio & (bt == 'Unknown')].copy()
+    # Het×Het Hom: rarest (1/4 yield) — absolute highest priority
+    is_hxh_hom = (bt == 'HetxHet') & eligibility_df['Genotype'].apply(
+        lambda g: canonicalize_genotype(g) == GENOTYPE_HOM
+    )
+    # Het×Het Het: second highest (1/2 yield from Het×Het cross)
+    is_hxh_het = (bt == 'HetxHet') & ~is_hxh_hom
+
+    tier_hxh_hom = eligibility_df[is_hxh_hom].copy()                                          # #1: HetxHet Hom
+    tier_hxh_het = eligibility_df[is_hxh_het].copy()                                          # #2: HetxHet Het
+    tier0a = eligibility_df[is_super & (bt == 'Half')  & ~is_hxh_hom & ~is_hxh_het].copy()   # #3: Super Half
+    tier0b = eligibility_df[is_super & (bt == 'All')   & ~is_hxh_hom & ~is_hxh_het].copy()   # #4: Super All
+    tier1  = eligibility_df[is_prio & ~is_super & (bt == 'Half')  & ~is_hxh_hom & ~is_hxh_het].copy()
+    tier2  = eligibility_df[is_prio & ~is_super & (bt == 'All')   & ~is_hxh_hom & ~is_hxh_het].copy()
+    tier3  = eligibility_df[~is_prio & (bt == 'Half')  & ~is_hxh_hom & ~is_hxh_het].copy()
+    tier4  = eligibility_df[~is_prio & (bt == 'All')   & ~is_hxh_hom & ~is_hxh_het].copy()
+    tier5  = eligibility_df[~is_prio & (bt == 'Unknown') & ~is_hxh_hom & ~is_hxh_het].copy()
 
     all_assignments = []
     # Track the +1 flex Perfusion slot per strain per timepoint (either sex)
@@ -1896,7 +1912,9 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
     perfusion_flex_used: Dict[tuple, bool] = {}  # (strain_key, timepoint) → used
 
     tier_names = [
-        "🔴 SUPER PRIORITY - Half (Het×WT) - HIGHEST",
+        "🔴 HET×HET HOM — #1 PRIORITY (1/4 yield)",
+        "🔴 HET×HET HET — #2 PRIORITY (1/2 yield from Het×Het)",
+        "🔴 SUPER PRIORITY - Half (Het×WT)",
         "🔴 SUPER PRIORITY - All (Hom×Hom)",
         "Priority - Half (Het×WT)",
         "Priority - All (Hom×Hom)",
@@ -1906,7 +1924,7 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
     ]
 
     for tier_num, (tier_name, animals_batch) in enumerate(
-        zip(tier_names, [tier0a, tier0b, tier1, tier2, tier3, tier4, tier5])
+        zip(tier_names, [tier_hxh_hom, tier_hxh_het, tier0a, tier0b, tier1, tier2, tier3, tier4, tier5])
     ):
         if animals_batch.empty:
             continue
@@ -2125,6 +2143,19 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                 if used < total_needed:
                     has_quota = True
                     p14_quota_used[(strain_key, sex)] = used + 1
+                else:
+                    # Check flex slot — triggers as soon as this sex's quota is full
+                    flex_key = (strain_key, 'P14')
+                    already_over = False
+                    if strain_key in remaining_needs:
+                        perf_m = remaining_needs[strain_key]['P14']['Male']['Perfusion']
+                        perf_f = remaining_needs[strain_key]['P14']['Female']['Perfusion']
+                        total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
+                        total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
+                        already_over = total_completed >= total_target + 1
+                    if not already_over and not perfusion_flex_used.get(flex_key, False):
+                        perfusion_flex_used[flex_key] = True
+                        has_quota = True
 
             if has_quota:
                 if animal.get('_quota_limited_complete_group'):
@@ -3560,18 +3591,27 @@ def _assess_genotype_worth_it(
 
     # ── quota / B6 helpers ────────────────────────────────────────────────────
     def _quota_met(timepoint: str) -> bool:
-        """Return True when *all* needs for this strain/timepoint are zero."""
+        """Return True when all needs are zero AND the flex slot is already used."""
         if is_b6_strain(strain):
             return False            # B6/B6N never considered quota-met
         strain_upper = str(strain).strip().upper()
         if not remaining_needs or strain_upper not in remaining_needs:
             return False
         tp_needs = remaining_needs[strain_upper][timepoint]
-        return all(
+        all_zero = all(
             tp_needs[sex][ht]['needed'] == 0
             for sex in ['Male', 'Female']
             for ht in ['Perfusion', 'MERFISH', 'RNAseq']
         )
+        if not all_zero:
+            return False
+        # Check if flex slot is still available (total completed < target*2 + 1)
+        perf_m = tp_needs['Male']['Perfusion']
+        perf_f = tp_needs['Female']['Perfusion']
+        total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
+        total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
+        flex_still_available = total_completed < total_target + 1
+        return not flex_still_available  # only truly met if flex is also used
 
     # ── generic worth evaluator ───────────────────────────────────────────────
     def _worth(available: bool, timepoint: str, group_n: int) -> str:
@@ -3595,6 +3635,19 @@ def _assess_genotype_worth_it(
 
         if _quota_met(timepoint):
             return '⚠️ QUOTA MET — genotyping low priority'
+
+        # Check if only the flex slot remains
+        strain_upper = str(strain).strip().upper()
+        if remaining_needs and strain_upper in remaining_needs:
+            tp_needs = remaining_needs[strain_upper][timepoint]
+            all_zero = all(
+                tp_needs[sex][ht]['needed'] == 0
+                for sex in ['Male', 'Female']
+                for ht in ['Perfusion', 'MERFISH', 'RNAseq']
+            )
+            if all_zero:
+                # Normal quota full but flex slot still open — last chance to harvest
+                return '🔴 HIGH PRIORITY — only flex slot remaining (last harvest opportunity)'
 
         # Expected usable animals from Mendelian ratios
         if breeding_type == 'All':
@@ -5300,6 +5353,11 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             return str(ht).strip()
         return 'N/A'
 
+    # Ensure scheduling columns exist even if no assignments were made
+    for col in ['Assigned_Timepoint', 'Harvest_Type', 'Assignment_Reason']:
+        if col not in all_animals_merged.columns:
+            all_animals_merged[col] = None
+
     all_animals_merged['Harvest_Type'] = all_animals_merged.apply(_fill_harvest_type, axis=1)
 
     # P14_Date — show "Too Old" if the animal missed the P14 window
@@ -6964,27 +7022,6 @@ def format_date_only(val):
     return ''
 
 
-def combine_sample_numbers(sample_list):
-    """Combine sample numbers into range format."""
-    if not sample_list:
-        return ""
-    base_numbers = []
-    for sample in sample_list:
-        sample_str = str(sample)
-        if '-' in sample_str:
-            base_num = sample_str.split('-')[0]
-        else:
-            base_num = sample_str
-        try:
-            base_numbers.append(int(base_num))
-        except (ValueError, TypeError):
-            continue
-    if not base_numbers:
-        return ""
-    if len(base_numbers) == 1:
-        return str(base_numbers[0])
-    else:
-        return f"{min(base_numbers)}-{max(base_numbers)}"
 
 
 def clean_genotype_base(genotype, strain):
@@ -7015,45 +7052,35 @@ def clean_genotype_base(genotype, strain):
 
 
 def clean_genotype(genotype):
-    """Remove <content> and Probe markers only, keep zygosity."""
-    if pd.isna(genotype):
-        return ""
-    result = str(genotype)
-    result = re.sub(r'<[^>]*>', '', result)
-    result = re.sub(r'‹[^›]*›', '', result)
-    result = re.sub(r'â€¹[^â€º]*â€º', '', result)
-    result = re.sub(r'\[[^\]]*\]', '', result)
-    for ch in ['<', '>', '‹', '›', 'â€¹', 'â€º', '[', ']']:
-        result = result.replace(ch, '')
-    result = re.sub(r'Probe\s*', '', result)
-    result = re.sub(r'Generic LacZ tg/0,\s*', '', result)
-    result = re.sub(r'\s+', ' ', result)
-    return result.strip()
+    """Convert any Climb genotype string to standard symbol for output."""
+    return genotype_to_symbol(genotype)
+
+
+def genotype_to_symbol(genotype, strain: str = '') -> str:
+    """
+    Convert any raw Climb genotype string to a standard display symbol:
+      +/-   Het / Carrier
+      -/-   Hom / Knockout
+      -/Y   Hemi / X-linked
+      +/+   Wild-type
+      Inbred  B6/B6NJ inbred
+      Blank   Unknown / ungenotyped
+    """
+    canon = canonicalize_genotype(genotype, strain)
+    return {
+        GENOTYPE_HET:    '+/-',
+        GENOTYPE_HOM:    '-/-',
+        GENOTYPE_HEMI:   '-/Y',
+        GENOTYPE_WILD:   '+/+',
+        GENOTYPE_INBRED: 'Inbred',
+        GENOTYPE_BLANK:  'Blank',
+    }.get(canon, 'Blank')
 
 
 def clean_genotype_labels(genotype):
-    """Clean genotype specifically for label formatting."""
-    if pd.isna(genotype):
-        return 'N/A'
-    result = str(genotype)
-    if result in ('', 'nan', 'N/A'):
-        return 'N/A'
-    result = re.sub(r'‹[^›]*›', '', result)
-    result = re.sub(r'<[^>]*>', '', result)
-    result = re.sub(r'Generic\s+LacZ\s+tg/0,?\s*', '', result, flags=re.IGNORECASE)
-    result = re.sub(r'\bprobe\b', '', result, flags=re.IGNORECASE)
-    result = ' '.join(result.split())
-    if not result.strip():
-        return 'N/A'
-    return result
+    """Clean genotype specifically for label formatting — returns standard symbol."""
+    return genotype_to_symbol(genotype)
 
-
-def natural_sort_key(name):
-    """Create a sort key that handles numbers naturally."""
-    if pd.isna(name):
-        return []
-    parts = re.split(r'(\d+)', str(name))
-    return [int(part) if part.isdigit() else part.lower() for part in parts]
 
 
 def translate_protocol(harvest_type, timepoint):
@@ -7250,10 +7277,6 @@ def build_working_data(all_animals_df):
 # ============================================================
 # STEPS 0+1: BUILD HARVEST WORKSHEET & CREATE SAMPLES
 # ============================================================
-
-def get_starting_sample_number():
-    """Ask user for the last sample number used — via GUI dialog."""
-    return _gui_ask('sample_number')
 
 
 def run_harvest_and_samples(working_df, timestamp):
@@ -8084,9 +8107,19 @@ def format_label_rows(row, label_type):
     animal_name = safe_get_label(row, 'Animal Name', 'Animal_Name')
     line_short = safe_get_label(row, 'Line (Short)')
 
+    # Calculate age in days at harvest for label (P prefix)
+    age_days_label = 'N/A'
+    try:
+        bd = pd.to_datetime(safe_get_label(row, 'Birth_Date', 'Birth Date'))
+        hd = pd.to_datetime(safe_get_label(row, 'Sample Harvest Date', 'Harvest Date', 'Harvest_Date'))
+        if pd.notna(bd) and pd.notna(hd):
+            age_days_label = f"P{int((hd - bd).days)}"
+    except:
+        pass
+
     row1 = f"{sample_name}_{harvest_date}_{animal_name}"
     row2 = f"{age_weeks}Wks_{sex}_{line_short}_{line_stock}"
-    row3 = f"{genotype}_{born_date}_{time_point}"
+    row3 = f"{genotype}_{born_date}_{age_days_label}"
     row4 = "Mouse_Perfused Brain" if label_type.lower() == 'perfusion' else "Mouse_Frozen Brain"
 
     return row1, row2, row3, row4
@@ -8179,15 +8212,6 @@ def run_labels(samples_df, working_df, timestamp):
         print("  ✗ No animal data. Skipping.")
         return None
 
-    # Debug input
-    print(f"\n  DEBUG Labels input:")
-    print(f"    samples_df columns: {list(samples_df.columns)}")
-    print(f"    samples_df rows: {len(samples_df)}")
-    if len(samples_df) > 0:
-        print(f"    samples_df first row: {samples_df.iloc[0].to_dict()}")
-    print(f"    working_df columns (first 10): {list(working_df.columns)[:10]}")
-    print(f"    working_df rows: {len(working_df)}")
-
     # Prepare samples — rename for merge
     s_df = samples_df.copy()
     s_rename = {}
@@ -8199,41 +8223,24 @@ def run_labels(samples_df, working_df, timestamp):
         s_rename['Harvest Date'] = 'Sample Harvest Date'
     s_df = s_df.rename(columns=s_rename)
 
-    print(f"    After rename - s_df columns: {list(s_df.columns)}")
-
     # Prepare animals — rename Animal_Name for merge
     a_df = working_df.copy()
     a_df = a_df.rename(columns={'Animal_Name': 'Animal Name'})
 
-    print(f"    After rename - a_df 'Animal Name' present: {'Animal Name' in a_df.columns}")
-
     if 'Animal Name' not in s_df.columns:
         print("  ✗ 'Animal Name' not found in samples after rename")
-        print(f"    s_df columns: {list(s_df.columns)}")
         return None
     if 'Animal Name' not in a_df.columns:
         print("  ✗ 'Animal Name' not found in animal data after rename")
-        print(f"    a_df columns: {list(a_df.columns)}")
         return None
 
-    # Debug merge values
-    s_names = set(s_df['Animal Name'].astype(str).str.strip().unique())
-    a_names = set(a_df['Animal Name'].astype(str).str.strip().unique())
-    common = s_names.intersection(a_names)
-    print(f"    Sample Animal Names (first 3): {list(s_names)[:3]}")
-    print(f"    Working Animal Names (first 3): {list(a_names)[:3]}")
-    print(f"    Common names: {len(common)}")
-
-    if len(common) == 0:
-        print("  ✗ NO MATCHING NAMES between samples and animals!")
-        print(f"    This means the merge will produce 0 rows.")
-        print(f"    Sample names sample: {list(s_names)[:5]}")
-        print(f"    Animal names sample: {list(a_names)[:5]}")
-        return None
-
-    # Ensure string types match
     s_df['Animal Name'] = s_df['Animal Name'].astype(str).str.strip()
     a_df['Animal Name'] = a_df['Animal Name'].astype(str).str.strip()
+
+    common = set(s_df['Animal Name'].unique()).intersection(set(a_df['Animal Name'].unique()))
+    if len(common) == 0:
+        print("  ✗ No matching animal names between samples and animals — cannot create labels.")
+        return None
 
     merged_df = pd.merge(s_df, a_df, on='Animal Name', how='inner',
                          suffixes=('_sample', '_animal'))
@@ -8242,11 +8249,27 @@ def run_labels(samples_df, working_df, timestamp):
     if unmatched > 0:
         print(f"  ⚠ {unmatched} samples did not match")
     print(f"  Matched {len(merged_df)} samples with animal data")
-    print(f"  Merged columns: {list(merged_df.columns)}")
 
     if len(merged_df) == 0:
         print("  ✗ No matches — cannot create labels.")
         return None
+
+    # Sort by animal number then sample number before generating labels
+    def _animal_sort_key(name):
+        parts = re.split(r'(\d+)', str(name))
+        return ''.join(p.zfill(10) if p.isdigit() else p.lower() for p in parts)
+
+    def _sample_sort_key(name):
+        s = str(name).strip()
+        base = s.split('-')[0] if '-' in s else s
+        digits = ''.join(filter(str.isdigit, base))
+        return int(digits) if digits else 0
+
+    merged_df['_animal_sort'] = merged_df['Animal Name'].apply(_animal_sort_key)
+    merged_df['_sample_sort'] = merged_df['Sample Name'].apply(_sample_sort_key)
+    merged_df = merged_df.sort_values(['_animal_sort', '_sample_sort']).drop(
+        ['_animal_sort', '_sample_sort'], axis=1
+    ).reset_index(drop=True)
 
     print("\n  Generating labels...")
     perfusion_labels, rna_labels, perf_count, rna_count, oct_count = generate_all_labels(merged_df)
@@ -9196,11 +9219,15 @@ def run_pipeline_gui():
                             working_df, timestamp)
                         run_deliverables(working_df, samples_df, timestamp)
                         # NB animals skip Envision — no behavior session needed
-                        envision_df = working_df[~working_df.get('_is_nb', pd.Series(False, index=working_df.index))].copy()
+                        # NB animals and P14 animals excluded from Envision — no behavior session
+                        envision_df = working_df[
+                            ~working_df.get('_is_nb', pd.Series(False, index=working_df.index)) &
+                            (working_df.get('Assigned_Timepoint', '') == 'P56')
+                        ].copy()
                         if not envision_df.empty:
                             run_climb_to_envision(envision_df, timestamp)
                         else:
-                            print("  ⓘ No Envision output — all animals are NB type.")
+                            print("  ⓘ No Envision output — no P56 non-NB animals scheduled.")
                         run_labels(samples_df, working_df, timestamp)
 
                         new_files = sorted([

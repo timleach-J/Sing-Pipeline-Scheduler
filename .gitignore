@@ -1,0 +1,34 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Data files — live colony data, never commit
+*.csv
+
+# Pipeline outputs — timestamped files from every run
+Complete_Schedule_*.xlsx
+Harvest_Sheet_Import_*.xlsx
+Lab_Data_Export_*.xlsx
+Labels_Mailmerge_*.xlsx
+Climb_Sample_Import_*.csv
+Tube_Labeler_RNA_*.xlsx
+Mailmerge_Labels_PERFUSION_*.xlsx
+
+# Pipeline-generated folders
+backup_*/
+logs/
+Complete exports/
+Labels/
+Tubes/
+Envision/
+Data Export/
+Sample Import/
+Complete Outputs/
+Documents/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
