@@ -3,7 +3,6 @@ from collections import defaultdict
 import re
 import os
 from datetime import datetime
-from sing_common import genotype_to_symbol as _genotype_to_symbol, natural_sort_key
 
 def clean_genotype_base(genotype, strain):
     """Remove <content>, Probe, Generic LacZ tg/0, and zygosity markers including -/Y"""
@@ -57,11 +56,43 @@ def clean_genotype_base(genotype, strain):
     return result.strip()
 
 def clean_genotype(genotype):
-    """Convert any Climb genotype string to standard display symbol.
-    Returns '' for null/empty inputs (rather than 'Blank') to produce
-    clean empty cells in the Envision import file."""
-    symbol = _genotype_to_symbol(genotype)
-    return '' if symbol == 'Blank' else symbol
+    """Convert any Climb genotype string to standard display symbol."""
+    if pd.isna(genotype):
+        return ''
+    raw = str(genotype).strip()
+    if not raw or raw.lower() in ('nan', 'none', 'n/a', '-'):
+        return ''
+    s = raw.lower()
+    s = re.sub(r'[‹<][^›>]*[›>]', '', s)
+    s = re.sub(r'\[[^\]]*\]', '', s)
+    s = re.sub(r'probe\s*', '', s)
+    s = ' '.join(s.split())
+    if any(k in s for k in ('inconclusive', 'pending', 'failed', 'no call')):
+        return 'Blank'
+    if re.search(r'\bhom\d*\b|-/-', s):
+        return '-/-'
+    if re.search(r'\bhet\d*\b|-/\+|\+/-', s):
+        return '+/-'
+    if re.search(r'hem[i]?|tg/\+|\+/tg|-/y', s):
+        return '-/Y'
+    if re.search(r'\+/\+|\bwt\b|wild.?type', s):
+        return '+/+'
+    if 'inbred' in s:
+        return 'Inbred'
+    return 'Blank'
+
+def natural_sort_key(name):
+    """
+    Create a sort key that handles numbers naturally.
+    E.g., "Mouse2" comes before "Mouse10"
+    """
+    if pd.isna(name):
+        return []
+    
+    # Split the name into text and number parts
+    parts = re.split(r'(\d+)', str(name))
+    # Convert numeric parts to integers for proper sorting
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
 
 def assign_ear_tags_by_strain_sex(df):
     """

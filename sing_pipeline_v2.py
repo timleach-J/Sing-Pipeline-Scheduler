@@ -1,23 +1,26 @@
 # =============================================================================
 # SING Pipeline Scheduler
-# Version: 2.0.0
-# Updated: 2026-03-24
+# Version: 2.3.0
+# Updated: 2026-06-04
 #
-# Changes from v1.6:
-#   - Narrowed warnings.filterwarnings — no longer silences all warnings globally
-#   - Fixed bare except clauses in auto_size_columns and _run_again queue clearing
-#   - Removed redundant `date as date_type` alias — all hints now use `date`
-#   - Removed unused `timezone` import
-#   - Removed top-level `import unittest` (lazy-loaded in test block only)
-#   - Added `Any` to typing imports
-#   - Documented unused `sex` param in get_strain_breeding_type
-#   - Replaced convoluted argsort sort with sort_values(key=...) in
-#     build_births_sexing_schedule
-#   - Simplified process_large_dataset — removed unnecessary line-count pre-pass
-#   - Vectorized filter_animals_by_use excluded record construction (no iterrows)
-#   - Added docstrings to to_date, validate_config_advanced, auto_size_columns,
-#     get_strain_breeding_type, process_large_dataset, filter_animals_by_use
-#   - Replaced len(df) == 0 checks with df.empty throughout (~30 sites)
+# Changes from v2.2:
+#   - Added Screen 1.5: Colony Rotation Review
+#       • Loads matings.csv (Climb active matings export) + births.csv
+#       • Monthly rotation formula: interval = ceil(6/N) months per unit
+#       • Bresenham pattern for N>6 (e.g. SHANK3 N=9 → 1,2,1,2,1,2 /mo)
+#       • NP rules: 90d with 0 live births; 60d since last litter (gone quiet)
+#       • Flags missing sire/dam (touring male, death, or other)
+#       • Shows breeding candidates from animals.csv (56-84d, matching genotype)
+#       • Checkboxes to reserve animals for breeding before harvest scheduling
+#       • Reserved animals excluded from harvest pool, appear as
+#         "Reserved — Breeding" in output
+#       • COMPLETING_STRAINS config list suppresses setup prompts for strains
+#         winding down (KCND3, FMR1, C3, CDKL5, CNTNAP2)
+#   - Removed births sexing schedule functionality (build_births_sexing_schedule,
+#     find_unmatched_births_enhanced, and related helpers) — Climb births export
+#     column format incompatible with previous implementation
+#   - Added CONFIG keys: INPUT_MATINGS_FILE, COLONY_ROTATION_DAYS,
+#     COLONY_NP_NO_BIRTHS_DAYS, COLONY_NP_GONE_QUIET_DAYS, COMPLETING_STRAINS
 # =============================================================================
 import pandas as pd
 from openpyxl import Workbook
@@ -82,7 +85,6 @@ CONFIG = {
     'INPUT_ANIMAL_FILE': 'animals.csv',
     'INPUT_TRACKING_FILE': 'Sing Harvest Sheet - Summary Sheet.csv',
     'INPUT_BIRTHS_FILE': 'births.csv',
-    'INPUT_OVERRIDES_FILE': 'harvest_overrides.csv',  # optional — leave blank rows to auto-assign
 
     'WEDNESDAY_CAPACITY': 18,
     'CAGE_SIZE': 3,
@@ -123,9 +125,6 @@ CONFIG = {
         'Genotype', 'Use', 'Status', 'Birth ID', 'Marker Type'
     ],
 
-    'REQUIRED_BIRTHS_COLUMNS': [
-        'Birth ID', 'Status', 'Birth Date', 'Live Count', '# of Pups', 'Line (Short)', 'Dam', 'Sire'
-    ],
 
     'SUPER_PRIORITY_STRAINS': [
         'ARID1B', 'CACNA1G', 'CHD8', 'CNTNAP2', 'CTCF',
@@ -144,7 +143,7 @@ CONFIG = {
         'DLG4': 'All', 'DLL1': 'Half', 'DNMT3A': 'Half', 'DYRK1A': 'All',
         'EBF3': 'Half', 'EHMT1': 'Half', 'EIF5A': 'All', 'EP300': 'Half',
         'ERF': 'Half', 'FAM120A': 'All', 'FBN1': 'Half', 'FMR1': 'All',
-        'FOXP1': 'Half', 'GABRA1': 'All', 'GABRG2': 'Half', 'GRIA2': 'Half',
+        'FOXP1': 'Half', 'GABRA1': 'All', 'GET204': 'All', 'GABRG2': 'Half', 'GRIA2': 'Half',
         'GRIN2A': 'Half', 'GRIN2B': 'Half', 'GRN': 'All', 'HECW2': 'Half',
         'HERC1': 'All', 'IQSEC2': 'All', 'ITPR1': 'All', 'KAT6B': 'Half',
         'KBTBD7': 'All', 'KCNB1': 'All', 'KCND3': 'All', 'KCNMA1': 'All',
@@ -169,7 +168,30 @@ CONFIG = {
     # Strains bred Het×Het — yield is 3/4 usable (1/4 Hom + 1/2 Het), 1/4 Wild
     # Hom animals from these crosses get absolute highest scheduling priority
     'HETXHET_STRAINS': [
-        'SHANK3', 'KDM5B',
+        'SHANK3',
+    ],
+
+    # ── Colony rotation (breeding) ────────────────────────────────────────────
+    # matings.csv: Climb active matings export, saved alongside animals.csv
+    # births.csv (INPUT_BIRTHS_FILE above): same file, also used for rotation
+    'INPUT_MATINGS_FILE': 'matings.csv',
+
+    # Target rotation length in days (6 months)
+    'COLONY_ROTATION_DAYS': 180,
+
+    # Non-productive (NP) retirement rules
+    'COLONY_NP_NO_BIRTHS_DAYS':   90,   # Rule 1: active >= 90d with 0 live births
+    'COLONY_NP_GONE_QUIET_DAYS':  60,   # Rule 2: had a litter, then silent >= 60d
+
+    # Strains completing their SING obligation.
+    # Retirement flags are shown but NO setup prompts are generated.
+    # Update this list as strains finish. Use the exact Line name from matings.csv.
+    'COMPLETING_STRAINS': [
+        'B6.129(FVB)-Cdkl5<tm1.1Joez>/J',
+        'B6.129S4-C3<tm1Crr>/J',
+        'B6J-Cntnap2-/-',
+        'B6J-Fmr1 -/- (X chr)',
+        'B6NJ-Kcnd3-/- Cyfip2-S968F<J> Hom Breed Well',
     ],
 }
 
@@ -451,7 +473,7 @@ def is_heterozygous(genotype: str) -> bool:
     if pd.isna(genotype):
         return False
     geno_str = str(genotype).strip()
-    if geno_str == GENOTYPE_HET:
+    if geno_str in (GENOTYPE_HET, GENOTYPE_HEMI):
         return True
     if geno_str in _CANONICAL_GENOTYPES:
         return False
@@ -728,14 +750,6 @@ def validate_animal_file(df: pd.DataFrame) -> bool:
     return True
 
 
-def validate_births_file(df: pd.DataFrame) -> bool:
-    core_required = ['Birth ID', 'Status', 'Birth Date']
-    missing_core = [col for col in core_required if col not in df.columns]
-    if missing_core:
-        raise DataValidationError(f"Missing required columns in births file: {missing_core}")
-    return True
-
-
 def process_large_dataset(animal_file: str, chunk_size: int = None) -> pd.DataFrame:
     """Read animal CSV and filter to alive animals only.
 
@@ -768,26 +782,6 @@ def read_animal_data(filename: str) -> pd.DataFrame:
 
     logger.info(f"Loaded {len(df)} alive animals")
     logger.info(f"Genotype breakdown:\n{df['Genotype'].value_counts().to_string()}")
-    return df
-
-
-def read_births_data(filename: str) -> Optional[pd.DataFrame]:
-    if filename is None or not os.path.exists(filename):
-        logger.warning(f"Births file not found: {filename}")
-        return None
-    try:
-        df = pd.read_csv(filename)
-    except Exception as e:
-        logger.warning(f"Error reading births file: {e}")
-        return None
-    try:
-        validate_births_file(df)
-    except DataValidationError as e:
-        logger.warning(f"{e}")
-        return None
-    df['Birth Date'] = pd.to_datetime(df['Birth Date'], errors='coerce')
-    df['Birth ID'] = df['Birth ID'].astype(str)
-    logger.info(f"Loaded {len(df)} birth records")
     return df
 
 
@@ -857,467 +851,6 @@ def diagnose_animal_file(df: pd.DataFrame) -> None:
 # BIRTHS ANALYSIS
 # ============================================================================
 
-def calculate_sexing_date(birth_date: Union[date, datetime, pd.Timestamp]) -> Optional[date]:
-    bd = to_date(birth_date)
-    if bd is None:
-        return None
-    return bd + timedelta(days=CONFIG['SEXING_OFFSET_DAYS'])
-
-
-def build_births_sexing_schedule(
-    births_df: pd.DataFrame,
-    animals_df: Optional[pd.DataFrame] = None
-) -> pd.DataFrame:
-    """
-    Build a sexing schedule for births that have not yet been sexed.
-    Any Birth ID that already has animals in animals_df is excluded.
-    """
-    if births_df is None or births_df.empty:
-        return pd.DataFrame()
-
-    today = datetime.now().date()
-
-    sing = births_df[
-        births_df['Status'].str.contains('Sing Inventory', na=False, case=False)
-    ].copy()
-
-    if sing.empty:
-        return pd.DataFrame()
-
-    already_sexed_birth_ids = set()
-    if animals_df is not None and len(animals_df) > 0 and 'Birth ID' in animals_df.columns:
-        already_sexed_birth_ids = set(
-            animals_df['Birth ID'].astype(str).unique()
-        )
-        logger.info(
-            f"build_births_sexing_schedule: {len(already_sexed_birth_ids)} "
-            f"Birth IDs already have animals entered (already sexed)"
-        )
-
-    rows = []
-    skipped_already_sexed = 0
-
-    for _, birth in sing.iterrows():
-        birth_id = str(birth.get('Birth ID', 'N/A'))
-
-        if birth_id in already_sexed_birth_ids:
-            skipped_already_sexed += 1
-            continue
-
-        birth_date_obj = to_date(birth['Birth Date'])
-        strain = birth.get('Line (Short)', 'N/A')
-        dam = birth.get('Dam', 'N/A')
-        sire = birth.get('Sire', 'N/A')
-        num_pups = birth.get('# of Pups', birth.get('Live Count', 'N/A'))
-
-        if birth_date_obj is None:
-            rows.append({
-                'Birth_ID': birth_id,
-                'Strain': strain if pd.notna(strain) else 'N/A',
-                'Dam': dam if pd.notna(dam) else 'N/A',
-                'Sire': sire if pd.notna(sire) else 'N/A',
-                'Birth_Date': 'N/A',
-                'Num_Pups': num_pups if pd.notna(num_pups) else 'N/A',
-                'Sexing_Date': 'N/A',
-                'Day_of_Week': 'N/A',
-                'Days_Until_Sexing': 'N/A',
-                'Sexing_Status': '❓ Unknown — No birth date',
-                'P14_Expected_Date': 'N/A',
-                'P14_Day_of_Week': 'N/A',
-            })
-            continue
-
-        sexing_date = birth_date_obj + timedelta(days=CONFIG['SEXING_OFFSET_DAYS'])
-        p14_date = birth_date_obj + timedelta(days=P14_OFFSET_DAYS)
-        days_until = (sexing_date - today).days
-
-        if days_until < 0:
-            status = f'✅ Done (was {sexing_date.strftime("%Y-%m-%d")})'
-        elif days_until == 0:
-            status = '🔴 TODAY — Sex pups now!'
-        elif days_until == 1:
-            status = '🟠 TOMORROW — Prepare'
-        elif days_until <= 3:
-            status = f'🟡 SOON — {days_until} days'
-        else:
-            status = f'🟢 Upcoming — {days_until} days'
-
-        rows.append({
-            'Birth_ID': birth_id,
-            'Strain': strain if pd.notna(strain) else 'N/A',
-            'Dam': dam if pd.notna(dam) else 'N/A',
-            'Sire': sire if pd.notna(sire) else 'N/A',
-            'Birth_Date': birth_date_obj.strftime('%Y-%m-%d'),
-            'Num_Pups': int(num_pups) if pd.notna(num_pups) else 'N/A',
-            'Sexing_Date': sexing_date.strftime('%Y-%m-%d'),
-            'Day_of_Week': sexing_date.strftime('%A'),
-            'Days_Until_Sexing': days_until,
-            'Sexing_Status': status,
-            'P14_Expected_Date': p14_date.strftime('%Y-%m-%d'),
-            'P14_Day_of_Week': p14_date.strftime('%A'),
-        })
-
-    if skipped_already_sexed > 0:
-        logger.info(
-            f"build_births_sexing_schedule: skipped {skipped_already_sexed} "
-            f"births already sexed (animals entered in system)"
-        )
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    def _sexing_sort_key(val: Any) -> tuple:
-        """Sort key: upcoming dates first (asc), then past dates, then unknowns."""
-        if isinstance(val, int):
-            return (0 if val >= 0 else 1, val if val >= 0 else -val)
-        return (2, 0)
-
-    df = df.sort_values(
-        by='Days_Until_Sexing',
-        key=lambda col: col.map(_sexing_sort_key)
-    )
-    df = df.reset_index(drop=True)
-    return df
-
-
-def analyze_birth_scheduling_potential(birth: pd.Series, requirements: Dict,
-                                       remaining_needs: Dict, today: date) -> Dict:
-    birth_date = birth['Birth Date']
-    if pd.isna(birth_date):
-        return {
-            'P14_Potential': 'Unknown', 'P14_Reason': 'No birth date',
-            'P14_Expected_Date': 'N/A', 'P14_Day_of_Week': 'N/A',
-            'P56_Potential': 'Unknown', 'P56_Reason': 'No birth date',
-            'P56_Expected_Behavior_Date': 'N/A', 'P56_Expected_Harvest_Date': 'N/A',
-            'Quota_Status': 'Unknown', 'Priority_Strain': 'Unknown', 'Age_Today_Days': 'N/A',
-            'Sexing_Date': 'N/A', 'Sexing_Day_of_Week': 'N/A',
-        }
-
-    birth_date_obj = to_date(birth_date)
-    strain = birth.get('Line (Short)', '')
-
-    if birth_date_obj is None:
-        return {
-            'P14_Potential': 'Unknown', 'P14_Reason': 'Invalid birth date',
-            'P14_Expected_Date': 'N/A', 'P14_Day_of_Week': 'N/A',
-            'P56_Potential': 'Unknown', 'P56_Reason': 'Invalid birth date',
-            'P56_Expected_Behavior_Date': 'N/A', 'P56_Expected_Harvest_Date': 'N/A',
-            'Quota_Status': 'Unknown',
-            'Priority_Strain': 'YES' if is_priority_strain(strain) else 'No',
-            'Age_Today_Days': 'N/A', 'Sexing_Date': 'N/A', 'Sexing_Day_of_Week': 'N/A',
-        }
-
-    dates = calculate_schedule_dates(birth_date_obj)
-
-    if dates is None:
-        return {
-            'P14_Potential': 'Unknown', 'P14_Reason': 'Invalid birth date',
-            'P14_Expected_Date': 'N/A', 'P14_Day_of_Week': 'N/A',
-            'P56_Potential': 'Unknown', 'P56_Reason': 'Invalid birth date',
-            'P56_Expected_Behavior_Date': 'N/A', 'P56_Expected_Harvest_Date': 'N/A',
-            'Quota_Status': 'Unknown',
-            'Priority_Strain': 'YES' if is_priority_strain(strain) else 'No',
-            'Age_Today_Days': 'N/A', 'Sexing_Date': 'N/A', 'Sexing_Day_of_Week': 'N/A',
-        }
-
-    p14_harvest = dates['p14_harvest']
-    behavior_window_start = dates['p56_behavior_window_start']
-    behavior_window_end = dates['p56_behavior_window_end']
-    sexing_date = dates['sexing_date']
-
-    p14_valid = is_valid_p14_day(p14_harvest)
-    p14_in_future = p14_harvest > today
-
-    if not p14_in_future:
-        p14_potential = 'Past'
-        if p14_harvest == today:
-            p14_reason = f'P14 date is today ({p14_harvest}) — too late to schedule'
-        else:
-            p14_reason = f'P14 date ({p14_harvest}) has passed'
-    elif not p14_valid:
-        p14_potential = 'No'
-        p14_reason = f'P14 falls on {p14_harvest.strftime("%A")} (invalid day)'
-    else:
-        p14_potential = 'Yes'
-        p14_reason = f'Could schedule on {p14_harvest.strftime("%A, %Y-%m-%d")}'
-
-    first_wednesday = next_wednesday(behavior_window_start)
-    p56_harvest_date = None
-
-    if first_wednesday is None:
-        p56_potential = 'No'
-        p56_reason = 'Cannot calculate P56 behavior date'
-    elif first_wednesday > behavior_window_end:
-        p56_potential = 'No'
-        p56_reason = 'No Wednesday in P42-49 window'
-    elif first_wednesday < today:
-        p56_potential = 'Past'
-        p56_reason = f'P56 window ({first_wednesday}) has passed'
-    else:
-        p56_potential = 'Yes'
-        p56_reason = f'Could schedule behavior on {first_wednesday.strftime("%A, %Y-%m-%d")}'
-        p56_harvest_date = first_wednesday + timedelta(days=P56_HARVEST_OFFSET_FROM_BEHAVIOR)
-
-    quota_status = 'Unknown'
-    quota_details = []
-    is_priority = is_priority_strain(strain)
-
-    if remaining_needs and pd.notna(strain):
-        strain_key = str(strain).strip().upper()
-        if strain_key in remaining_needs:
-            p14_needs = remaining_needs[strain_key]['P14']
-            p56_needs = remaining_needs[strain_key]['P56']
-            for timepoint, needs_dict in [('P14', p14_needs), ('P56', p56_needs)]:
-                for sex in ['Male', 'Female']:
-                    total = sum(needs_dict[sex][ht]['needed'] for ht in ['Perfusion', 'MERFISH', 'RNAseq'])
-                    if total > 0:
-                        quota_details.append(f"{timepoint} {sex}: {total} needed")
-            quota_status = 'NEEDED - ' + '; '.join(quota_details) if quota_details else 'Quota Complete'
-        else:
-            quota_status = 'Not tracked in requirements'
-
-    age_days = (today - birth_date_obj).days
-
-    return {
-        'P14_Potential': p14_potential,
-        'P14_Reason': p14_reason,
-        'P14_Expected_Date': p14_harvest.strftime('%Y-%m-%d'),
-        'P14_Day_of_Week': p14_harvest.strftime('%A'),
-        'P56_Potential': p56_potential,
-        'P56_Reason': p56_reason,
-        'P56_Expected_Behavior_Date': first_wednesday.strftime('%Y-%m-%d') if p56_potential != 'No' and first_wednesday else 'N/A',
-        'P56_Expected_Harvest_Date': p56_harvest_date.strftime('%Y-%m-%d') if p56_harvest_date else 'N/A',
-        'Quota_Status': quota_status,
-        'Priority_Strain': 'YES' if is_priority else 'No',
-        'Age_Today_Days': age_days,
-        'Sexing_Date': sexing_date.strftime('%Y-%m-%d') if sexing_date else 'N/A',
-        'Sexing_Day_of_Week': sexing_date.strftime('%A') if sexing_date else 'N/A',
-    }
-
-
-def estimate_expected_animals(birth: pd.Series) -> Dict:
-    num_pups = None
-    count_source = 'No count field'
-
-    if 'Live Count' in birth.index:
-        num_pups = birth.get('Live Count', None)
-        if pd.notna(num_pups):
-            count_source = 'Live Count'
-
-    if num_pups is None and '# of Pups' in birth.index:
-        num_pups = birth.get('# of Pups', None)
-        if pd.notna(num_pups):
-            count_source = '# of Pups'
-
-    strain = birth.get('Line (Short)', '')
-    breeding_type = get_strain_breeding_type(strain)
-
-    if pd.isna(num_pups):
-        return {
-            'Expected_Total_Born': 'Unknown', 'Expected_Usable': 'Unknown',
-            'Expected_Usable_Males': 'Unknown', 'Expected_Usable_Females': 'Unknown',
-            'Breeding_Type': breeding_type,
-            'Estimation_Note': 'No pup count in birth record'
-        }
-
-    try:
-        total_pups = int(num_pups)
-    except (ValueError, TypeError):
-        return {
-            'Expected_Total_Born': 'Unknown', 'Expected_Usable': 'Unknown',
-            'Expected_Usable_Males': 'Unknown', 'Expected_Usable_Females': 'Unknown',
-            'Breeding_Type': breeding_type,
-            'Estimation_Note': f'Invalid pup count: {num_pups}'
-        }
-
-    if breeding_type == 'Half':
-        expected_usable = total_pups // 2
-        expected_usable_males = expected_usable // 2
-        expected_usable_females = expected_usable - expected_usable_males
-        note = f'Het x WT: ~50% usable ({expected_usable} of {total_pups}) [from {count_source}]'
-    elif breeding_type == 'All':
-        expected_usable = total_pups
-        expected_usable_males = total_pups // 2
-        expected_usable_females = total_pups - expected_usable_males
-        note = f'Hom x Hom/Inbred: All usable ({expected_usable} of {total_pups}) [from {count_source}]'
-    else:
-        expected_usable = total_pups // 2
-        expected_usable_males = expected_usable // 2
-        expected_usable_females = expected_usable - expected_usable_males
-        note = f'Unknown strain: Assuming Het x WT (~50%) [from {count_source}]'
-
-    return {
-        'Expected_Total_Born': total_pups,
-        'Expected_Usable': expected_usable,
-        'Expected_Usable_Males': f'~{expected_usable_males}',
-        'Expected_Usable_Females': f'~{expected_usable_females}',
-        'Breeding_Type': breeding_type,
-        'Estimation_Note': note
-    }
-
-
-def determine_action_required(potential: Dict, expectations: Dict, age_days) -> str:
-    actions = []
-    if potential['P14_Potential'] == 'Yes' or potential['P56_Potential'] == 'Yes':
-        actions.append('🔍 VERIFY animals exist and have correct Birth ID')
-        if potential['Quota_Status'].startswith('NEEDED'):
-            actions.append('⚠️ URGENT: Quota needs exist - locate animals immediately')
-    if age_days is not None and age_days != 'N/A':
-        if age_days > 56:
-            actions.append('❌ Too old for P56 - consider P14 retrospective or exclude')
-        elif age_days > 49:
-            actions.append('⏰ P56 window closing - urgent genotyping needed')
-        elif age_days >= 42:
-            actions.append('📋 P56 window open - genotype and schedule behavior')
-        elif age_days > 14:
-            actions.append('⏰ P14 window passed - plan for P56')
-        elif age_days >= 10:
-            actions.append('📋 Genotype for P14 scheduling')
-        else:
-            actions.append('⏳ Monitor - too young for scheduling')
-    if expectations.get('Expected_Total_Born') == 0:
-        actions.append('ℹ️ Birth shows 0 pups - verify and update status')
-    if not actions:
-        actions.append('📧 Contact lab manager for clarification')
-    return ' | '.join(actions)
-
-
-def find_unmatched_births_enhanced(births_df: Optional[pd.DataFrame], animals_df: pd.DataFrame,
-                                    requirements: Dict, remaining_needs: Dict) -> pd.DataFrame:
-    if births_df is None or births_df.empty:
-        return pd.DataFrame()
-
-    today = datetime.now().date()
-    logger.info("Analyzing unmatched births...")
-
-    sing_inventory_births = births_df[
-        births_df['Status'].str.contains('Sing Inventory', na=False, case=False)
-    ].copy()
-
-    if sing_inventory_births.empty:
-        return pd.DataFrame()
-
-    animal_birth_ids = set(animals_df['Birth ID'].astype(str).unique())
-    unmatched_births = []
-
-    for idx, birth in sing_inventory_births.iterrows():
-        birth_id = str(birth['Birth ID'])
-        if birth_id == 'nan' or birth_id.strip() == '':
-            continue
-        if birth_id not in animal_birth_ids:
-            birth_date = birth['Birth Date']
-            birth_date_str = to_date(birth_date).strftime('%Y-%m-%d') if pd.notna(birth_date) else 'N/A'
-            strain = birth.get('Line (Short)', 'N/A')
-            dam = birth.get('Dam', 'N/A')
-            sire = birth.get('Sire', 'N/A')
-            num_pups = birth.get('# of Pups', 'N/A')
-
-            potential = analyze_birth_scheduling_potential(birth, requirements, remaining_needs, today)
-            expectations = estimate_expected_animals(birth)
-            age_days = potential.get('Age_Today_Days', 'N/A')
-
-            if age_days != 'N/A':
-                if age_days > 56:
-                    urgency = '🔴 URGENT - Past P56'
-                elif age_days > 42:
-                    urgency = '🟡 HIGH - In P56 window'
-                elif age_days > 14:
-                    urgency = '🟢 MEDIUM - Past P14'
-                elif age_days >= 10:
-                    urgency = '🟢 LOW - Approaching P14'
-                else:
-                    urgency = '⚪ INFO - Too young'
-            else:
-                urgency = '❓ UNKNOWN - No birth date'
-
-            possible_reasons = []
-            if pd.notna(num_pups) and num_pups == 0:
-                possible_reasons.append('Birth record shows 0 pups')
-            elif pd.notna(birth_date) and age_days != 'N/A' and age_days < 5:
-                possible_reasons.append('Birth too recent - animals may not be entered yet')
-            else:
-                possible_reasons.append('Animals not found/entered in Climb')
-                possible_reasons.append('Animals may have been culled')
-                possible_reasons.append('Birth ID mismatch possible')
-
-            unmatched_births.append({
-                'Urgency': urgency,
-                'Birth_ID': birth_id,
-                'Birth_Date': birth_date_str,
-                'Age_Days': age_days,
-                'Strain': strain if pd.notna(strain) else 'N/A',
-                'Priority_Strain': potential.get('Priority_Strain', 'Unknown'),
-                'Dam': dam if pd.notna(dam) else 'N/A',
-                'Sire': sire if pd.notna(sire) else 'N/A',
-                'Num_Pups_Recorded': num_pups if pd.notna(num_pups) else 'N/A',
-                'Status': birth['Status'],
-                **expectations,
-                'Sexing_Date': potential.get('Sexing_Date', 'N/A'),
-                'Sexing_Day_of_Week': potential.get('Sexing_Day_of_Week', 'N/A'),
-                'P14_Potential': potential['P14_Potential'],
-                'P14_Expected_Date': potential['P14_Expected_Date'],
-                'P14_Day_of_Week': potential['P14_Day_of_Week'],
-                'P14_Analysis': potential['P14_Reason'],
-                'P56_Potential': potential['P56_Potential'],
-                'P56_Expected_Behavior_Date': potential['P56_Expected_Behavior_Date'],
-                'P56_Expected_Harvest_Date': potential['P56_Expected_Harvest_Date'],
-                'P56_Analysis': potential['P56_Reason'],
-                'Quota_Status': potential['Quota_Status'],
-                'Possible_Reasons': ' | '.join(possible_reasons),
-                'Action_Required': determine_action_required(potential, expectations, age_days)
-            })
-
-    unmatched_df = pd.DataFrame(unmatched_births)
-
-    if len(unmatched_df) > 0:
-        urgency_order = {
-            '🔴 URGENT - Past P56': 0, '🟡 HIGH - In P56 window': 1,
-            '🟢 MEDIUM - Past P14': 2, '🟢 LOW - Approaching P14': 3,
-            '⚪ INFO - Too young': 4, '❓ UNKNOWN - No birth date': 5
-        }
-        unmatched_df['_urgency_sort'] = unmatched_df['Urgency'].map(urgency_order)
-        unmatched_df = unmatched_df.sort_values(['_urgency_sort', 'Birth_Date'])
-        unmatched_df = unmatched_df.drop(columns=['_urgency_sort'])
-
-    return unmatched_df
-
-
-def create_unmatched_births_summary(unmatched_df: pd.DataFrame) -> pd.DataFrame:
-    if unmatched_df.empty:
-        return pd.DataFrame()
-
-    summary_data = []
-    summary_data.append({'Category': 'Total Unmatched Births', 'Count': len(unmatched_df), 'Details': ''})
-
-    if 'Urgency' in unmatched_df.columns:
-        for urgency_val in unmatched_df['Urgency'].unique():
-            count = len(unmatched_df[unmatched_df['Urgency'] == urgency_val])
-            summary_data.append({'Category': 'By Urgency', 'Count': count, 'Details': urgency_val})
-
-    if 'P14_Potential' in unmatched_df.columns:
-        p14_yes = len(unmatched_df[unmatched_df['P14_Potential'] == 'Yes'])
-        summary_data.append({'Category': 'P14 Schedulable', 'Count': p14_yes, 'Details': 'Could be scheduled for P14 if animals found'})
-
-    if 'P56_Potential' in unmatched_df.columns:
-        p56_yes = len(unmatched_df[unmatched_df['P56_Potential'] == 'Yes'])
-        summary_data.append({'Category': 'P56 Schedulable', 'Count': p56_yes, 'Details': 'Could be scheduled for P56 if animals found'})
-
-    if 'Priority_Strain' in unmatched_df.columns:
-        priority_count = len(unmatched_df[unmatched_df['Priority_Strain'] == 'YES'])
-        summary_data.append({'Category': 'Priority Strains', 'Count': priority_count, 'Details': 'High-priority strains needing immediate attention'})
-
-    if 'Quota_Status' in unmatched_df.columns:
-        quota_needed = len(unmatched_df[unmatched_df['Quota_Status'].str.contains('NEEDED', na=False)])
-        summary_data.append({'Category': 'Has Quota Needs', 'Count': quota_needed, 'Details': 'Strains where quotas are not yet filled'})
-
-    return pd.DataFrame(summary_data)
-
-
-# ============================================================================
-# REQUIREMENTS PARSING
-# ============================================================================
-
 def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
     if tracking_df is None or tracking_df.empty:
         return {}
@@ -1336,12 +869,23 @@ def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
         return {}
 
     requirements = {}
+    seen_first_data = False
     for idx, row in tracking_df.iterrows():
         strain = row.iloc[0]
-        if pd.isna(strain) or str(strain).strip() in ['Lines', 'Line', '']:
+        strain_str_raw = str(strain).strip() if not pd.isna(strain) else ''
+
+        # Stop when we hit a second 'Lines'/'Line' header — marks end of strain data
+        if strain_str_raw in ('Lines', 'Line'):
+            if seen_first_data:
+                logger.info(f"parse_requirements: stopping at repeat header row {idx}")
+                break
             continue
 
-        strain_str = str(strain).strip()
+        if pd.isna(strain) or strain_str_raw == '':
+            continue
+
+        seen_first_data = True
+        strain_str = strain_str_raw
         strain_key = strain_str.upper()
 
         completed = {
@@ -1372,7 +916,8 @@ def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
             'original_name': strain_str,
             'completed': completed,
             'targets': targets,
-            'is_priority': is_priority_strain(strain_str)
+            'is_priority': is_priority_strain(strain_str),
+            'genotyped': str(row.iloc[1]).strip().upper() != 'NO',
         }
 
     logger.info(f"Parsed {len(requirements)} strains")
@@ -1425,42 +970,13 @@ def group_has_quota(strain: str, sex: str, timepoint: str, remaining_needs: Dict
     if strain_key not in remaining_needs:
         return True
 
+    if timepoint not in remaining_needs.get(strain_key, {}):
+        return True
+    if sex not in remaining_needs[strain_key].get(timepoint, {}):
+        return True
     needs = remaining_needs[strain_key][timepoint][sex]
     total_needed = needs['MERFISH']['needed'] + needs['RNAseq']['needed'] + needs['Perfusion']['needed']
     return total_needed >= 1
-
-
-def create_requirements_status(remaining_needs: Dict, requirements: Dict) -> pd.DataFrame:
-    if not remaining_needs or not requirements:
-        return pd.DataFrame()
-
-    status_rows = []
-    for strain_key, timepoints in remaining_needs.items():
-        original_strain = requirements[strain_key]['original_name']
-        is_priority = requirements[strain_key]['is_priority']
-
-        for timepoint, sexes in timepoints.items():
-            for sex, harvest_types in sexes.items():
-                for harvest_type, counts in harvest_types.items():
-                    status_rows.append({
-                        'Strain': original_strain,
-                        'Strain_Priority': 'PRIORITY' if is_priority else 'Standard',
-                        'Timepoint': timepoint,
-                        'Sex': sex,
-                        'Harvest_Type': harvest_type,
-                        'Target': counts['target'],
-                        'Completed': counts['completed'],
-                        'Remaining': counts['needed'],
-                        'Progress': f"{counts['completed']}/{counts['target']}",
-                        'Status': '✓ Complete' if counts['needed'] == 0 else f'Need {counts["needed"]} more'
-                    })
-
-    status_df = pd.DataFrame(status_rows)
-    status_df = status_df.sort_values(
-        ['Strain_Priority', 'Strain', 'Timepoint', 'Sex', 'Harvest_Type'],
-        ascending=[False, True, True, True, True]
-    )
-    return status_df
 
 
 # ============================================================================
@@ -1500,7 +1016,8 @@ def filter_animals_by_use(animals_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
 
 
 def filter_animals_by_genotype_first_pass(
-    animals_df: pd.DataFrame
+    animals_df: pd.DataFrame,
+    no_geno_strains: Optional[frozenset] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     First-pass genotype filter.
@@ -1508,9 +1025,21 @@ def filter_animals_by_genotype_first_pass(
     Returns
     -------
     filtered_df   : animals with usable genotypes (Het, Hom, Hemi, Inbred)
-    excluded_df   : animals definitively excluded (Wild, Cre-only Wild)
+    excluded_df   : animals definitively excluded (Wild, Cre-only Wild, Het-in-hom-only-strain)
     blank_df      : animals with Blank genotype — held for second pass
+
+    Parameters
+    ----------
+    no_geno_strains : upper-cased strain keys where column B == 'No' in the
+                      tracking sheet (inbred / hom-only crosses).  Het animals
+                      from these strains are excluded — only Hom is scheduled.
+                      Combined with _HETXHET_STRAINS_UPPER so both rules apply.
     """
+    if no_geno_strains is None:
+        no_geno_strains = frozenset()
+    # All strains where Het animals must be excluded
+    het_excluded_strains = no_geno_strains | _HETXHET_STRAINS_UPPER
+
     excluded_records = []
     blank_records    = []
     keep_mask        = []
@@ -1540,7 +1069,24 @@ def filter_animals_by_genotype_first_pass(
             keep_mask.append(False)
 
         elif geno in (GENOTYPE_HET, GENOTYPE_HOM, GENOTYPE_HEMI, GENOTYPE_INBRED):
-            keep_mask.append(True)
+            # Het animals from hom-only or Het×Het strains are not scheduled
+            strain_upper = str(strain).strip().upper()
+            if geno == GENOTYPE_HET and strain_upper in het_excluded_strains:
+                excluded_records.append({
+                    'Animal_Name': name,
+                    'Birth_ID':    row.get('Birth ID', 'N/A'),
+                    'Strain':      strain,
+                    'Genotype':    geno,
+                    'Sex':         row.get('Sex', 'N/A'),
+                    'Birth_Date':  (
+                        to_date(row.get('Birth Date')).strftime('%Y-%m-%d')
+                        if to_date(row.get('Birth Date')) else 'N/A'
+                    ),
+                    'Reason': f'Het excluded — {strain} only schedules Hom animals',
+                })
+                keep_mask.append(False)
+            else:
+                keep_mask.append(True)
 
         else:
             # Unrecognised canonical value — treat as blank
@@ -1730,7 +1276,7 @@ def check_eligibility(animals_df: pd.DataFrame,
         # P14 eligibility
         p14_age_at_harvest_days = (p14_harvest - birth_date).days
         p14_age_at_harvest_months = round(p14_age_at_harvest_days / 30.44)
-        p14_too_old = p14_harvest <= today
+        p14_too_old = p14_harvest < today
 
         if p14_too_old:
             p14_eligible = False
@@ -1981,7 +1527,7 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                     perf_f = remaining_needs[strain_key_flex]['P56']['Female']['Perfusion']
                     total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
                     total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
-                    already_over = total_completed >= total_target + 1
+                    already_over = total_completed >= total_target
                 # Allow flex only if not B6, not already over, and not yet used this run
                 if (strain_key_flex not in _B6_STRAINS_UPPER
                         and not already_over
@@ -2152,7 +1698,7 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                         perf_f = remaining_needs[strain_key]['P14']['Female']['Perfusion']
                         total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
                         total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
-                        already_over = total_completed >= total_target + 1
+                        already_over = total_completed >= total_target
                     if not already_over and not perfusion_flex_used.get(flex_key, False):
                         perfusion_flex_used[flex_key] = True
                         has_quota = True
@@ -2226,7 +1772,7 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                     perf_f = remaining_needs[strain_key]['P14']['Female']['Perfusion']
                     total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
                     total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
-                    already_over = total_completed >= total_target + 1
+                    already_over = total_completed >= total_target
                 if (remaining_needs and strain_key in remaining_needs
                         and not already_over
                         and not perfusion_flex_used.get(flex_key, False)):
@@ -2569,16 +2115,20 @@ def _compute_auto_types(schedulable_df, remaining_needs):
             )
             if p56_group_sizes.get(grp_key, 0) < CONFIG['CAGE_SIZE']:
                 nb_flag = True
+        elif timepoint == 'P14' and row.get('_dns_nb_candidate', False):
+            # P14 animal DNS'd with no P56 path — bypass quota, always Perfusion NB
+            result[name] = 'Perfusion NB'
+            continue
 
         # B6/B6NJ — check quota first, then default to Perfusion
         if strain_key in _B6_STRAINS_UPPER:
             if strain_key in working:
-                needs = working[strain_key][timepoint][sex]
-                if needs['MERFISH']['needed'] > 0:
+                needs = working[strain_key].get(timepoint, {}).get(sex, {})
+                if needs.get('MERFISH', {}).get('needed', 0) > 0:
                     result[name] = 'MERFISH'
                     needs['MERFISH']['needed'] -= 1
                     continue
-                elif needs['RNAseq']['needed'] > 0:
+                elif needs.get('RNAseq', {}).get('needed', 0) > 0:
                     result[name] = 'RNAseq'
                     needs['RNAseq']['needed'] -= 1
                     continue
@@ -2589,7 +2139,10 @@ def _compute_auto_types(schedulable_df, remaining_needs):
             result[name] = 'Perfusion NB' if nb_flag else 'Extra'
             continue
 
-        needs = working[strain_key][timepoint][sex]
+        needs = working[strain_key].get(timepoint, {}).get(sex, {})
+        if not needs:
+            result[name] = 'Extra'
+            continue
 
         if needs['MERFISH']['needed'] > 0:
             base = 'MERFISH'
@@ -2604,12 +2157,12 @@ def _compute_auto_types(schedulable_df, remaining_needs):
             # Quota filled for this sex — offer flex slot (5+1 rule)
             flex_key = (strain_key, timepoint)
             already_over = False
-            if strain_key in working:
+            if strain_key in working and timepoint in working.get(strain_key, {}):
                 perf_m = working[strain_key][timepoint]['Male']['Perfusion']
                 perf_f = working[strain_key][timepoint]['Female']['Perfusion']
                 total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
                 total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
-                already_over = total_completed >= total_target + 1
+                already_over = total_completed >= total_target
             if not already_over and not flex_used.get(flex_key, False):
                 flex_used[flex_key] = True
                 base = 'Perfusion'  # flex slot
@@ -2708,24 +2261,97 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         print("  ⚠ tkinter not available — skipping harvest assignment GUI.")
         return {}
 
-    HARVEST_OPTIONS = ['Perfusion', 'MERFISH', 'RNAseq', 'Extra',
-                       'Perfusion NB', 'MERFISH NB', 'RNAseq NB',
-                       'Do Not Schedule']
+    BASE_TYPES = ['Perfusion', 'MERFISH', 'RNAseq']
     OPTION_COLORS   = {
-        'Perfusion':        '#d4edda',
-        'MERFISH':          '#cce5ff',
-        'RNAseq':           '#fff3cd',
+        'P14 Perfusion':    '#d4edda',
+        'P56 Perfusion':    '#d4edda',
+        'P14 MERFISH':      '#cce5ff',
+        'P56 MERFISH':      '#cce5ff',
+        'P14 RNAseq':       '#fff3cd',
+        'P56 RNAseq':       '#fff3cd',
         'Extra':            '#e8d5f5',
-        'Perfusion NB':     '#a8d5b5',  # darker green — no behavior
-        'MERFISH NB':       '#7ab8f5',  # darker blue
-        'RNAseq NB':        '#f5d76e',  # darker yellow
+        'NB Perfusion':     '#a8d5b5',
+        'NB MERFISH':       '#7ab8f5',
+        'NB RNAseq':        '#f5d76e',
         'Do Not Schedule':  '#f8d7da',
     }
+
+    # Display-label <-> internal harvest-type translation
+    _DISPLAY_TO_INTERNAL = {
+        'P14 Perfusion':   'Perfusion',
+        'P56 Perfusion':   'Perfusion',
+        'NB Perfusion':    'Perfusion NB',
+        'P14 MERFISH':     'MERFISH',
+        'P56 MERFISH':     'MERFISH',
+        'NB MERFISH':      'MERFISH NB',
+        'P14 RNAseq':      'RNAseq',
+        'P56 RNAseq':      'RNAseq',
+        'NB RNAseq':       'RNAseq NB',
+        'Extra':           'Extra',
+        'Do Not Schedule': 'Do Not Schedule',
+    }
+
+    def _display_to_internal(display):
+        return _DISPLAY_TO_INTERNAL.get(display, display)
+
+    def _internal_to_display(internal, timepoint):
+        mapping = {
+            'Perfusion':    f'{timepoint} Perfusion',
+            'MERFISH':      f'{timepoint} MERFISH',
+            'RNAseq':       f'{timepoint} RNAseq',
+            'Perfusion NB': 'NB Perfusion',
+            'MERFISH NB':   'NB MERFISH',
+            'RNAseq NB':    'NB RNAseq',
+            'Extra':        'Extra',
+            'DO_NOT_SCHEDULE': 'Do Not Schedule',
+        }
+        return mapping.get(internal, internal)
     STATUS_COLORS = {
         '✓ Match':  '#c3e6cb',
         '↑':        '#ffeeba',
         '↓':        '#f5c6cb',
     }
+
+    def _animal_options(strain_key: str, timepoint: str, sex: str, nb_flag: bool) -> List[str]:
+        """Return the ordered dropdown options for one animal.
+
+        Includes only harvest types where quota is still needed, plus NB variants
+        when the animal is in an incomplete group or is a P14 animal.
+        Extra and Do Not Schedule are always present.
+
+        Args:
+            strain_key: Upper-cased strain key used in remaining_needs.
+            timepoint:  'P14' or 'P56'.
+            sex:        'Male' or 'Female'.
+            nb_flag:    True when the animal's group is incomplete (P56) or
+                        the timepoint is P14 (no behaviour session exists at P14).
+
+        Returns:
+            Ordered list of option strings for the Combobox.
+        """
+        if strain_key in _B6_STRAINS_UPPER:
+            # B6/B6NJ always fills — offer all regular types
+            available = list(BASE_TYPES)
+        elif strain_key in remaining_needs:
+            needs = remaining_needs.get(strain_key, {}).get(timepoint, {}).get(sex, {})
+            available = [t for t in BASE_TYPES if needs.get(t, {}).get('needed', 0) > 0]
+            if not available:
+                # All quota filled — still offer Perfusion for the flex slot
+                available = ['Perfusion']
+        else:
+            # Untracked strain — offer all regular types
+            available = list(BASE_TYPES)
+
+        # Regular options include the timepoint prefix
+        options = [f'{timepoint} {t}' for t in available]
+
+        # NB options only for incomplete P56 groups — P14 never gets NB variants
+        if nb_flag and timepoint == 'P56':
+            for t in available:
+                options.append(f'NB {t}')
+
+        options += ['Extra', 'Do Not Schedule']
+        return options
 
     # Only show schedulable animals (P14 / P56), skip Unschedulable
     schedulable = assignments_df[
@@ -2750,21 +2376,15 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
     # ── Header ────────────────────────────────────────────────────────────────
     header_frame = tk.Frame(root, bg='#2c3e50', pady=12)
     header_frame.pack(fill='x')
-    is_second_pass = bool(prior_selections)
     tk.Label(
         header_frame,
-        text="Harvest Assignment Review" + (" — Pass 2" if is_second_pass else ""),
+        text="Harvest Assignment Review",
         font=('Helvetica', 16, 'bold'),
         bg='#2c3e50', fg='white'
     ).pack()
-    subtitle = (
-        f"{len(schedulable)} animals  •  Prior selections pre-filled  •  DNS animals shown for NB review  •  All choices editable."
-        if is_second_pass else
-        f"{len(schedulable)} animals ready to schedule  •  Review assignments below, make any changes, then confirm."
-    )
     tk.Label(
         header_frame,
-        text=subtitle,
+        text=f"{len(schedulable)} animals ready to schedule  •  Review assignments below, make any changes, then confirm.",
         font=('Helvetica', 10),
         bg='#2c3e50', fg='#bdc3c7'
     ).pack()
@@ -2782,8 +2402,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
     left_frame.pack(side='left', fill='both', expand=True, padx=(0, 6))
 
     # Column headers
-    headers = ['Animal Name', 'Strain', 'Sex', 'Timepoint', 'Date', 'Group', 'Harvest Type']
-    col_widths = [18, 12, 8, 10, 10, 8, 16]
+    headers = ['Animal Name', 'Strain', 'Sex', 'Date', 'Group', 'Harvest Type']
+    col_widths = [18, 12, 8, 10, 8, 20]
 
     hdr_row = tk.Frame(left_frame, bg='#2c3e50')
     hdr_row.pack(fill='x')
@@ -2886,11 +2506,25 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         strain    = str(row.get('Strain', '')).strip()
         sex       = str(row.get('Sex', '')).strip()
         timepoint = str(row.get('Assigned_Timepoint', '')).strip()
-        # Use prior selection if available, otherwise auto-suggest
-        if prior_selections and name in prior_selections:
-            default = prior_selections[name]
-        else:
-            default = auto_types.get(name, 'Perfusion')
+        genotype  = row.get('Genotype', '')
+        strain_key = resolve_strain_key(strain, genotype, remaining_needs)
+
+        # nb_flag: incomplete P56 group, or any P14 animal (no behaviour at P14)
+        nb_flag = False
+        if timepoint == 'P56':
+            grp_key_nb = (str(strain).strip(), str(sex).strip(),
+                          str(row.get('P56_Behavior_Date', '')).strip())
+            if p56_group_sizes_gui.get(grp_key_nb, 0) < CONFIG['CAGE_SIZE']:
+                nb_flag = True
+        # P14 animals never get NB variants — P14 IS the no-behaviour harvest
+
+        animal_options = _animal_options(strain_key, timepoint, sex, nb_flag)
+
+        # Translate auto-suggested internal string to display label
+        auto_internal = auto_types.get(name, 'Perfusion')
+        default = _internal_to_display(auto_internal, timepoint)
+        if default not in animal_options:
+            animal_options.insert(0, default)
 
         var = tk.StringVar(value=default)
         selection_vars[name] = var
@@ -2917,15 +2551,17 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         # Group size indicator
         if timepoint == 'P56':
             grp_key = (str(strain).strip(), str(sex).strip(), raw_date)
-            grp_size = p56_group_sizes_gui.get(grp_key, 1)
+            grp_size = p56_group_sizes_gui.get(grp_key, 0)
             if grp_size >= CONFIG['CAGE_SIZE']:
                 group_label = f'✓ {grp_size}'
+            elif grp_size == 0:
+                group_label = '⚠ 0'   # genuine problem — no animals found for this group
             else:
-                group_label = f'⚠ {grp_size}'
+                group_label = str(grp_size)  # incomplete but normal — NB options handle it
         else:
             group_label = '—'  # P14 doesn't need groups
 
-        for val, w in zip([name, strain, sex, timepoint, display_date, group_label], col_widths[:6]):
+        for val, w in zip([name, strain, sex, display_date, group_label], col_widths[:5]):
             lbl = tk.Label(
                 frame, text=val, width=w, anchor='w',
                 font=('Helvetica', 9), bg=bg, padx=4, pady=3
@@ -2934,14 +2570,15 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
 
         menu = ttk.Combobox(
             frame, textvariable=var,
-            values=HARVEST_OPTIONS,
-            state='readonly', width=col_widths[6] - 2
+            values=animal_options,
+            state='readonly', width=col_widths[5] - 2
         )
         menu.pack(side='left', padx=2, pady=2)
         menu.set(default)  # explicitly set display value after pack
         selection_menus[name] = menu  # store widget ref for direct read at confirm
         menu.bind('<<ComboboxSelected>>',
                   lambda e, n=name, f=frame, m=menu: _on_type_change_cb(n, m, f))
+
 
         # Apply initial color
         c = OPTION_COLORS.get(default, bg)
@@ -3036,7 +2673,10 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
 
     def _reset_to_auto():
         for name, var in selection_vars.items():
-            val = auto_types.get(name, 'Perfusion')
+            internal = auto_types.get(name, 'Perfusion')
+            row_match = schedulable[schedulable['Animal_Name'].astype(str).str.strip() == name]
+            row_tp = str(row_match['Assigned_Timepoint'].iloc[0]).strip() if not row_match.empty else 'P56'
+            val = _internal_to_display(internal, row_tp)
             var.set(val)
             selection_values[name] = val  # keep plain-dict in sync
             frame = row_frames[name]
@@ -3056,8 +2696,10 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         for name in selection_menus:
             val = selection_values.get(name)
             if not val:
-                val = selection_menus[name].get() or 'Perfusion'
+                val = selection_menus[name].get() or 'P56 Perfusion'
             current[name] = val
+        # Translate display labels to internal strings for all downstream logic
+        current = {n: _display_to_internal(v) for n, v in current.items()}
         # Debug log all selections
         for _n, _h in sorted(current.items()):
             logger.info(f"CONFIRM: {_n} → {_h}")
@@ -3197,158 +2839,6 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
     return final
 
 
-
-def write_harvest_overrides_template(assignments_df: pd.DataFrame, overrides_file: str) -> None:
-    """Write confirmed assignments to harvest_overrides.csv. Always overwrites."""
-    if assignments_df is None or assignments_df.empty:
-        return
-
-    rows = []
-
-    # Scheduled animals first — sorted by harvest date then name
-    scheduled = assignments_df[
-        assignments_df['Assigned_Timepoint'].isin(['P14', 'P56'])
-    ].copy()
-
-    # Determine the relevant harvest date for sorting
-    def _harvest_date_for_sort(row):
-        if row.get('Assigned_Timepoint') == 'P14':
-            return str(row.get('P14_Date', '') or '')
-        return str(row.get('P56_Harvest_Date', '') or '')
-
-    if len(scheduled) > 0:
-        scheduled = scheduled.copy()
-        scheduled['_sort_date'] = scheduled.apply(_harvest_date_for_sort, axis=1)
-        scheduled = scheduled.sort_values(['_sort_date', 'Strain', 'Animal_Name'])
-
-        for _, row in scheduled.iterrows():
-            name      = str(row.get('Animal_Name', '')).strip()
-            htype     = str(row.get('Harvest_Type', '')).strip()
-            timepoint = str(row.get('Assigned_Timepoint', '')).strip()
-            strain    = str(row.get('Strain', '')).strip()
-            sex       = str(row.get('Sex', '')).strip()
-            priority  = str(row.get('Priority', '')).strip()
-
-            # Skip auto quota-filled — not real harvests; keep Extra (user-assigned)
-            if htype == 'COMPLETE (Quota Filled)':
-                continue
-
-            rows.append({
-                'Animal_Name':        name,
-                'Harvest_Type':       htype,
-                'Assigned_Timepoint': timepoint,
-                'Strain':             strain,
-                'Sex':                sex,
-                'Auto_Priority':      priority,
-                'Notes':              '',
-            })
-
-    try:
-        import csv as _csv
-        fieldnames = ['Animal_Name', 'Harvest_Type', 'Assigned_Timepoint',
-                      'Strain', 'Sex', 'Auto_Priority', 'Notes']
-
-        with open(overrides_file, 'w', newline='', encoding='utf-8') as f:
-            f.write(
-                "# harvest_overrides.csv — edit Harvest_Type for any animal, then re-run.\n"
-                "# Valid values: Perfusion   MERFISH   RNAseq\n"
-                "# Leave Harvest_Type blank to keep the auto-assignment.\n"
-                "# DO NOT change Animal_Name — it must match exactly.\n"
-                "# Assigned_Timepoint, Strain, Sex, Auto_Priority, Notes are for reference only.\n"
-                "#\n"
-            )
-            writer = _csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-
-        print(f"\n  📋 harvest_overrides.csv written ({len(rows)} animals)")
-        print(f"     → Edit Harvest_Type for any animal you want to change, then re-run.")
-        print(f"     → File: {overrides_file}")
-        logger.info(f"harvest_overrides.csv written: {overrides_file} ({len(rows)} rows)")
-
-    except Exception as e:
-        logger.error(f"Could not write harvest_overrides.csv: {e}")
-        print(f"  ⚠ Could not write harvest_overrides.csv: {e}")
-
-
-def load_harvest_overrides(overrides_file: Optional[str]) -> Dict[str, str]:
-    """
-    Load manual harvest-type overrides from a CSV file.
-
-    Expected CSV columns (case-insensitive):
-        Animal_Name   — the exact animal name as it appears in the schedule
-        Harvest_Type  — one of: Perfusion, MERFISH, RNAseq
-                        Leave blank / omit to let the scheduler auto-assign.
-
-    Optional columns (both must be present to use):
-        Assigned_Timepoint  — P14 or P56 (if omitted, override applies regardless)
-
-    Returns a dict:  { 'AnimalName': 'HarvestType', ... }
-    Only rows with a valid non-blank Harvest_Type are included.
-    """
-    VALID_TYPES = {'Perfusion', 'MERFISH', 'RNAseq', 'Extra'}
-
-    if not overrides_file:
-        return {}
-    if not os.path.exists(overrides_file):
-        logger.info(f"No harvest overrides file found at: {overrides_file} — auto-assigning all.")
-        return {}
-
-    try:
-        df = pd.read_csv(overrides_file)
-        # Normalise column names to lowercase for flexible matching
-        df.columns = [c.strip().lower().replace(' ', '_') for c in df.columns]
-
-        name_col = next((c for c in df.columns if 'animal' in c and 'name' in c), None)
-        type_col = next((c for c in df.columns if 'harvest' in c and 'type' in c), None)
-
-        if name_col is None or type_col is None:
-            logger.warning(
-                f"harvest_overrides.csv must have 'Animal_Name' and 'Harvest_Type' columns. "
-                f"Found: {list(df.columns)}"
-            )
-            return {}
-
-        overrides: Dict[str, str] = {}
-        skipped = 0
-        for _, row in df.iterrows():
-            name = str(row[name_col]).strip() if pd.notna(row[name_col]) else ''
-            htype = str(row[type_col]).strip() if pd.notna(row[type_col]) else ''
-
-            if not name or name.lower() in ('nan', ''):
-                continue
-            if not htype or htype.lower() in ('nan', ''):
-                continue  # blank = let scheduler decide
-
-            # Case-insensitive match to valid types
-            matched = next((v for v in VALID_TYPES if v.lower() == htype.lower()), None)
-            if matched is None:
-                logger.warning(
-                    f"  Override for '{name}': '{htype}' is not a valid Harvest_Type "
-                    f"(use Perfusion, MERFISH, or RNAseq). Skipping."
-                )
-                skipped += 1
-                continue
-
-            overrides[name] = matched
-
-        loaded = len(overrides)
-        print(f"  ✓ Loaded {loaded} harvest override(s) from {os.path.basename(overrides_file)}")
-        if skipped:
-            print(f"  ⚠ {skipped} override row(s) skipped — invalid Harvest_Type value")
-        if loaded:
-            for aname, htype in list(overrides.items())[:5]:
-                print(f"    {aname!r:40s} → {htype}")
-            if loaded > 5:
-                print(f"    ... and {loaded - 5} more")
-        return overrides
-
-    except Exception as e:
-        logger.error(f"Could not read harvest overrides file '{overrides_file}': {e}")
-        print(f"  ⚠ Could not read harvest_overrides.csv: {e} — auto-assigning all.")
-        return {}
-
-
 def assign_harvest_types(assignments_df: pd.DataFrame,
                          remaining_needs: Dict,
                          requirements: Dict,
@@ -3442,7 +2932,18 @@ def assign_harvest_types(assignments_df: pd.DataFrame,
             })
             continue
 
-        needs = working_needs[strain_key][timepoint][sex]
+        needs = working_needs[strain_key].get(timepoint, {}).get(sex, {})
+
+        if not needs:
+            # Timepoint not found in working_needs (e.g. Unschedulable slipped through)
+            assignments_with_types.append({
+                **row.to_dict(),
+                'Harvest_Type':      'N/A',
+                'Priority':          'N/A',
+                'Strain_Priority':   strain_priority,
+                'Genotype_Priority': genotype_priority,
+            })
+            continue
 
         if needs['MERFISH']['needed'] > 0:
             harvest_type = 'MERFISH'
@@ -3597,6 +3098,8 @@ def _assess_genotype_worth_it(
         strain_upper = str(strain).strip().upper()
         if not remaining_needs or strain_upper not in remaining_needs:
             return False
+        if timepoint not in remaining_needs[strain_upper]:
+            return False
         tp_needs = remaining_needs[strain_upper][timepoint]
         all_zero = all(
             tp_needs[sex][ht]['needed'] == 0
@@ -3638,7 +3141,7 @@ def _assess_genotype_worth_it(
 
         # Check if only the flex slot remains
         strain_upper = str(strain).strip().upper()
-        if remaining_needs and strain_upper in remaining_needs:
+        if remaining_needs and strain_upper in remaining_needs and timepoint in remaining_needs[strain_upper]:
             tp_needs = remaining_needs[strain_upper][timepoint]
             all_zero = all(
                 tp_needs[sex][ht]['needed'] == 0
@@ -3674,7 +3177,7 @@ def _assess_genotype_worth_it(
             else:
                 return (
                     f'❌ UNLIKELY — <1 usable expected from {group_n} animals '
-                    f'in window ({breeding_type} cross, need {min_cage} for a cage)'
+                    f'in window ({breeding_type} mating, need {min_cage} for a cage)'
                 )
         else:
             # P14: simpler threshold — at least 1 usable is sufficient
@@ -3685,7 +3188,7 @@ def _assess_genotype_worth_it(
             else:
                 return (
                     f'❌ UNLIKELY — <1 usable expected '
-                    f'({group_n} blanks, {breeding_type} cross)'
+                    f'({group_n} blanks, {breeding_type} mating)'
                 )
 
     # ── evaluate each timepoint with its own group size ───────────────────────
@@ -3828,11 +3331,13 @@ def analyze_blank_genotype_for_scheduling(
 
     if breeding_type == 'All':
         expected_usable = num_blanks
+        is_b6 = str(strain).strip().upper() in _B6_STRAINS_UPPER
+        mating_desc = 'Inbred colony' if is_b6 else 'Hom×Hom cross'
         if not is_schedulable:
             prediction = 'NOT SCHEDULABLE'
             reason = (
                 f"'All' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"ALL {num_blanks} expected usable (Hom×Hom/Inbred cross) "
+                f"ALL {num_blanks} expected usable ({mating_desc}) "
                 f"BUT NOT SCHEDULABLE. Reason: {scheduling_window}"
             )
         elif genotype_needed_by and genotype_needed_by >= today:
@@ -3841,7 +3346,7 @@ def analyze_blank_genotype_for_scheduling(
             prediction = 'LIKELY USABLE'
             reason = (
                 f"'All' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"ALL {num_blanks} expected usable (Hom×Hom/Inbred). "
+                f"ALL {num_blanks} expected usable ({mating_desc}). "
                 f"{urgency}: Genotype by "
                 f"{genotype_needed_by.strftime('%Y-%m-%d')} ({days_until} days) "
                 f"for {scheduling_window}"
@@ -3851,14 +3356,14 @@ def analyze_blank_genotype_for_scheduling(
             reason = (
                 f"[GENOTYPE DEADLINE PASSED] "
                 f"'All' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"ALL should be usable but genotyping deadline passed "
+                f"ALL expected usable ({mating_desc}) but genotyping deadline passed "
                 f"({genotype_needed_by.strftime('%Y-%m-%d')}). {scheduling_window}"
             )
         else:
             prediction = 'LIKELY USABLE'
             reason = (
                 f"'All' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"ALL {num_blanks} expected usable (Hom×Hom/Inbred). "
+                f"ALL {num_blanks} expected usable ({mating_desc}). "
                 f"Genotype ASAP! {scheduling_window}"
             )
 
@@ -3870,7 +3375,7 @@ def analyze_blank_genotype_for_scheduling(
             expected_usable = 0
             reason = (
                 f"'Half' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"~{int(round(expected_hets))} Hets expected (50% from Het×WT) "
+                f"~{int(round(expected_hets))} Hets expected (50% — Het×WT cross) "
                 f"BUT NOT SCHEDULABLE. Reason: {scheduling_window}"
             )
         elif expected_hets >= 2.0:
@@ -3882,7 +3387,7 @@ def analyze_blank_genotype_for_scheduling(
                 reason = (
                     f"'Half' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
                     f"~{int(round(expected_hets))} of {num_blanks} expected Het "
-                    f"(50% from Het×WT). {urgency}: Genotype by "
+                    f"(Het×WT cross — 50% usable). {urgency}: Genotype by "
                     f"{genotype_needed_by.strftime('%Y-%m-%d')} ({days_until} days) "
                     f"for {scheduling_window}"
                 )
@@ -3898,7 +3403,7 @@ def analyze_blank_genotype_for_scheduling(
                 reason = (
                     f"'Half' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
                     f"~{int(round(expected_hets))} of {num_blanks} expected Het "
-                    f"(50% from Het×WT). Genotype for scheduling! {scheduling_window}"
+                    f"(Het×WT cross — 50% usable). Genotype for scheduling! {scheduling_window}"
                 )
         elif expected_hets >= 1.0:
             prediction      = 'POSSIBLY USABLE' if is_schedulable else 'NOT SCHEDULABLE'
@@ -3908,7 +3413,7 @@ def analyze_blank_genotype_for_scheduling(
                 reason = (
                     f"'Half' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
                     f"May contain ~{int(round(expected_hets))} Het "
-                    f"(50% expected from Het×WT). Consider genotyping by "
+                    f"(Het×WT cross — 50% usable). Consider genotyping by "
                     f"{genotype_needed_by.strftime('%Y-%m-%d')} ({days_until} days). "
                     f"{scheduling_window}"
                 )
@@ -3933,7 +3438,7 @@ def analyze_blank_genotype_for_scheduling(
                 days_until = (genotype_needed_by - today).days
                 reason = (
                     f"'Half' STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                    f"50% chance Het, 50% chance Wild (Het×WT cross). "
+                    f"Het×WT cross — ~50% usable. "
                     f"Low statistical likelihood of usable animals. "
                     f"Deadline: {genotype_needed_by.strftime('%Y-%m-%d')} ({days_until} days). "
                     f"{scheduling_window}"
@@ -3952,6 +3457,52 @@ def analyze_blank_genotype_for_scheduling(
                     f"{birth_date}. 50% chance Het, 50% chance Wild. "
                     f"Low likelihood. {scheduling_window}"
                 )
+    elif breeding_type == 'HetxHet':
+        expected_usable_all = int(round(num_blanks * 0.75))  # 3/4 usable (Hom + Het)
+        expected_homs_hxh   = int(round(num_blanks * 0.25))  # 1/4 Hom
+        expected_hets_hxh   = int(round(num_blanks * 0.50))  # 1/2 Het
+
+        if not is_schedulable:
+            prediction      = 'NOT SCHEDULABLE'
+            expected_usable = 0
+            reason = (
+                f"Het×Het STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
+                f"~{expected_usable_all} usable expected "
+                f"(Hom:{expected_homs_hxh} + Het:{expected_hets_hxh}) "
+                f"BUT NOT SCHEDULABLE. Reason: {scheduling_window}"
+            )
+        elif genotype_needed_by and genotype_needed_by >= today:
+            days_until      = (genotype_needed_by - today).days
+            urgency         = "URGENT" if days_until <= 7 else "HIGH PRIORITY"
+            prediction      = 'LIKELY USABLE'
+            expected_usable = expected_usable_all
+            reason = (
+                f"Het×Het STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
+                f"~{expected_usable_all} usable expected "
+                f"(Hom:{expected_homs_hxh} + Het:{expected_hets_hxh}). "
+                f"{urgency}: Genotype by "
+                f"{genotype_needed_by.strftime('%Y-%m-%d')} ({days_until} days) "
+                f"for {scheduling_window}"
+            )
+        elif genotype_needed_by and genotype_needed_by < today:
+            prediction      = 'DEADLINE PASSED'
+            expected_usable = 0
+            reason = (
+                f"[GENOTYPE DEADLINE PASSED] "
+                f"Het×Het STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
+                f"~{expected_usable_all} usable expected but deadline passed "
+                f"({genotype_needed_by.strftime('%Y-%m-%d')}). {scheduling_window}"
+            )
+        else:
+            prediction      = 'LIKELY USABLE'
+            expected_usable = expected_usable_all
+            reason = (
+                f"Het×Het STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
+                f"~{expected_usable_all} usable expected "
+                f"(Hom:{expected_homs_hxh} + Het:{expected_hets_hxh}). "
+                f"Genotype ASAP — Hom animals are #1 priority! {scheduling_window}"
+            )
+
     else:
         expected_hets = num_blanks * 0.5
         prediction    = 'UNKNOWN' if is_schedulable else 'NOT SCHEDULABLE'
@@ -3966,7 +3517,7 @@ def analyze_blank_genotype_for_scheduling(
             expected_usable = int(round(expected_hets))
             reason = (
                 f"UNKNOWN STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"Assuming Het×WT (~{int(round(expected_hets))} Hets). "
+                f"Het×WT cross — ~{int(round(expected_hets))} Hets). "
                 f"Genotype by {genotype_needed_by.strftime('%Y-%m-%d')} ({days_until} days). "
                 f"{scheduling_window}"
             )
@@ -3983,7 +3534,7 @@ def analyze_blank_genotype_for_scheduling(
             expected_usable = int(round(expected_hets))
             reason = (
                 f"UNKNOWN STRAIN — {num_blanks} blank genotype(s) from birth {birth_date}. "
-                f"Assuming ~{int(round(expected_hets))} usable. {scheduling_window}"
+                f"Het×WT cross — ~{int(round(expected_hets))} usable. {scheduling_window}"
             )
 
     return {
@@ -4119,92 +3670,6 @@ def analyze_blank_genotypes_second_pass(
 
     logger.info(f"Analyzed {len(excluded)} animals with blank genotypes")
     return pd.DataFrame(excluded)
-
-
-def summarize_genotype_exclusions(genotype_excluded_df: pd.DataFrame) -> pd.DataFrame:
-    if genotype_excluded_df.empty:
-        return pd.DataFrame()
-
-    summary_data = []
-
-    summary_data.append({
-        'Category': 'Total Excluded',
-        'Count': len(genotype_excluded_df),
-        'Details': 'All animals excluded due to genotype issues'
-    })
-
-    if 'Prediction' in genotype_excluded_df.columns:
-        for prediction_val in genotype_excluded_df['Prediction'].value_counts().index:
-            count = len(genotype_excluded_df[genotype_excluded_df['Prediction'] == prediction_val])
-            summary_data.append({
-                'Category': f'Prediction: {prediction_val}',
-                'Count': count,
-                'Details': f'{count} animals with this prediction'
-            })
-
-    if 'Expected_Usable_In_Group' in genotype_excluded_df.columns:
-        total_expected = 0
-        for val in genotype_excluded_df['Expected_Usable_In_Group']:
-            try:
-                total_expected += int(val)
-            except (ValueError, TypeError):
-                pass
-        if total_expected > 0:
-            summary_data.append({
-                'Category': '📊 STATISTICAL PREDICTION',
-                'Count': int(total_expected),
-                'Details': f'~{int(total_expected)} usable animals expected among blanks (Mendelian ratios)'
-            })
-
-    if 'Prediction' in genotype_excluded_df.columns:
-        likely = genotype_excluded_df[genotype_excluded_df['Prediction'] == 'LIKELY USABLE']
-        possibly = genotype_excluded_df[genotype_excluded_df['Prediction'] == 'POSSIBLY USABLE']
-        not_sched = genotype_excluded_df[genotype_excluded_df['Prediction'] == 'NOT SCHEDULABLE']
-
-        if len(likely) > 0:
-            summary_data.append({
-                'Category': '🔍 LIKELY USABLE (blank genotype)',
-                'Count': len(likely),
-                'Details': f'{len(likely)} animals — RECOMMEND GENOTYPING for P14/P56'
-            })
-        if len(possibly) > 0:
-            summary_data.append({
-                'Category': '🔍 POSSIBLY USABLE (blank genotype)',
-                'Count': len(possibly),
-                'Details': f'{len(possibly)} animals — Consider genotyping'
-            })
-        if len(not_sched) > 0:
-            summary_data.append({
-                'Category': '🚫 NOT SCHEDULABLE (blank genotype)',
-                'Count': len(not_sched),
-                'Details': f'{len(not_sched)} animals — No available P14/P56 windows'
-            })
-
-    if 'Reason' in genotype_excluded_df.columns:
-        wild_count = len(genotype_excluded_df[
-            genotype_excluded_df['Reason'].str.contains('Wild genotype', na=False)])
-        cre_wild_count = len(genotype_excluded_df[
-            genotype_excluded_df['Reason'].str.contains('Cre-only', na=False, case=False)])
-        critical_count = len(genotype_excluded_df[
-            genotype_excluded_df['Reason'].str.contains('⚠️', na=False)])
-
-        summary_data.append({
-            'Category': 'Wild genotype',
-            'Count': wild_count,
-            'Details': 'Animals with Wild genotype'
-        })
-        summary_data.append({
-            'Category': 'Cre-only Wild',
-            'Count': cre_wild_count,
-            'Details': 'Generic Cre, no mutation of interest'
-        })
-        summary_data.append({
-            'Category': '⚠️ CRITICAL ISSUES',
-            'Count': critical_count,
-            'Details': 'Possible breeding pair errors'
-        })
-
-    return pd.DataFrame(summary_data)
 
 
 # ============================================================================
@@ -4727,47 +4192,6 @@ def create_p56_schedule(assignments_df: pd.DataFrame) -> pd.DataFrame:
     return p56_filtered[available_cols]
 
 
-def create_capacity_summary(p56_schedule_df: pd.DataFrame) -> pd.DataFrame:
-    if p56_schedule_df.empty:
-        return pd.DataFrame()
-    if CONFIG['CAGE_SIZE'] <= 0:
-        return pd.DataFrame()
-
-    capacity = p56_schedule_df.groupby('P56_Behavior_Date').size().reset_index()
-    capacity.columns = ['Behavior_Start', 'Animals_Scheduled']
-    capacity['Capacity'] = CONFIG['WEDNESDAY_CAPACITY']
-    capacity['Available_Slots'] = CONFIG['WEDNESDAY_CAPACITY'] - capacity['Animals_Scheduled']
-    capacity['Cages_Scheduled'] = capacity['Animals_Scheduled'] / CONFIG['CAGE_SIZE']
-    capacity['Status'] = capacity['Available_Slots'].apply(
-        lambda x: '✓ OK' if x >= 0 else '✗ OVER CAPACITY'
-    )
-    return capacity.sort_values('Behavior_Start')
-
-
-def create_strain_summary(assignments_df: pd.DataFrame) -> pd.DataFrame:
-    if assignments_df.empty:
-        return pd.DataFrame()
-
-    summary = assignments_df.groupby(
-        ['Strain', 'Genotype', 'Sex', 'Assigned_Timepoint']
-    ).size().reset_index()
-    summary.columns = ['Strain', 'Genotype', 'Sex', 'Timepoint', 'Count']
-
-    pivot = summary.pivot_table(
-        index=['Strain', 'Genotype', 'Sex'],
-        columns='Timepoint',
-        values='Count',
-        fill_value=0
-    ).reset_index()
-
-    if 'P56' in pivot.columns and CONFIG['CAGE_SIZE'] > 0:
-        pivot['P56_Complete_Cages'] = pivot['P56'] // CONFIG['CAGE_SIZE']
-        pivot['P56_Animals_in_Cages'] = pivot['P56_Complete_Cages'] * CONFIG['CAGE_SIZE']
-        pivot['P56_Leftover'] = pivot['P56'] % CONFIG['CAGE_SIZE']
-
-    return pivot
-
-
 def create_b6_monthly_summary(assignments_df: pd.DataFrame) -> pd.DataFrame:
     if assignments_df.empty:
         return pd.DataFrame()
@@ -4827,23 +4251,6 @@ def create_b6_monthly_summary(assignments_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def save_backup_csvs(output_dir: str, timestamp: str, **dataframes) -> str:
-    backup_dir = os.path.join(output_dir, f'backup_{timestamp}')
-    os.makedirs(backup_dir, exist_ok=True)
-    saved = []
-    for name, df in dataframes.items():
-        if df is not None and isinstance(df, pd.DataFrame) and len(df) > 0:
-            filepath = os.path.join(backup_dir, f'{name}.csv')
-            try:
-                df.to_csv(filepath, index=False)
-                saved.append(filepath)
-            except Exception as e:
-                logger.warning(f"Could not save backup CSV {name}: {e}")
-    if saved:
-        print(f"\n✓ Backup CSVs saved to: {backup_dir} ({len(saved)} files)")
-    return backup_dir
-
-
 # ============================================================================
 # MAIN SCHEDULING FUNCTION
 # ============================================================================
@@ -4854,7 +4261,8 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
                              birth_date_end: Optional[date] = None,
                              behavior_date_start: Optional[date] = None,
                              behavior_date_end: Optional[date] = None,
-                             full_behavior_dates: Optional[List[date]] = None) -> str:
+                             full_behavior_dates: Optional[List[date]] = None,
+                             breeding_reserves: Optional[set] = None) -> str:
     logger.info("=" * 70)
     logger.info("COMPREHENSIVE ANIMAL SCHEDULER")
     logger.info("=" * 70)
@@ -4874,8 +4282,15 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     total_alive_count = len(animals_df)
     animals_df_raw = animals_df.copy()
 
+    # Remove breeding-reserved animals before scheduling
+    if breeding_reserves:
+        _res = {str(n) for n in breeding_reserves}
+        _mask = animals_df['Name'].astype(str).isin(_res)
+        animals_df = animals_df[~_mask].copy()
+        print(f'  \U0001F42D {_mask.sum()} animal(s) reserved for breeding '
+              f'\u2014 excluded from harvest scheduling.')
+
     tracking_df = read_tracking_data(tracking_file) if tracking_file else None
-    births_df = read_births_data(births_file) if births_file else None
 
     print(f"\nTotal alive animals loaded: {total_alive_count:,}")
 
@@ -4884,30 +4299,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     # Parse requirements
     requirements = parse_requirements(tracking_df)
     remaining_needs = calculate_remaining_needs(requirements)
-
-    # Births analysis
-    print("\n" + "=" * 70)
-    print("BIRTHS ANALYSIS")
-    print("=" * 70)
-
-    sexing_schedule_df = pd.DataFrame()
-    if births_df is not None:
-        sexing_schedule_df = build_births_sexing_schedule(births_df, animals_df_raw)
-        upcoming = (
-            sexing_schedule_df[
-                sexing_schedule_df['Days_Until_Sexing'].apply(
-                    lambda x: isinstance(x, int) and 0 <= x <= 7
-                )
-            ] if len(sexing_schedule_df) > 0 else pd.DataFrame()
-        )
-        print(f"  Births needing sexing (not yet entered): {len(sexing_schedule_df)}")
-        if len(upcoming) > 0:
-            print(f"  ⚠️  {len(upcoming)} litter(s) need sexing within the next 7 days!")
-
-    unmatched_births_df = find_unmatched_births_enhanced(
-        births_df, animals_df, requirements, remaining_needs
-    )
-    unmatched_births_summary = create_unmatched_births_summary(unmatched_births_df)
 
     # Animal filtering
     print("\n" + "=" * 70)
@@ -4920,7 +4311,12 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         print("  ⚠️  ALL animals were excluded by the Use filter.")
         print("  Check the 'Use' column values in your CSV.")
 
-    animals_df, genotype_excluded_pass1, blank_genotypes = filter_animals_by_genotype_first_pass(animals_df)
+    no_geno_strains = frozenset(
+        k for k, v in requirements.items() if not v.get('genotyped', True)
+    )
+    animals_df, genotype_excluded_pass1, blank_genotypes = filter_animals_by_genotype_first_pass(
+        animals_df, no_geno_strains=no_geno_strains
+    )
     print(f"After genotype first pass:     {len(animals_df):,} animals remain")
     print(f"  Excluded (Wild, Cre-only Wild, Inconclusive): {len(genotype_excluded_pass1)}")
     print(f"  Blank genotypes (pending 2nd pass):           {len(blank_genotypes)}")
@@ -4994,10 +4390,10 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     print("\n" + "=" * 70)
     print("HARVEST ASSIGNMENT REVIEW")
     print("=" * 70)
-    overrides_file = os.path.join(output_dir, CONFIG.get('INPUT_OVERRIDES_FILE', 'harvest_overrides.csv'))
 
     if len(assignments) > 0:
-        # Show the GUI — user reviews and confirms (or skips for auto)
+        # Single-pass GUI — all harvest options (including NB types) available per animal.
+        # User picks the final harvest type directly; no second pass.
         gui_selections = prompt_harvest_assignments_gui(assignments, remaining_needs)
 
         # Log exactly what the GUI returned
@@ -5005,84 +4401,21 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         for _n, _h in sorted(gui_selections.items()):
             print(f"    {_n}: {_h}")
 
-        # Separate out any "Do Not Schedule" animals
+        # Remove Do Not Schedule animals from assignments and eligibility
         do_not_schedule = {
             name for name, htype in gui_selections.items()
             if htype == 'DO_NOT_SCHEDULE'
         }
         if do_not_schedule:
-            print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — removed from assignments.")
+            print(f"  ⚠ {len(do_not_schedule)} animal(s) marked 'Do Not Schedule' — excluded.")
             logger.info(f"Do Not Schedule: {sorted(do_not_schedule)}")
-
             dns_names_str = {str(n) for n in do_not_schedule}
-
-            # Check if any DNS animals could fill NB slots at their current or alternate timepoint
-            dns_rows = assignments[assignments['Animal_Name'].astype(str).isin(dns_names_str)]
-            nb_candidates = []
-            for _, row in dns_rows.iterrows():
-                name = str(row.get('Animal_Name', '')).strip()
-                current_tp = str(row.get('Assigned_Timepoint', '')).strip()
-                if current_tp == 'P56':
-                    # Could be P56 NB or offered as P14
-                    alt = row.to_dict()
-                    alt['Assignment_Reason'] = 'DNS — review for NB harvest or P14'
-                    nb_candidates.append(alt)
-                elif current_tp == 'P14':
-                    if row.get('P56_Eligible', False):
-                        alt = row.to_dict()
-                        alt['Assigned_Timepoint'] = 'P56'
-                        alt['Assignment_Reason'] = 'DNS from P14 — offered as P56 NB'
-                        nb_candidates.append(alt)
-                    else:
-                        alt = row.to_dict()
-                        alt['Assignment_Reason'] = 'DNS — review for alternate use'
-                        nb_candidates.append(alt)
-
-            if nb_candidates:
-                # Build combined df: all current assignments + NB candidates
-                # NB candidates replace their DNS version in the list
-                non_dns = assignments[~assignments['Animal_Name'].astype(str).isin(dns_names_str)].copy()
-                nb_df = pd.DataFrame(nb_candidates)
-                second_pass_df = pd.concat([non_dns, nb_df], ignore_index=True)
-
-                # Seed the GUI with first-round selections for non-DNS animals
-                # DNS animals show blank (ready for new decision)
-                prior_selections = {
-                    n: h for n, h in gui_selections.items()
-                    if h != 'DO_NOT_SCHEDULE'
-                }
-
-                print(f"\n  {len(nb_candidates)} DNS animal(s) available for NB review — showing second pass GUI...")
-                second_selections = prompt_harvest_assignments_gui(
-                    second_pass_df, remaining_needs,
-                    prior_selections=prior_selections
-                )
-
-                # Merge: second pass overrides first pass
-                gui_selections.update(second_selections)
-                do_not_schedule = {
-                    name for name, htype in gui_selections.items()
-                    if htype == 'DO_NOT_SCHEDULE'
-                }
-                dns_names_str = {str(n) for n in do_not_schedule}
-
-                # Rebuild assignments from second pass
-                assignments = second_pass_df[
-                    ~second_pass_df['Animal_Name'].astype(str).isin(dns_names_str)
-                ].copy()
-            else:
-                assignments = assignments[
-                    ~assignments['Animal_Name'].astype(str).isin(dns_names_str)
-                ].copy()
-
-            # Also remove DNS from eligibility so they can't be re-added
+            assignments = assignments[
+                ~assignments['Animal_Name'].astype(str).isin(dns_names_str)
+            ].copy()
             eligibility = eligibility[
                 ~eligibility['Animal_Name'].astype(str).isin(dns_names_str)
             ].copy()
-        else:
-            # No DNS — remove nothing
-            pass
-
 
         # Build final override dict (exclude DO_NOT_SCHEDULE sentinels)
         harvest_overrides = {
@@ -5097,9 +4430,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     else:
         assignments = pd.DataFrame()
         harvest_overrides = {}
-
-    # Persist confirmed assignments as the override file for reference / next run
-    write_harvest_overrides_template(assignments, overrides_file)
 
     # B6/B6N monthly minimum
     # B6/B6N monthly minimum enforcement disabled — managed manually
@@ -5116,11 +4446,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         genotype_excluded,
         date_excluded
     )
-    capacity = create_capacity_summary(p56_schedule)
-    strain_summary = create_strain_summary(assignments)
-    requirements_status = create_requirements_status(remaining_needs, requirements)
-    genotype_summary = summarize_genotype_exclusions(genotype_excluded)
-    b6_monthly_summary = pd.DataFrame()  # disabled — B6 minimum managed manually
 
     # Counts for summary
     p14_count = len(p14_schedule) if len(p14_schedule) > 0 else 0
@@ -5157,31 +4482,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         else 0
     )
 
-    unmatched_p14_count = (
-        len(unmatched_births_df[unmatched_births_df['P14_Potential'] == 'Yes'])
-        if len(unmatched_births_df) > 0 and 'P14_Potential' in unmatched_births_df.columns else 0
-    )
-    unmatched_p56_count = (
-        len(unmatched_births_df[unmatched_births_df['P56_Potential'] == 'Yes'])
-        if len(unmatched_births_df) > 0 and 'P56_Potential' in unmatched_births_df.columns else 0
-    )
-    unmatched_priority_count = (
-        len(unmatched_births_df[unmatched_births_df['Priority_Strain'] == 'YES'])
-        if len(unmatched_births_df) > 0 and 'Priority_Strain' in unmatched_births_df.columns else 0
-    )
-    unmatched_quota_count = (
-        len(unmatched_births_df[unmatched_births_df['Quota_Status'].str.contains('NEEDED', na=False)])
-        if len(unmatched_births_df) > 0 and 'Quota_Status' in unmatched_births_df.columns else 0
-    )
-
-    upcoming_sexing_count = 0
-    if len(sexing_schedule_df) > 0 and 'Days_Until_Sexing' in sexing_schedule_df.columns:
-        upcoming_sexing_count = len(sexing_schedule_df[
-            sexing_schedule_df['Days_Until_Sexing'].apply(
-                lambda x: isinstance(x, int) and 0 <= x <= 7
-            )
-        ])
-
     summary_data = {
         'Metric': [
             '── ANIMAL COUNTS ──',
@@ -5204,14 +4504,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             '── B6/B6N ──',
             'B6/B6N Monthly Minimum Required',
             'B6/B6N Top-Up Animals Added',
-            '── BIRTHS / SEXING ──',
-            'Births Needing Sexing (not yet entered)',
-            'Sexing Due Within 7 Days',
-            'Unmatched Births (Sing Inventory)',
-            'Unmatched - Can Schedule P14',
-            'Unmatched - Can Schedule P56',
-            'Unmatched - Priority Strains',
-            'Unmatched - With Quota Needs',
             '── SETTINGS ──',
             'Wednesday Capacity',
             'Sexing Day Offset (days)',
@@ -5246,14 +4538,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             '',
             CONFIG.get('B6_MIN_PER_MONTH', 3),
             b6_topup_count,
-            '',
-            len(sexing_schedule_df),
-            upcoming_sexing_count,
-            len(unmatched_births_df),
-            unmatched_p14_count,
-            unmatched_p56_count,
-            unmatched_priority_count,
-            unmatched_quota_count,
             '',
             CONFIG['WEDNESDAY_CAPACITY'],
             CONFIG.get('SEXING_OFFSET_DAYS', 9),
@@ -5290,6 +4574,10 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
     # Build a name → exclusion_reason lookup from all filter stages
     exclusion_reasons: Dict[str, str] = {}
+    # Breeding reserves get their own reason label
+    if breeding_reserves:
+        for _rn in breeding_reserves:
+            exclusion_reasons[str(_rn)] = 'Reserved — Breeding'
     if len(use_excluded) > 0:
         name_col = next((c for c in ['Name', 'Animal_Name', 'Animal ID'] if c in use_excluded.columns), None)
         use_col  = next((c for c in ['Use'] if c in use_excluded.columns), None)
@@ -5385,20 +4673,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     output_filename = f'Complete_Schedule_{timestamp}.xlsx'
     output_path = os.path.join(output_dir, output_filename)
 
-    save_backup_csvs(
-        output_dir, timestamp,
-        p14_schedule=p14_schedule,
-        p56_schedule=p56_schedule,
-        unschedulable=unschedulable,
-        capacity=capacity,
-        strain_summary=strain_summary,
-        requirements_status=requirements_status,
-        unmatched_births=unmatched_births_df,
-        genotype_excluded=genotype_excluded,
-        b6_monthly_summary=b6_monthly_summary,
-        all_animals=all_animals_merged,
-    )
-
     print(f"\nWriting Excel: {output_filename}")
 
     try:
@@ -5474,35 +4748,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             # ── Formatting ────────────────────────────────────────────────────
             wb = writer.book
 
-            if 'Sexing Schedule' in wb.sheetnames:
-                ws = wb['Sexing Schedule']
-                headers = [cell.value for cell in ws[1]]
-                status_col = headers.index('Sexing_Status') + 1 if 'Sexing_Status' in headers else None
-
-                for row_idx in range(2, ws.max_row + 1):
-                    if status_col:
-                        cell = ws.cell(row=row_idx, column=status_col)
-                        val = str(cell.value) if cell.value else ''
-                        color = None
-                        if 'TODAY' in val:
-                            color = 'FF0000'
-                            cell.font = Font(bold=True, color='FFFFFF')
-                        elif 'TOMORROW' in val:
-                            color = 'FF8C00'
-                            cell.font = Font(bold=True)
-                        elif 'SOON' in val:
-                            color = 'FFD700'
-                        elif 'Upcoming' in val:
-                            color = 'A8E6CF'
-                        elif 'Done' in val:
-                            color = 'D3D3D3'
-                        if color:
-                            cell.fill = PatternFill(
-                                start_color=color, end_color=color, fill_type='solid'
-                            )
-
-
-
             geno_sheet = truncate_sheet_name('Genotype Excluded Details')
             if geno_sheet in wb.sheetnames:
                 ws = wb[geno_sheet]
@@ -5576,12 +4821,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         print(f"  ⛔ Unusable for both:  {unusable_both:>6}  (too old for P14 AND P56)")
     if b6_topup_count > 0:
         print(f"  B6/B6N top-up added:  {b6_topup_count:>6}  (to meet {CONFIG['B6_MIN_PER_MONTH']}/month minimum)")
-    if len(sexing_schedule_df) > 0:
-        print(f"\n  Births needing sexing:    {len(sexing_schedule_df)}")
-        if upcoming_sexing_count > 0:
-            print(f"  ⚠️  Sexing due ≤7 days:    {upcoming_sexing_count}")
-    if len(unmatched_births_df) > 0:
-        print(f"\n  ⚠️  Unmatched births:       {len(unmatched_births_df)}")
     if genotype_critical_count > 0:
         print(f"\n  ⚠️  CRITICAL genotype issues: {genotype_critical_count}")
 
@@ -5695,18 +4934,6 @@ class TestSchedulerFunctions(unittest.TestCase):
         self.assertFalse(is_b6_strain('CHD8'))
         self.assertFalse(is_b6_strain(None))
         self.assertFalse(is_b6_strain(''))
-
-    def test_calculate_sexing_date(self):
-        bd = date(2025, 11, 1)
-        expected = date(2025, 11, 10)
-        self.assertEqual(calculate_sexing_date(bd), expected)
-        self.assertIsNone(calculate_sexing_date(None))
-        self.assertIsNone(calculate_sexing_date(pd.NaT))
-
-    def test_calculate_sexing_date_pd_timestamp(self):
-        ts = pd.Timestamp('2025-11-01')
-        expected = date(2025, 11, 10)
-        self.assertEqual(calculate_sexing_date(ts), expected)
 
     def test_sexing_date_in_schedule_dates(self):
         bd = date(2025, 11, 1)
@@ -6188,7 +5415,7 @@ class TestSchedulerFunctions(unittest.TestCase):
             'Birth_Date': '2025-10-01',
             'Reason': (
                 "'Half' STRAIN — 2 blank genotype(s) from birth 2025-10-01. "
-                "~1 of 2 expected Het (50% from Het×WT). "
+                "~1 of 2 expected Het (Het×WT cross). "
                 "RECOMMEND: Genotype by 2025-11-12 (7 days) for P14 on 2025-11-15"
             ),
         }])
@@ -7015,13 +6242,34 @@ def format_date_only(val):
         dt = pd.to_datetime(val)
         if pd.notna(dt):
             return dt.strftime('%m/%d/%Y')
-    except:
+    except Exception:
         pass
     if pd.notna(val) and str(val).strip() != '':
         return str(val)
     return ''
 
 
+def combine_sample_numbers(sample_list):
+    """Combine sample numbers into range format."""
+    if not sample_list:
+        return ""
+    base_numbers = []
+    for sample in sample_list:
+        sample_str = str(sample)
+        if '-' in sample_str:
+            base_num = sample_str.split('-')[0]
+        else:
+            base_num = sample_str
+        try:
+            base_numbers.append(int(base_num))
+        except (ValueError, TypeError):
+            continue
+    if not base_numbers:
+        return ""
+    if len(base_numbers) == 1:
+        return str(base_numbers[0])
+    else:
+        return f"{min(base_numbers)}-{max(base_numbers)}"
 
 
 def clean_genotype_base(genotype, strain):
@@ -7081,6 +6329,13 @@ def clean_genotype_labels(genotype):
     """Clean genotype specifically for label formatting — returns standard symbol."""
     return genotype_to_symbol(genotype)
 
+
+def natural_sort_key(name):
+    """Create a sort key that handles numbers naturally."""
+    if pd.isna(name):
+        return []
+    parts = re.split(r'(\d+)', str(name))
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
 
 
 def translate_protocol(harvest_type, timepoint):
@@ -7146,7 +6401,7 @@ def auto_width_worksheet(ws):
                 cell_len = len(str(cell.value)) if cell.value is not None else 0
                 if cell_len > max_length:
                     max_length = cell_len
-            except:
+            except Exception:
                 pass
         ws.column_dimensions[col_letter].width = max(max_length + 3, 8)
 
@@ -7261,7 +6516,7 @@ def build_working_data(all_animals_df):
             hd = pd.to_datetime(row.get('Harvest_Date'))
             if pd.notna(bd) and pd.notna(hd):
                 df.at[idx, 'Age_Weeks'] = round((hd - bd).days / 7, 1)
-        except:
+        except Exception:
             pass
 
     print(f"\n  Protocol breakdown:")
@@ -7277,6 +6532,10 @@ def build_working_data(all_animals_df):
 # ============================================================
 # STEPS 0+1: BUILD HARVEST WORKSHEET & CREATE SAMPLES
 # ============================================================
+
+def get_starting_sample_number():
+    """Ask user for the last sample number used — via GUI dialog."""
+    return _gui_ask('sample_number')
 
 
 def run_harvest_and_samples(working_df, timestamp):
@@ -7302,15 +6561,20 @@ def run_harvest_and_samples(working_df, timestamp):
     next_sample_num = get_starting_sample_number()
     print(f"  Starting with sample number: {next_sample_num}")
 
-    # Build animal ID lookup
+    # Build animal ID lookup: Animal_Name → JCMS ID (integer)
     animal_lookup = {}
     if 'ID' in sorted_df.columns:
         for _, row in sorted_df.iterrows():
             aname = str(row.get('Animal_Name', '')).strip()
-            aid = row.get('ID', '')
-            if aname and pd.notna(aid) and str(aid).strip() != '':
-                animal_lookup[aname] = str(aid).strip()
+            aid   = row.get('ID', '')
+            if aname and pd.notna(aid) and str(aid).strip() not in ('', 'nan'):
+                try:
+                    animal_lookup[aname] = str(int(float(aid)))
+                except (ValueError, TypeError):
+                    animal_lookup[aname] = str(aid).strip()
         print(f"  Built Animal ID lookup: {len(animal_lookup)} entries")
+    else:
+        print("  ⚠ No 'ID' column in working data — Source AnimalID will fall back to animal name")
 
     # Process each animal
     harvest_rows = []
@@ -7437,6 +6701,24 @@ def run_harvest_and_samples(working_df, timestamp):
 # ============================================================
 
 class MultiSheetExporter:
+
+    # Full-nomenclature translations for strains whose Line name in the animals
+    # export doesn't match the canonical JAX nomenclature.
+    # Key   = exact string as it appears in the 'Line' column of the animals CSV
+    # Value = correct full nomenclature to use in Line_subject
+    LINE_TRANSLATIONS = {
+        'B6J-Shank3 (Gfn) use hets':                     'B6.129-Shank3<tm2Gfng>/J',
+        'B6J-Cntnap2-/-':                                 'B6.129(Cg)-Cntnap2<tm1Pele>/J',
+        'B6J-Fmr1 -/- (X chr)':                          'B6.129P2-Fmr1\u2039tm1Cgr\u203a/J',
+        'B6NJ-Bcl11b Cyfip2-S968F\u2039J\u203a H Lethal':           'B6N(Cg)-Cyfip2em2Kumr Bcl11btm1.1(KOMP)Vlcg/Kumr',
+        'B6NJ-Kcnd3-/- Cyfip2-S968F\u2039J\u203a Hom Breed Well':   'C57BL/6NJ-Kcnd3em1(IMPC)J Cyfip2em2Kumr/Kumr',
+        'B6NJ-Kdm5b Cyfip2-S968F\u2039J\u203a HSubVi':              'C57BL/6N-Cyfip2em2Kumr Kdm5bem1(IMPC)Wtsi/Kumr',
+    }
+
+    def _translate_line(self, raw: str) -> str:
+        """Return the canonical line name, applying LINE_TRANSLATIONS if needed."""
+        return self.LINE_TRANSLATIONS.get(str(raw).strip(), raw)
+
     def __init__(self, working_df, samples_df, output_filename):
         """Initialize using in-memory DataFrames."""
         self.output_filename = output_filename
@@ -7508,7 +6790,7 @@ class MultiSheetExporter:
                 birth = pd.to_datetime(birth_date)
                 harvest = pd.to_datetime(harvest_date)
                 return round((harvest - birth).days / 7, 1)
-        except:
+        except Exception:
             pass
         return ''
 
@@ -7601,7 +6883,7 @@ class MultiSheetExporter:
                 'Age (weeks)_sample': age_weeks,
                 'Name_subject': self._safe_get(row, 'Animal_Name'),
                 'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                'Line_subject': self._safe_get(row, 'Line', 'Line_animal', 'Strain'),
+                'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse',
@@ -7658,7 +6940,7 @@ class MultiSheetExporter:
                 'Age (weeks)_sample': age_weeks,
                 'Name_subject': self._safe_get(row, 'Animal_Name'),
                 'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                'Line_subject': self._safe_get(row, 'Line', 'Line_animal', 'Strain'),
+                'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse',
@@ -7715,7 +6997,7 @@ class MultiSheetExporter:
                 'Age (weeks)_sample': age_weeks,
                 'Name_subject': self._safe_get(row, 'Animal_Name'),
                 'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                'Line_subject': self._safe_get(row, 'Line', 'Line_animal', 'Strain'),
+                'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse',
@@ -7767,7 +7049,7 @@ class MultiSheetExporter:
                     try:
                         if pd.notna(cell.value) and cell.value != '':
                             cell.number_format = 'MM/DD/YYYY'
-                    except:
+                    except Exception:
                         pass
 
         auto_width_worksheet(ws)
@@ -7960,7 +7242,7 @@ def run_climb_to_envision(working_df, timestamp):
 def safe_date_format(date_value, date_name='Date'):
     try:
         return pd.to_datetime(date_value).strftime('%m/%d/%y')
-    except:
+    except Exception:
         if pd.notna(date_value):
             return str(date_value)
         return 'N/A'
@@ -7971,7 +7253,7 @@ def safe_int_format(value, default='N/A'):
         if pd.notna(value):
             return int(float(value))
         return default
-    except:
+    except Exception:
         return default
 
 
@@ -8024,7 +7306,7 @@ def format_sample_number(sample_name, pad=True):
             return s
         formatted_num = digits.zfill(4) if pad else str(int(digits))
         return f"{formatted_num}-{suffix}" if suffix is not None else formatted_num
-    except:
+    except Exception:
         return str(sample_name)
 
 
@@ -8100,7 +7382,7 @@ def format_label_rows(row, label_type):
         hd = pd.to_datetime(safe_get_label(row, 'Sample Harvest Date', 'Harvest Date', 'Harvest_Date'))
         if pd.notna(bd) and pd.notna(hd):
             age_weeks = int((hd - bd).days / 7)
-    except:
+    except Exception:
         pass
 
     sample_name = safe_get_label(row, 'Sample Name', 'Sample_Name')
@@ -8114,7 +7396,7 @@ def format_label_rows(row, label_type):
         hd = pd.to_datetime(safe_get_label(row, 'Sample Harvest Date', 'Harvest Date', 'Harvest_Date'))
         if pd.notna(bd) and pd.notna(hd):
             age_days_label = f"P{int((hd - bd).days)}"
-    except:
+    except Exception:
         pass
 
     row1 = f"{sample_name}_{harvest_date}_{animal_name}"
@@ -8592,6 +7874,227 @@ def _make_styled_button(parent, text, command, style='primary', **kwargs):
     return btn
 
 
+
+# =============================================================================
+# COLONY ROTATION HELPERS
+# =============================================================================
+
+# Maps Climb full Line name (matings.csv) -> Line (Short) used in animals.csv.
+# Trailing-space variant of Unaffected included for robustness.
+_CLIMB_TO_SHORT = {
+    'B6.129-Shank3<tm2Gfng>/J':                                          'SHANK3',
+    'B6NJ-Kcnd3-/- Cyfip2-S968F<J> Hom Breed Well':                      'KCND3',
+    'B6J-Fmr1 -/- (X chr)':                                              'FMR1',
+    'B6.129(FVB)-Cdkl5<tm1.1Joez>/J':                                    'CDKL5',
+    'B6J-Cntnap2-/-':                                                     'CNTNAP2',
+    'B6.129S4-C3<tm1Crr>/J':                                              'C3',
+    'B6NJ-Bcl11b Cyfip2-S968F<J> H Lethal':                              'BCL11B',
+    'B6NJ-Cyfip2-S968F<J> (GET204)':                                      'GET204',
+    'C57BL/6J':                                                           'B6J',
+    'C57BL/6NJ':                                                          'B6NJ',
+    '(C57BL/6J x 129S1/SvImJ-Scn1a<em1Dsf>/J)F1 - Affected':            'Dravet',
+    '129S1/SvImJ-Scn1a<em1Dsf>/J - Unaffected':                          'Dravet',
+    '129S1/SvImJ-Scn1a<em1Dsf>/J - Unaffected ':                         'Dravet',
+}
+
+
+def _parse_geno_symbol(geno_str: str) -> str:
+    """Extract allele symbol from a Climb genotype string.
+
+    Examples: 'Shank3<tm2Gfng> Probe -/+' -> '-/+'
+              'Fmr1<tm1Cgr> -/Y'          -> '-/Y'
+              '' or nan                   -> 'WT'
+    """
+    import re as _re
+    s = str(geno_str).strip() if geno_str and str(geno_str).strip().lower() != 'nan' else ''
+    if not s:
+        return 'WT'
+    m = _re.search(r'([-+*/]/[-+*YyWw])', s)
+    return m.group(1) if m else 'WT'
+
+
+def _load_matings(filepath: str) -> 'pd.DataFrame':
+    """Load Climb matings export — Active Mating rows only."""
+    df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
+    df = df[df['Status'] == 'Active Mating'].copy()
+    df['Line']        = df['Line'].str.strip()
+    df['Mating Date'] = pd.to_datetime(df['Mating Date'], errors='coerce')
+    df = df.dropna(subset=['Mating Date'])
+    today             = pd.Timestamp(date.today())
+    df['days_active'] = (today - df['Mating Date']).dt.days.astype(int)
+    df['Births']      = pd.to_numeric(df['Births'],  errors='coerce').fillna(0).astype(int)
+    df['Comments']    = df['Comments'].fillna('').str.strip()
+    # Blank Name field = no animal physically logged in that slot (dead / touring)
+    df['sire_blank']  = df['Sire(s) Name(s)'].fillna('').str.strip() == ''
+    df['dam_blank']   = df['Dam(s) Name(s)'].fillna('').str.strip()  == ''
+    return df
+
+
+def _enrich_with_births(matings_df: 'pd.DataFrame', births_filepath: str) -> 'pd.DataFrame':
+    """Join births CSV to matings on Mating ID; attach NP flags and live birth totals."""
+    births = pd.read_csv(births_filepath, encoding='utf-8-sig', dtype=str)
+    births['Birth Date'] = pd.to_datetime(births['Birth Date'], errors='coerce')
+    births['Live Count'] = pd.to_numeric(births['Live Count'], errors='coerce').fillna(0).astype(int)
+
+    last_litter = (births.groupby('Mating ID')['Birth Date']
+                         .max().rename('last_litter_date'))
+    total_live  = (births.groupby('Mating ID')['Live Count']
+                         .sum().rename('live_births'))
+
+    df = matings_df.join(last_litter, on='Mating ID')
+    df = df.join(total_live,          on='Mating ID')
+    df['live_births'] = df['live_births'].fillna(0).astype(int)
+
+    today                  = pd.Timestamp(date.today())
+    df['days_since_litter'] = (today - df['last_litter_date']).dt.days
+
+    np_days    = CONFIG['COLONY_NP_NO_BIRTHS_DAYS']
+    quiet_days = CONFIG['COLONY_NP_GONE_QUIET_DAYS']
+    df['np_zero']  = (df['days_active'] >= np_days)    & (df['live_births'] == 0)
+    df['np_quiet'] = (df['live_births'] > 0)           & (df['days_since_litter'] >= quiet_days)
+    df['is_np']    = df['np_zero'] | df['np_quiet']
+    return df
+
+
+
+def _monthly_pattern(N: int, cycle: int = 6) -> list:
+    """Bresenham-style distribution of N retirements across cycle months.
+
+    Returns a list of `cycle` ints that sum to N, as evenly spaced as possible.
+    Examples:
+        N=9  -> [1, 2, 1, 2, 1, 2]   (Tim's 1,2,1,2,1,2)
+        N=4  -> [0, 1, 1, 0, 1, 1]   (approx every 2 months)
+        N=6  -> [1, 1, 1, 1, 1, 1]   (every month)
+    """
+    pattern, error = [], 0
+    for _ in range(cycle):
+        error += N
+        pattern.append(error // cycle)
+        error %= cycle
+    return pattern
+
+def _build_rotation_analysis(matings_df: 'pd.DataFrame') -> list:
+    """Return per-strain rotation status as a list of dicts, urgency-sorted."""
+    completing    = set(CONFIG.get('COMPLETING_STRAINS', []))
+    rotation_days = CONFIG['COLONY_ROTATION_DAYS']
+    today         = pd.Timestamp(date.today())
+    results       = []
+
+    for line, grp in matings_df.groupby('Line'):
+        grp           = grp.sort_values('Mating Date').copy()
+        N             = len(grp)
+        from math import ceil as _ceil
+        interval_mo   = max(1, _ceil(6 / N))        # whole months, rounded up
+        pat           = _monthly_pattern(N)         # retirements per month pattern
+        newest_date   = grp['Mating Date'].max()
+        days_since_new = int((today - newest_date).days)
+        months_since_new = days_since_new / 30
+        swap_due      = months_since_new >= interval_mo
+
+        np_units      = grp[grp['is_np']]
+        overdue_units = grp[grp['days_active'] >= rotation_days]
+        missing_units = grp[grp['sire_blank'] | grp['dam_blank']]
+
+        # Cadence candidate: least productive non-NP unit (oldest breaks ties)
+        non_np = grp[~grp['is_np']].sort_values(
+            ['live_births', 'days_active'], ascending=[True, False])
+        cadence_candidate = non_np.iloc[0] if (swap_due and not non_np.empty) else None
+
+        # Representative genotypes for replacement lookup —
+        # use the first mating that has a logged sire/dam respectively
+        sire_geno = ''
+        dam_geno  = ''
+        for _, r in grp.iterrows():
+            sg = str(r.get("Sire(s) Genotype(s)", '') or '').strip()
+            dg = str(r.get("Dam(s) Genotype(s)",  '') or '').strip()
+            if not r['sire_blank'] and not sire_geno and sg:
+                sire_geno = sg
+            if not r['dam_blank'] and not dam_geno and dg:
+                dam_geno = dg.split(',')[0].strip()  # trios: take first dam
+
+        results.append({
+            'line':              line,
+            'N':                 N,
+            'interval_months':   interval_mo,
+            'monthly_pattern':   pat,
+            'is_completing':     line in completing,
+            'swap_due':          swap_due,
+            'days_since_newest': days_since_new,
+            'next_swap_date':    newest_date + pd.DateOffset(months=interval_mo),
+            'np_units':          np_units,
+            'overdue_units':     overdue_units,
+            'missing_units':     missing_units,
+            'cadence_candidate': cadence_candidate,
+            'sire_geno':         sire_geno,
+            'dam_geno':          dam_geno,
+            'all_units':         grp,
+        })
+
+    # Urgency sort: completing strains last; within groups by action count desc
+    results.sort(key=lambda x: (
+        x['is_completing'],
+        -(len(x['np_units']) + len(x['overdue_units']) + len(x['missing_units']))
+    ))
+    return results
+
+
+def _find_breeding_candidates(animals_df: 'pd.DataFrame', line: str,
+                               sire_geno: str, dam_geno: str) -> dict:
+    """Find animals at breeding age (56-84 days) matching required genotypes.
+
+    Returns dict: males (list), females (list), line_short (str|None),
+                  sufficient (bool — at least 1M + 1F available)
+    """
+    line_short = _CLIMB_TO_SHORT.get(line.strip())
+    empty = {'males': [], 'females': [], 'line_short': line_short, 'sufficient': False}
+
+    if not line_short or animals_df is None or animals_df.empty:
+        return empty
+
+    today  = pd.Timestamp(date.today())
+    ls_col = animals_df.get('Line (Short)', pd.Series(dtype=str)).str.strip()
+    strain = animals_df[ls_col == line_short].copy()
+    if strain.empty:
+        return empty
+
+    strain['_bd']  = pd.to_datetime(strain['Birth Date'], errors='coerce')
+    strain         = strain.dropna(subset=['_bd'])
+    strain['_age'] = (today - strain['_bd']).dt.days
+    strain         = strain[(strain['_age'] >= 56) & (strain['_age'] <= 84)]
+    if strain.empty:
+        return empty
+
+    req_sire = _parse_geno_symbol(sire_geno)
+    req_dam  = _parse_geno_symbol(dam_geno)
+
+    def _matches(geno: str, required: str) -> bool:
+        if required == 'WT':
+            return _parse_geno_symbol(geno) in ('+/+', 'WT')
+        return _parse_geno_symbol(geno) == required
+
+    males   = strain[strain['Sex'].str.strip().str.upper() == 'M'].copy()
+    females = strain[strain['Sex'].str.strip().str.upper() == 'F'].copy()
+
+    if req_sire != 'WT':
+        males = males[males['Genotype'].apply(lambda g: _matches(str(g), req_sire))]
+    if req_dam != 'WT':
+        females = females[females['Genotype'].apply(lambda g: _matches(str(g), req_dam))]
+
+    def _fmt(row):
+        return {'name': row['Name'], 'age_days': int(row['_age']),
+                'genotype': str(row.get('Genotype', ''))}
+
+    male_list   = [_fmt(r) for _, r in males.iterrows()]
+    female_list = [_fmt(r) for _, r in females.iterrows()]
+
+    return {
+        'males':      male_list,
+        'females':    female_list,
+        'line_short': line_short,
+        'sufficient': len(male_list) >= 1 and len(female_list) >= 1,
+    }
+
+
 def run_pipeline_gui():
     """Entry point — shows the full GUI pipeline."""
 
@@ -8607,6 +8110,8 @@ def run_pipeline_gui():
         'animal_file':   _os.path.join(script_dir, CONFIG['INPUT_ANIMAL_FILE']),
         'tracking_file': _os.path.join(script_dir, CONFIG['INPUT_TRACKING_FILE']),
         'births_file':   _os.path.join(script_dir, CONFIG['INPUT_BIRTHS_FILE']),
+        'matings_file':  _os.path.join(script_dir, CONFIG['INPUT_MATINGS_FILE']),
+        'breeding_reserves': set(),
     }
 
     REQUIRED_COLOR = _T['red']
@@ -8692,6 +8197,14 @@ def run_pipeline_gui():
                 'label':    'Births Record',
                 'hint':     'Optional  •  check the box to include in this run',
                 'desc':     'Log of recent births used to identify new P14 animals.',
+            },
+            {
+                'key':      'matings_file',
+                'default':  CONFIG['INPUT_MATINGS_FILE'],
+                'required': False,
+                'label':    'Colony Matings',
+                'hint':     'Optional  •  check the box to include in this run',
+                'desc':     'Climb active matings export — enables colony rotation review.',
             },
         ]
 
@@ -8847,7 +8360,7 @@ def run_pipeline_gui():
 
             state['animal_file'] = animal
 
-            for key in ('tracking_file', 'births_file'):
+            for key in ('tracking_file', 'births_file', 'matings_file'):
                 if toggle_vars[key].get():
                     p = path_vars[key].get().strip()
                     state[key] = p if _os.path.exists(p) else None
@@ -8860,7 +8373,10 @@ def run_pipeline_gui():
                 else:
                     state[key] = None
 
-            _switch(screen_wednesday)
+            if state.get('matings_file'):
+                _switch(screen_breeding_rotation)
+            else:
+                _switch(screen_wednesday)
 
         tk.Button(foot, text='Next: Wednesday Capacity  →',
                   command=_proceed,
@@ -8879,6 +8395,246 @@ def run_pipeline_gui():
             root.geometry(f'{w}x{h}+{x}+{y}')
         root.after(10, _fit_window)
 
+
+    def screen_breeding_rotation():
+        root.title('SING Pipeline Scheduler — Colony Rotation')
+        root.geometry('960x700')
+    
+        matings_df = None
+        try:
+            matings_df = _load_matings(state['matings_file'])
+            if state.get('births_file'):
+                matings_df = _enrich_with_births(matings_df, state['births_file'])
+            else:
+                for col, val in [('live_births', 0), ('np_zero', False),
+                                  ('np_quiet', False), ('is_np', False)]:
+                    matings_df[col] = val
+                matings_df['last_litter_date']  = pd.NaT
+                matings_df['days_since_litter'] = pd.NA
+        except Exception as ex:
+            messagebox.showerror('Colony Rotation', f'Could not load matings:\n{ex}')
+    
+        animals_df = None
+        if state.get('animal_file'):
+            try:
+                animals_df = pd.read_csv(state['animal_file'], dtype=str,
+                                         encoding='utf-8-sig')
+            except Exception:
+                pass
+    
+        analysis = _build_rotation_analysis(matings_df) if matings_df is not None else []
+    
+        _make_header(
+            eyebrow='Step 1.5  —  Colony Rotation',
+            title='Reserve animals for breeding',
+            subtitle=('Check animals to reserve — excluded from harvest scheduling, '
+                      'appear as “Reserved — Breeding” in output.'),
+        )
+    
+        body = tk.Frame(root, bg=_T['bg'])
+        body.pack(fill='both', expand=True)
+    
+        canvas = tk.Canvas(body, bg=_T['bg'], highlightthickness=0)
+        vsb    = ttk.Scrollbar(body, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+    
+        inner  = tk.Frame(canvas, bg=_T['bg'])
+        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',
+                    lambda e: canvas.itemconfig(win_id, width=e.width))
+    
+        def _wheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        canvas.bind_all('<MouseWheel>', _wheel)
+    
+        check_vars = {}
+    
+        def _update_count(*_):
+            n = sum(1 for v in check_vars.values() if v.get())
+            count_lbl.configure(
+                text=f'{n} animal{"s" if n != 1 else ""} reserved for breeding',
+                fg=_T['accent'] if n else _T['text_muted'],
+            )
+    
+        def _render_block(s):
+            line        = s['line']
+            has_np      = len(s['np_units'])      > 0
+            has_missing = len(s['missing_units']) > 0
+            has_over    = len(s['overdue_units']) > 0
+            is_done     = s['is_completing']
+    
+            if has_np or has_missing:
+                bg, border = _T['red_lt'],    _T['red']
+            elif has_over or s['swap_due']:
+                bg, border = _T['amber_lt'],  _T['amber']
+            elif is_done:
+                bg, border = _T['bg_inset'],  _T['border_mid']
+            else:
+                bg, border = _T['accent_lt'], _T['accent']
+    
+            card = tk.Frame(inner, bg=bg, padx=14, pady=10,
+                            highlightbackground=border, highlightthickness=1)
+            card.pack(fill='x', padx=10, pady=3)
+    
+            hrow = tk.Frame(card, bg=bg)
+            hrow.pack(fill='x')
+            short = _CLIMB_TO_SHORT.get(line.strip(), line[:35])
+            tk.Label(hrow, text=short,
+                     font=('Helvetica', 12, 'bold'), bg=bg,
+                     fg=_T['text']).pack(side='left')
+            N      = s['N']
+            pat_str = ','.join(str(x) for x in s['monthly_pattern'])
+            suffix = ('  [COMPLETING]' if is_done
+                      else f'   {N} unit{"s" if N != 1 else ""}  '
+                           f'•  {pat_str} /mo')
+            tk.Label(hrow, text=suffix, font=('Helvetica', 9), bg=bg,
+                     fg=_T['text_muted']).pack(side='left', padx=4)
+    
+            if not (has_np or has_missing or has_over or s['swap_due']):
+                nxt = s['next_swap_date'].strftime('%b %d')
+                tk.Label(card,
+                         text=f'✅  On track  —  next swap due {nxt}',
+                         font=('Helvetica', 9), bg=bg,
+                         fg=_T['accent_text']).pack(anchor='w', pady=(2, 0))
+                return
+    
+            tbl = tk.Frame(card, bg=bg)
+            tbl.pack(fill='x', pady=(6, 2))
+            col_specs = [('Housing', 7), ('Mating', 7), ('Days\nActive', 6),
+                         ('Live\nBirths', 7), ('Last\nLitter', 11), ('Status', 30)]
+            for ci, (txt, w) in enumerate(col_specs):
+                tk.Label(tbl, text=txt, width=w, anchor='center',
+                         font=('Helvetica', 8), bg=bg,
+                         fg=_T['text_faint']).grid(row=0, column=ci, padx=2)
+    
+            for ri, (_, r) in enumerate(s['all_units'].iterrows(), 1):
+                flags = []
+                if r.get('np_zero'):
+                    flags.append('NP: no births 90d+')
+                if r.get('np_quiet'):
+                    flags.append(f'NP: quiet {int(r.get("days_since_litter", 0))}d')
+                if r['days_active'] >= CONFIG['COLONY_ROTATION_DAYS']:
+                    flags.append(f'Overdue {r["days_active"]}d')
+                if r.get('sire_blank'):
+                    flags.append('⚠ No sire logged')
+                if r.get('dam_blank'):
+                    flags.append('⚠ No dam(s) logged')
+                is_cad = (s['cadence_candidate'] is not None
+                          and r['Housing ID'] == s['cadence_candidate']['Housing ID']
+                          and not flags)
+                if is_cad:
+                    flags.append('→ Retire next (cadence)')
+                ll    = (r['last_litter_date'].strftime('%b %d')
+                         if pd.notna(r.get('last_litter_date')) else '—')
+                row_bg = (_T['red_lt']   if any('NP' in f or 'No sire' in f
+                                                 or 'No dam' in f for f in flags)
+                          else _T['amber_lt'] if flags else bg)
+                fg_c   = _T['red'] if row_bg == _T['red_lt'] else _T['text']
+                vals   = [r['Housing ID'], r['Mating ID'], str(r['days_active']),
+                          str(r.get('live_births', 0)), ll,
+                          '  '.join(flags) or 'OK']
+                for ci, (v, w) in enumerate(zip(vals, [7, 7, 6, 7, 11, 30])):
+                    tk.Label(tbl, text=v, width=w, anchor='center',
+                             font=('Helvetica', 9), bg=row_bg,
+                             fg=fg_c).grid(row=ri, column=ci, padx=2, pady=1)
+    
+            if not is_done and (s['swap_due'] or has_np):
+                cands   = _find_breeding_candidates(
+                    animals_df, line, s['sire_geno'], s['dam_geno'])
+                comment = (s['all_units'].iloc[0]['Comments']
+                           if not s['all_units'].empty else '')
+                tk.Label(card,
+                         text=f'SET UP REPLACEMENT   [{comment or "see matings"}]',
+                         font=('Helvetica', 9, 'bold'), bg=bg,
+                         fg=_T['text']).pack(anchor='w', pady=(8, 0))
+                if not cands.get('line_short'):
+                    tk.Label(card,
+                             text='⚠  Line (Short) mapping unknown — update _CLIMB_TO_SHORT',
+                             font=('Helvetica', 9, 'italic'), bg=bg,
+                             fg=_T['amber']).pack(anchor='w')
+                elif not cands.get('sufficient'):
+                    nm = len(cands.get('males',   []))
+                    nf = len(cands.get('females', []))
+                    tk.Label(card,
+                             text=(f'  No sufficient candidates  '
+                                   f'({nm} male{"s" if nm != 1 else ""},  '
+                                   f'{nf} female{"s" if nf != 1 else ""}  at 56–84d)'),
+                             font=('Helvetica', 9, 'italic'), bg=bg,
+                             fg=_T['amber']).pack(anchor='w')
+                else:
+                    sire_sym = _parse_geno_symbol(s['sire_geno'])
+                    dam_sym  = _parse_geno_symbol(s['dam_geno'])
+                    cgrid    = tk.Frame(card, bg=bg)
+                    cgrid.pack(fill='x', pady=(4, 0))
+                    for ci, (sex_lbl, lst) in enumerate([
+                        (f'Males  ({sire_sym})',  cands['males']),
+                        (f'Females  ({dam_sym})', cands['females']),
+                    ]):
+                        col_f = tk.Frame(cgrid, bg=bg, padx=4)
+                        col_f.grid(row=0, column=ci, sticky='nw', padx=(0, 20))
+                        tk.Label(col_f, text=sex_lbl,
+                                 font=('Helvetica', 9, 'bold'), bg=bg,
+                                 fg=_T['text_muted']).pack(anchor='w')
+                        for animal in lst[:6]:
+                            name = animal['name']
+                            var  = check_vars.setdefault(
+                                name, tk.BooleanVar(value=False))
+                            var.trace_add('write', _update_count)
+                            lbl  = (f"  {name}  ({animal['age_days']}d)"
+                                    f"  {animal['genotype']}")
+                            tk.Checkbutton(col_f, text=lbl, variable=var,
+                                           font=('Helvetica', 9), bg=bg,
+                                           fg=_T['text'], activebackground=bg,
+                                           selectcolor=bg,
+                                           cursor='hand2').pack(anchor='w')
+    
+            for _, mr in s['missing_units'].iterrows():
+                parts = []
+                if mr.get('sire_blank'): parts.append('sire')
+                if mr.get('dam_blank'):  parts.append('dam(s)')
+                who = ' & '.join(parts)
+                tk.Label(card,
+                         text=(f'⚠  H{mr["Housing ID"]}  M{mr["Mating ID"]}  —  '
+                               f'no {who} logged (touring male, death, or other)  —  '
+                               f'replace {who} individually or retire unit.'),
+                         font=('Helvetica', 9), bg=bg, fg=_T['red'],
+                         wraplength=860, justify='left',
+                         ).pack(anchor='w', pady=(4, 0))
+    
+        for sd in analysis:
+            _render_block(sd)
+        if not analysis:
+            tk.Label(inner, text='No matings data to display.',
+                     font=('Helvetica', 11), bg=_T['bg'],
+                     fg=_T['text_muted']).pack(pady=40)
+    
+        foot = _make_footer()
+    
+        _make_styled_button(
+            foot, '← Back to Files',
+            lambda: [canvas.unbind_all('<MouseWheel>'), _switch(screen_file_setup)],
+            style='ghost',
+        ).pack(side='left', padx=16)
+    
+        count_lbl = tk.Label(foot, text='0 animals reserved for breeding',
+                             font=('Helvetica', 10), bg=_T['bg_subtle'],
+                             fg=_T['text_muted'])
+        count_lbl.pack(side='left', padx=8)
+    
+        def _proceed():
+            state['breeding_reserves'] = {
+                name for name, var in check_vars.items() if var.get()
+            }
+            canvas.unbind_all('<MouseWheel>')
+            _switch(screen_wednesday)
+    
+        _make_styled_button(
+            foot, 'Next: Wednesday Capacity  →', _proceed, style='primary',
+        ).pack(side='right', padx=16)
 
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 2: Wednesday Capacity
@@ -9200,6 +8956,7 @@ def run_pipeline_gui():
                     behavior_date_start = None,
                     behavior_date_end   = None,
                     full_behavior_dates = state.get('full_behavior_dates'),
+                    breeding_reserves   = state.get('breeding_reserves') or None,
                 )
 
                 timestamp = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -9245,7 +9002,7 @@ def run_pipeline_gui():
             except Exception as ex:
                 import traceback as _tb
                 _tb.print_exc()
-                _pipeline_queue.put({'kind': _MSG_DONE, 'ok': False, 'error': str(ex)})
+                _pipeline_queue.put({'kind': _MSG_DONE, 'ok': False, 'error': traceback.format_exc()})
             finally:
                 _sys.stdout = old_stdout
 

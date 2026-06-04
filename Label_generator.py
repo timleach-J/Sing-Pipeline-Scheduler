@@ -4,7 +4,6 @@ import re
 from datetime import datetime
 import sys
 import traceback
-from sing_common import genotype_to_symbol
 
 # ==================== EASY CONFIGURATION ====================
 INPUT_SAMPLES_FILE = 'samples.csv'
@@ -118,7 +117,46 @@ def safe_get(row, *keys, default='N/A'):
     return default
 
 
-clean_genotype_for_label = genotype_to_symbol
+def _canon_geno_simple(raw: str) -> str:
+    """Canonicalise raw Climb genotype to het/hom/hemi/wild/inbred/blank."""
+    if not raw or raw.lower() in ('nan', 'none', 'n/a', '-', ''):
+        return 'blank'
+    s = raw.lower()
+    s = re.sub(r'[‹<][^›>]*[›>]', '', s)
+    s = re.sub(r'\[[^\]]*\]', '', s)
+    s = re.sub(r'probe\s*', '', s)
+    s = ' '.join(s.split())
+    if any(k in s for k in ('inconclusive', 'pending', 'failed', 'no call')):
+        return 'blank'
+    if re.search(r'\bhom\d*\b|-/-', s):
+        return 'hom'
+    if re.search(r'\bhet\d*\b|-/\+|\+/-', s):
+        return 'het'
+    if re.search(r'hem[i]?|tg/\+|\+/tg|-/y', s):
+        return 'hemi'
+    if re.search(r'\+/\+|\bwt\b|wild.?type', s):
+        return 'wild'
+    if 'inbred' in s:
+        return 'inbred'
+    return 'blank'
+
+_GENO_SYMBOL = {
+    'het':    '+/-',
+    'hom':    '-/-',
+    'hemi':   '-/Y',
+    'wild':   '+/+',
+    'inbred': 'Inbred',
+    'blank':  'Blank',
+}
+
+def clean_genotype_for_label(genotype) -> str:
+    """Convert any Climb genotype string to standard display symbol."""
+    if genotype is None or (isinstance(genotype, float) and genotype != genotype):
+        return 'Blank'
+    raw = str(genotype).strip()
+    if raw in ('', 'nan', 'N/A'):
+        return 'Blank'
+    return _GENO_SYMBOL.get(_canon_geno_simple(raw), 'Blank')
 
 
 def format_sample_number(sample_name, pad=True):

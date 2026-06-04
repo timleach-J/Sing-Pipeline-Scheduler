@@ -6,7 +6,63 @@ import os
 import sys
 import traceback
 import re
-from sing_common import genotype_to_symbol, combine_sample_numbers
+
+def genotype_to_symbol(raw) -> str:
+    """Convert any Climb genotype string to standard display symbol."""
+    if raw is None or (isinstance(raw, float) and raw != raw):
+        return 'Blank'
+    s = str(raw).strip().lower()
+    if not s or s in ('nan', 'none', 'n/a', '-', ''):
+        return 'Blank'
+    s = re.sub(r'[‹<][^›>]*[›>]', '', s)
+    s = re.sub(r'\[[^\]]*\]', '', s)
+    s = re.sub(r'probe\s*', '', s)
+    s = ' '.join(s.split())
+    if any(k in s for k in ('inconclusive', 'pending', 'failed', 'no call')):
+        return 'Blank'
+    if re.search(r'\bhom\d*\b|-/-', s):   return '-/-'
+    if re.search(r'\bhet\d*\b|-/\+|\+/-', s): return '+/-'
+    if re.search(r'hem[i]?|tg/\+|\+/tg|-/y', s): return '-/Y'
+    if re.search(r'\+/\+|\bwt\b|wild.?type', s):  return '+/+'
+    if 'inbred' in s:                      return 'Inbred'
+    return 'Blank'
+
+def combine_sample_numbers(sample_list):
+    """
+    Combine sample numbers into range format.
+    Example: [571, 572, 573] -> "571-573"
+    Example: [100] -> "100"
+    """
+    if not sample_list:
+        return ""
+    
+    # Extract base numbers (remove any suffixes if present)
+    base_numbers = []
+    for sample in sample_list:
+        sample_str = str(sample)
+        # Remove suffix (everything after and including the dash)
+        if '-' in sample_str:
+            base_num = sample_str.split('-')[0]
+        else:
+            base_num = sample_str
+        try:
+            # Always convert to int for comparison
+            base_numbers.append(int(base_num))
+        except (ValueError, TypeError):
+            # If conversion fails, skip this sample
+            continue
+    
+    # If no valid numbers were found, return empty string
+    if not base_numbers:
+        return ""
+    
+    if len(base_numbers) == 1:
+        return str(base_numbers[0])
+    else:
+        # Return as range
+        first = min(base_numbers)
+        last = max(base_numbers)
+        return f"{first}-{last}"
 
 class MultiSheetExporter:
     def __init__(self, animals_csv, samples_csv, output_filename=None):
@@ -299,7 +355,7 @@ class MultiSheetExporter:
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse' if self._safe_get(row, 'Sex') != '' else '',
-                'Genotype': f"{self._safe_get(row, 'Line (Short)')} {genotype_to_symbol(self._safe_get(row, 'Genotype'))}".strip(),
+                'Genotype': genotype_to_symbol(self._safe_get(row, 'Genotype')),
                 'Birth Date': self._safe_get(row, 'Birth Date'),
                 'Wean Date': self._safe_get(row, 'Wean Date'),
                 'Harvest Timepoint': self._safe_get(row, 'Time Point')
@@ -365,7 +421,7 @@ class MultiSheetExporter:
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse' if self._safe_get(row, 'Sex') != '' else '',
-                'Genotype': f"{self._safe_get(row, 'Line (Short)')} {genotype_to_symbol(self._safe_get(row, 'Genotype'))}".strip(),
+                'Genotype': genotype_to_symbol(self._safe_get(row, 'Genotype')),
                 'Birth Date': self._safe_get(row, 'Birth Date'),
                 'Wean Date': self._safe_get(row, 'Wean Date'),
                 'Dissect Date': self._safe_get(row, 'Harvest Date')
@@ -429,7 +485,7 @@ class MultiSheetExporter:
                 'Line (Short)': self._safe_get(row, 'Line (Short)'),
                 'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
                 'Species_subject': 'Mouse' if self._safe_get(row, 'Sex') != '' else '',
-                'Genotype': f"{self._safe_get(row, 'Line (Short)')} {genotype_to_symbol(self._safe_get(row, 'Genotype'))}".strip(),
+                'Genotype': genotype_to_symbol(self._safe_get(row, 'Genotype')),
                 'Birth Date': self._safe_get(row, 'Birth Date'),
                 'Wean Date': self._safe_get(row, 'Wean Date'),
                 'Dissect Date': self._safe_get(row, 'Harvest Date')

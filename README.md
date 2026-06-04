@@ -10,7 +10,7 @@ NIH-funded, 2024–2029
 
 The SING Pipeline Scheduler is a Python/tkinter GUI tool that automates harvest scheduling, Envision tagging prep, sample tracking, and output file generation for the SING project. It processes animal colony data exported from Climb/Envision and produces a complete set of Excel and CSV files ready for the harvest workflow.
 
-Built and maintained by Tim Leach, Research Technician, Kumar Lab.
+Built and maintained by Tim Leach, Research Assistant, Kumar Lab.
 
 ---
 
@@ -19,7 +19,11 @@ Built and maintained by Tim Leach, Research Technician, Kumar Lab.
 | File | Version | Status | Notes |
 |---|---|---|---|
 | `sing_pipeline.py` | v1.7 | Stable | Previous production version — fallback if needed |
-| `sing_pipeline_v2.py` | v2.1 | Current | Active production version |
+| `sing_pipeline_v2.py` | v2.2 | Current | Active production version |
+| `sing_common.py` | v2.2 | Shared | Utility functions imported by all scripts — must be on the Python path |
+| `Label_generator.py` | v2.2 | Standalone | Label reprints — run independently |
+| `Deliverables_Sheet_Export.py` | v2.2 | Standalone | Lab data export — run independently |
+| `Climb_to_Envision_Translation.py` | v2.2 | Standalone | Envision tag file — run independently |
 
 ---
 
@@ -37,6 +41,27 @@ Install dependencies:
 ```bash
 pip install pandas openpyxl tqdm
 ```
+
+---
+
+## Shared Utilities (`sing_common.py`)
+
+`sing_common.py` lives at:
+```
+Z:\kumarlab-new\Tim Leach\Scripts\Pipeline Scripts Shared Logic\
+```
+
+It is imported by `sing_pipeline_v2.py` and all three standalone scripts. It contains:
+
+- `genotype_to_symbol` — converts any raw Climb genotype string to a standard display symbol (`+/-`, `-/-`, `-/Y`, `+/+`, `Inbred`, `Blank`)
+- `combine_sample_numbers` — compresses a list of sample names into a range string (e.g. `['1000-0', '1001-1']` → `'1000-1001'`)
+- `natural_sort_key` — sort key for numeric-aware string ordering
+
+Because `sing_common.py` lives in a different folder from the scripts, each script adds that folder to `sys.path` at startup. If you move the files, update the path in the `sys.path.insert` line near the top of each script.
+
+**Two intentional duplications remain** — do not "fix" these:
+- `sing_pipeline_v2.py` has its own `genotype_to_symbol` that calls `canonicalize_genotype()`. This is separate from `sing_common`'s regex version by design — they serve different purposes in the pipeline's canonical chain.
+- `clean_genotype_base` exists in both `sing_pipeline_v2.py` and `Climb_to_Envision_Translation.py` with intentionally different behaviour (the Envision version strips zygosity word tokens; the pipeline version does not).
 
 ---
 
@@ -133,6 +158,7 @@ Indicate the current harvest type:
 - **Capacity**: Wednesday behavior sessions capped at 18 animals (`WEDNESDAY_CAPACITY` in CONFIG).
 - **Minimum group size**: P56 animals must be in groups of 3 to be scheduled. Incomplete groups go to Unschedulable unless assigned an NB type.
 - **Toe clip animals**: Excluded from P56/behavior (gait effects). Ear-notched animals used for P56.
+- **All strains**: Weighed equally against tracking sheet quota — no strains are blocked from P56 scheduling.
 
 ### Quota and Flex Slot
 - Target: 5 Male + 5 Female Perfusion per strain per timepoint
@@ -172,6 +198,22 @@ All tunable parameters live in the `CONFIG` dict near the top of the script. Key
 
 ## Version History
 
+### v2.2 — 2026-04-21 (`sing_pipeline_v2.py`)
+
+**Shared utilities**
+- Extracted `genotype_to_symbol`, `combine_sample_numbers`, and `natural_sort_key` into `sing_common.py`
+- All three standalone scripts (`Label_generator.py`, `Deliverables_Sheet_Export.py`, `Climb_to_Envision_Translation.py`) now import from `sing_common.py` — one fix propagates everywhere
+- Removed duplicate `get_starting_sample_number` definition in `sing_pipeline_v2.py` (terminal version at ~line 7308 was shadowed by GUI version; terminal version deleted)
+
+**Code quality**
+- Replaced all 18 bare `except:` clauses with `except Exception:` across all four files — `KeyboardInterrupt` and `SystemExit` no longer silently swallowed
+
+**Deliverables output**
+- Genotype column in all three tracker sheets now shows `"<Line Short> <symbol>"` (e.g. `"Mecp2 +/-"`, `"Shank3 -/-"`, `"B6J Inbred"`) instead of bare symbol
+
+**Scheduling**
+- Removed P56 behavior-complete strain list — all strains now weighed equally against tracking sheet quota
+
 ### v2.1 — 2026-04-08 (`sing_pipeline_v2.py`)
 
 **Harvest Review GUI**
@@ -192,7 +234,7 @@ All tunable parameters live in the `CONFIG` dict near the top of the script. Key
 - B6 monthly minimum enforcement disabled — managed manually
 
 **Outputs**
-- All Animals tab: all 113 animals from input file, scheduling data merged in, Assignment_Reason always populated, P14_Date shows "Too Old" where applicable
+- All Animals tab: all animals from input file, scheduling data merged in, Assignment_Reason always populated, P14_Date shows "Too Old" where applicable
 - Complete_Schedule.xlsx: removed Wednesday Capacity, Requirements Status, Strain Summary tabs — now shows only Summary, P14, P56, Genotype Excluded, All Animals
 - Lab_Data_Export.xlsx: removed Sing Harvest Sheet tab (use Harvest_Sheet_Import file instead)
 - NB animals excluded from Envision output; Envision Date shows "NB"
