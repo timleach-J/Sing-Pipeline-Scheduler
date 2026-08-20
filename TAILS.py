@@ -1,26 +1,24 @@
 # =============================================================================
-# SING Pipeline Scheduler
-# Version: 2.3.0
-# Updated: 2026-06-04
+# TAILS — Tracking Animal Inventory, Logging Shipments
+# (formerly the SING Pipeline Scheduler)
+# Version: 2.0.0
+# Updated: 2026-03-24
 #
-# Changes from v2.2:
-#   - Added Screen 1.5: Colony Rotation Review
-#       • Loads matings.csv (Climb active matings export) + births.csv
-#       • Monthly rotation formula: interval = ceil(6/N) months per unit
-#       • Bresenham pattern for N>6 (e.g. SHANK3 N=9 → 1,2,1,2,1,2 /mo)
-#       • NP rules: 90d with 0 live births; 60d since last litter (gone quiet)
-#       • Flags missing sire/dam (touring male, death, or other)
-#       • Shows breeding candidates from animals.csv (56-84d, matching genotype)
-#       • Checkboxes to reserve animals for breeding before harvest scheduling
-#       • Reserved animals excluded from harvest pool, appear as
-#         "Reserved — Breeding" in output
-#       • COMPLETING_STRAINS config list suppresses setup prompts for strains
-#         winding down (KCND3, FMR1, C3, CDKL5, CNTNAP2)
-#   - Removed births sexing schedule functionality (build_births_sexing_schedule,
-#     find_unmatched_births_enhanced, and related helpers) — Climb births export
-#     column format incompatible with previous implementation
-#   - Added CONFIG keys: INPUT_MATINGS_FILE, COLONY_ROTATION_DAYS,
-#     COLONY_NP_NO_BIRTHS_DAYS, COLONY_NP_GONE_QUIET_DAYS, COMPLETING_STRAINS
+# Changes from v1.6:
+#   - Narrowed warnings.filterwarnings — no longer silences all warnings globally
+#   - Fixed bare except clauses in auto_size_columns and _run_again queue clearing
+#   - Removed redundant `date as date_type` alias — all hints now use `date`
+#   - Removed unused `timezone` import
+#   - Removed top-level `import unittest` (lazy-loaded in test block only)
+#   - Added `Any` to typing imports
+#   - Documented unused `sex` param in get_strain_breeding_type
+#   - Replaced convoluted argsort sort with sort_values(key=...) in
+#     build_births_sexing_schedule
+#   - Simplified process_large_dataset — removed unnecessary line-count pre-pass
+#   - Vectorized filter_animals_by_use excluded record construction (no iterrows)
+#   - Added docstrings to to_date, validate_config_advanced, auto_size_columns,
+#     get_strain_breeding_type, process_large_dataset, filter_animals_by_use
+#   - Replaced len(df) == 0 checks with df.empty throughout (~30 sites)
 # =============================================================================
 import pandas as pd
 from openpyxl import Workbook
@@ -40,6 +38,20 @@ import unicodedata
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ── Support files live in lib\ ────────────────────────────────────────────────
+# sing_common.py, sing_climb*.py and sing_credentials.json belong in a "lib"
+# subfolder. The script folder itself is kept on the path as a fallback so a
+# flattened copy (everything in one folder) still runs.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LIB_DIR    = os.path.join(_SCRIPT_DIR, 'lib')
+
+# Bumped on every change — printed at startup so you can confirm which build ran.
+PIPELINE_VERSION = '2.9.4  (2026-08-20)'
+for _d in (_LIB_DIR, _SCRIPT_DIR):
+    if os.path.isdir(_d) and _d not in sys.path:
+        sys.path.insert(0, _d)
+
 from sing_common import combine_sample_numbers, natural_sort_key
 
 warnings.filterwarnings('ignore', category=pd.errors.PerformanceWarning)
@@ -82,13 +94,46 @@ except ImportError:
 # CONFIGURATION
 # ============================================================================
 CONFIG = {
+    # Before scheduling, upload any TGS genotype calls sitting in the
+    # 'genotypes' subfolder. Animals that already have that assay are skipped.
+    # Reports named in a tgs_genotype_upload_*.json receipt are skipped too —
+    # that receipt is the record of what has already been uploaded.
+    'UPLOAD_TGS_GENOTYPES': True,
+
+    # After scheduling, move Wild and Inconclusive animals out of the Sing pool
+    # to 'Available' — they can never be scheduled, so they'd sit in Sing
+    # Inventory forever. Matched on Line (Short), case-insensitive substring.
+    'RELEASE_UNUSABLE': True,
+    'RELEASE_GENOTYPES': ['Wild', 'Inconclusive'],
+    'RELEASE_EXCLUDE_LINES': ['Shank3', 'Bcl11b', 'Scn1a'],   # Scn1a = Dravet
+
+    # After harvest assignments are confirmed, set each scheduled animal's Use
+    # in Climb: P14 -> 'Sing - P14', adults -> 'Sing - P56'.
+    'UPDATE_ANIMAL_USE': True,
+
+    # Add scheduled animals to cohorts: 'P14 <harvest date>' / 'P56 <behavior
+    # date>'. Cohorts cannot be created via the API, so the run pauses and asks
+    # you to make any missing ones in Climb. Skippable.
+    'ASSIGN_COHORTS': True,
+
+    # When the Envision export is created, write the assigned RapID tags back
+    # into Climb as "<original marker>, <tag>" with marker type RapID.
+    # Only happens on a complete list — see _push_rapid_markers_to_climb.
+    'PUSH_RAPID_MARKERS_TO_CLIMB': True,
+
     'INPUT_ANIMAL_FILE': 'animals.csv',
-    'INPUT_TRACKING_FILE': 'Sing Harvest Sheet - Summary Sheet.csv',
+    'INPUT_TRACKING_FILE': 'Sing Harvest Sheet.xlsx',
     'INPUT_BIRTHS_FILE': 'births.csv',
 
-    'WEDNESDAY_CAPACITY': 18,
+    'WEDNESDAY_CAPACITY': 9999,  # Cap removed — no limit on Wednesday slots
     'CAGE_SIZE': 3,
+    # Harvest sheet auto-fill. Perfusion protocols use PFA_PER_MOUSE_ML each;
+    # the day's batch is split by PFA_MIX_RATIOS on the first row of that date.
+    'PFA_PER_MOUSE_ML': 50,
+    'PFA_MIX_RATIOS': {'Distilled Water': 0.25, '2xPBS': 0.50, '16% PFA': 0.25},
+
     'P14_VALID_DAYS': [0, 1, 2, 3, 4],  # Monday=0 through Friday=4
+    'P14_HARVEST_AGE_DAYS': 14,         # P14 harvest age — used for cohort born dates
     'P56_BEHAVIOR_START_DAY': 42,
     'P56_BEHAVIOR_END_DAY': 49,
     'P56_BEHAVIOR_DAY_OF_WEEK': 2,  # Wednesday=2
@@ -125,6 +170,9 @@ CONFIG = {
         'Genotype', 'Use', 'Status', 'Birth ID', 'Marker Type'
     ],
 
+    'REQUIRED_BIRTHS_COLUMNS': [
+        'Birth ID', 'Status', 'Birth Date', 'Live Count', '# of Pups', 'Line (Short)', 'Dam', 'Sire'
+    ],
 
     'SUPER_PRIORITY_STRAINS': [
         'ARID1B', 'CACNA1G', 'CHD8', 'CNTNAP2', 'CTCF',
@@ -169,29 +217,6 @@ CONFIG = {
     # Hom animals from these crosses get absolute highest scheduling priority
     'HETXHET_STRAINS': [
         'SHANK3',
-    ],
-
-    # ── Colony rotation (breeding) ────────────────────────────────────────────
-    # matings.csv: Climb active matings export, saved alongside animals.csv
-    # births.csv (INPUT_BIRTHS_FILE above): same file, also used for rotation
-    'INPUT_MATINGS_FILE': 'matings.csv',
-
-    # Target rotation length in days (6 months)
-    'COLONY_ROTATION_DAYS': 180,
-
-    # Non-productive (NP) retirement rules
-    'COLONY_NP_NO_BIRTHS_DAYS':   90,   # Rule 1: active >= 90d with 0 live births
-    'COLONY_NP_GONE_QUIET_DAYS':  60,   # Rule 2: had a litter, then silent >= 60d
-
-    # Strains completing their SING obligation.
-    # Retirement flags are shown but NO setup prompts are generated.
-    # Update this list as strains finish. Use the exact Line name from matings.csv.
-    'COMPLETING_STRAINS': [
-        'B6.129(FVB)-Cdkl5<tm1.1Joez>/J',
-        'B6.129S4-C3<tm1Crr>/J',
-        'B6J-Cntnap2-/-',
-        'B6J-Fmr1 -/- (X chr)',
-        'B6NJ-Kcnd3-/- Cyfip2-S968F<J> Hom Breed Well',
     ],
 }
 
@@ -340,12 +365,17 @@ GENOTYPE_HET    = 'Het'
 GENOTYPE_HOM    = 'Hom'
 GENOTYPE_HEMI   = 'Hemi'
 GENOTYPE_INBRED = 'Inbred'
-GENOTYPE_BLANK  = 'Blank'
+GENOTYPE_BLANK  = 'Blank'           # never genotyped — no record exists
+GENOTYPE_INCONC = 'Inconclusive'    # genotyped, but the assay gave no usable call
 
 _CANONICAL_GENOTYPES = frozenset([
     GENOTYPE_WILD, GENOTYPE_HET, GENOTYPE_HOM,
-    GENOTYPE_HEMI, GENOTYPE_INBRED, GENOTYPE_BLANK
+    GENOTYPE_HEMI, GENOTYPE_INBRED, GENOTYPE_BLANK,
+    GENOTYPE_INCONC,
 ])
+
+# Neither can be scheduled — both need a genotype before the animal is usable.
+_NEEDS_GENOTYPE = frozenset([GENOTYPE_BLANK, GENOTYPE_INCONC])
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -405,8 +435,11 @@ def normalize_genotype(genotype: str) -> str:
 
 def canonicalize_genotype(genotype, strain: str = '') -> str:
     """
-    Normalize any genotype string to one of six canonical labels:
-      Wild, Het, Hom, Hemi, Inbred, Blank
+    Normalize any genotype string to one of seven canonical labels:
+      Wild, Het, Hom, Hemi, Inbred, Blank, Inconclusive
+
+    Blank        = no genotype on record
+    Inconclusive = genotyped, but the assay returned no usable call
     """
     if isinstance(genotype, str) and genotype in _CANONICAL_GENOTYPES:
         return genotype
@@ -430,9 +463,10 @@ def canonicalize_genotype(genotype, strain: str = '') -> str:
     geno_norm = normalize_genotype(geno_str)
     gl = geno_norm.lower()
 
-    if any(kw in gl for kw in ('inconclusive', 'pending', 'regenotype',
-                                'failed', 'no call', 'tbd')):
-        return GENOTYPE_BLANK
+    # 'Inconclusive' is the only no-call value in Climb's genotypeSymbol
+    # vocabulary (key 11), so that's all we need to match.
+    if 'inconclusive' in gl:
+        return GENOTYPE_INCONC
 
     hemi_patterns = [
         r'hem[i]?', r'tg/\+', r'\+/tg', r'tg/-', r'-/y', r'[a-z]/y',
@@ -750,6 +784,14 @@ def validate_animal_file(df: pd.DataFrame) -> bool:
     return True
 
 
+def validate_births_file(df: pd.DataFrame) -> bool:
+    core_required = ['Birth ID', 'Status', 'Birth Date']
+    missing_core = [col for col in core_required if col not in df.columns]
+    if missing_core:
+        raise DataValidationError(f"Missing required columns in births file: {missing_core}")
+    return True
+
+
 def process_large_dataset(animal_file: str, chunk_size: int = None) -> pd.DataFrame:
     """Read animal CSV and filter to alive animals only.
 
@@ -785,12 +827,35 @@ def read_animal_data(filename: str) -> pd.DataFrame:
     return df
 
 
+def read_births_data(filename: str) -> Optional[pd.DataFrame]:
+    if filename is None or not os.path.exists(filename):
+        logger.warning(f"Births file not found: {filename}")
+        return None
+    try:
+        df = pd.read_csv(filename)
+    except Exception as e:
+        logger.warning(f"Error reading births file: {e}")
+        return None
+    try:
+        validate_births_file(df)
+    except DataValidationError as e:
+        logger.warning(f"{e}")
+        return None
+    df['Birth Date'] = pd.to_datetime(df['Birth Date'], errors='coerce')
+    df['Birth ID'] = df['Birth ID'].astype(str)
+    logger.info(f"Loaded {len(df)} birth records")
+    return df
+
+
 def read_tracking_data(filename: str) -> Optional[pd.DataFrame]:
     if filename is None or not os.path.exists(filename):
         logger.warning(f"Tracking file not found: {filename}")
         return None
     try:
-        df = pd.read_csv(filename)
+        if filename.lower().endswith('.xlsx'):
+            df = pd.read_excel(filename, sheet_name='Summary Sheet')
+        else:
+            df = pd.read_csv(filename)
         logger.info(f"Loaded tracking file: {len(df)} rows")
         return df
     except Exception as e:
@@ -849,6 +914,436 @@ def diagnose_animal_file(df: pd.DataFrame) -> None:
 
 # ============================================================================
 # BIRTHS ANALYSIS
+# ============================================================================
+
+def calculate_sexing_date(birth_date: Union[date, datetime, pd.Timestamp]) -> Optional[date]:
+    bd = to_date(birth_date)
+    if bd is None:
+        return None
+    return bd + timedelta(days=CONFIG['SEXING_OFFSET_DAYS'])
+
+
+def build_births_sexing_schedule(
+    births_df: pd.DataFrame,
+    animals_df: Optional[pd.DataFrame] = None
+) -> pd.DataFrame:
+    """
+    Build a sexing schedule for births that have not yet been sexed.
+    Any Birth ID that already has animals in animals_df is excluded.
+    """
+    if births_df is None or births_df.empty:
+        return pd.DataFrame()
+
+    today = datetime.now().date()
+
+    sing = births_df[
+        births_df['Status'].str.contains('Sing Inventory', na=False, case=False)
+    ].copy()
+
+    if sing.empty:
+        return pd.DataFrame()
+
+    already_sexed_birth_ids = set()
+    if animals_df is not None and len(animals_df) > 0 and 'Birth ID' in animals_df.columns:
+        already_sexed_birth_ids = set(
+            animals_df['Birth ID'].astype(str).unique()
+        )
+        logger.info(
+            f"build_births_sexing_schedule: {len(already_sexed_birth_ids)} "
+            f"Birth IDs already have animals entered (already sexed)"
+        )
+
+    rows = []
+    skipped_already_sexed = 0
+
+    for _, birth in sing.iterrows():
+        birth_id = str(birth.get('Birth ID', 'N/A'))
+
+        if birth_id in already_sexed_birth_ids:
+            skipped_already_sexed += 1
+            continue
+
+        birth_date_obj = to_date(birth['Birth Date'])
+        strain = birth.get('Line (Short)', 'N/A')
+        dam = birth.get('Dam', 'N/A')
+        sire = birth.get('Sire', 'N/A')
+        num_pups = birth.get('# of Pups', birth.get('Live Count', 'N/A'))
+
+        if birth_date_obj is None:
+            rows.append({
+                'Birth_ID': birth_id,
+                'Strain': strain if pd.notna(strain) else 'N/A',
+                'Dam': dam if pd.notna(dam) else 'N/A',
+                'Sire': sire if pd.notna(sire) else 'N/A',
+                'Birth_Date': 'N/A',
+                'Num_Pups': num_pups if pd.notna(num_pups) else 'N/A',
+                'Sexing_Date': 'N/A',
+                'Day_of_Week': 'N/A',
+                'Days_Until_Sexing': 'N/A',
+                'Sexing_Status': '❓ Unknown — No birth date',
+                'P14_Expected_Date': 'N/A',
+                'P14_Day_of_Week': 'N/A',
+            })
+            continue
+
+        sexing_date = birth_date_obj + timedelta(days=CONFIG['SEXING_OFFSET_DAYS'])
+        p14_date = birth_date_obj + timedelta(days=P14_OFFSET_DAYS)
+        days_until = (sexing_date - today).days
+
+        if days_until < 0:
+            status = f'✅ Done (was {sexing_date.strftime("%Y-%m-%d")})'
+        elif days_until == 0:
+            status = '🔴 TODAY — Sex pups now!'
+        elif days_until == 1:
+            status = '🟠 TOMORROW — Prepare'
+        elif days_until <= 3:
+            status = f'🟡 SOON — {days_until} days'
+        else:
+            status = f'🟢 Upcoming — {days_until} days'
+
+        rows.append({
+            'Birth_ID': birth_id,
+            'Strain': strain if pd.notna(strain) else 'N/A',
+            'Dam': dam if pd.notna(dam) else 'N/A',
+            'Sire': sire if pd.notna(sire) else 'N/A',
+            'Birth_Date': birth_date_obj.strftime('%Y-%m-%d'),
+            'Num_Pups': int(num_pups) if pd.notna(num_pups) else 'N/A',
+            'Sexing_Date': sexing_date.strftime('%Y-%m-%d'),
+            'Day_of_Week': sexing_date.strftime('%A'),
+            'Days_Until_Sexing': days_until,
+            'Sexing_Status': status,
+            'P14_Expected_Date': p14_date.strftime('%Y-%m-%d'),
+            'P14_Day_of_Week': p14_date.strftime('%A'),
+        })
+
+    if skipped_already_sexed > 0:
+        logger.info(
+            f"build_births_sexing_schedule: skipped {skipped_already_sexed} "
+            f"births already sexed (animals entered in system)"
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    def _sexing_sort_key(val: Any) -> tuple:
+        """Sort key: upcoming dates first (asc), then past dates, then unknowns."""
+        if isinstance(val, int):
+            return (0 if val >= 0 else 1, val if val >= 0 else -val)
+        return (2, 0)
+
+    df = df.sort_values(
+        by='Days_Until_Sexing',
+        key=lambda col: col.map(_sexing_sort_key)
+    )
+    df = df.reset_index(drop=True)
+    return df
+
+
+def analyze_birth_scheduling_potential(birth: pd.Series, requirements: Dict,
+                                       remaining_needs: Dict, today: date) -> Dict:
+    birth_date = birth['Birth Date']
+    if pd.isna(birth_date):
+        return {
+            'P14_Potential': 'Unknown', 'P14_Reason': 'No birth date',
+            'P14_Expected_Date': 'N/A', 'P14_Day_of_Week': 'N/A',
+            'P56_Potential': 'Unknown', 'P56_Reason': 'No birth date',
+            'P56_Expected_Behavior_Date': 'N/A', 'P56_Expected_Harvest_Date': 'N/A',
+            'Quota_Status': 'Unknown', 'Priority_Strain': 'Unknown', 'Age_Today_Days': 'N/A',
+            'Sexing_Date': 'N/A', 'Sexing_Day_of_Week': 'N/A',
+        }
+
+    birth_date_obj = to_date(birth_date)
+    strain = birth.get('Line (Short)', '')
+
+    if birth_date_obj is None:
+        return {
+            'P14_Potential': 'Unknown', 'P14_Reason': 'Invalid birth date',
+            'P14_Expected_Date': 'N/A', 'P14_Day_of_Week': 'N/A',
+            'P56_Potential': 'Unknown', 'P56_Reason': 'Invalid birth date',
+            'P56_Expected_Behavior_Date': 'N/A', 'P56_Expected_Harvest_Date': 'N/A',
+            'Quota_Status': 'Unknown',
+            'Priority_Strain': 'YES' if is_priority_strain(strain) else 'No',
+            'Age_Today_Days': 'N/A', 'Sexing_Date': 'N/A', 'Sexing_Day_of_Week': 'N/A',
+        }
+
+    dates = calculate_schedule_dates(birth_date_obj)
+
+    if dates is None:
+        return {
+            'P14_Potential': 'Unknown', 'P14_Reason': 'Invalid birth date',
+            'P14_Expected_Date': 'N/A', 'P14_Day_of_Week': 'N/A',
+            'P56_Potential': 'Unknown', 'P56_Reason': 'Invalid birth date',
+            'P56_Expected_Behavior_Date': 'N/A', 'P56_Expected_Harvest_Date': 'N/A',
+            'Quota_Status': 'Unknown',
+            'Priority_Strain': 'YES' if is_priority_strain(strain) else 'No',
+            'Age_Today_Days': 'N/A', 'Sexing_Date': 'N/A', 'Sexing_Day_of_Week': 'N/A',
+        }
+
+    p14_harvest = dates['p14_harvest']
+    behavior_window_start = dates['p56_behavior_window_start']
+    behavior_window_end = dates['p56_behavior_window_end']
+    sexing_date = dates['sexing_date']
+
+    p14_valid = is_valid_p14_day(p14_harvest)
+    p14_in_future = p14_harvest > today
+
+    if not p14_in_future:
+        p14_potential = 'Past'
+        if p14_harvest == today:
+            p14_reason = f'P14 date is today ({p14_harvest}) — too late to schedule'
+        else:
+            p14_reason = f'P14 date ({p14_harvest}) has passed'
+    elif not p14_valid:
+        p14_potential = 'No'
+        p14_reason = f'P14 falls on {p14_harvest.strftime("%A")} (invalid day)'
+    else:
+        p14_potential = 'Yes'
+        p14_reason = f'Could schedule on {p14_harvest.strftime("%A, %Y-%m-%d")}'
+
+    first_wednesday = next_wednesday(behavior_window_start)
+    p56_harvest_date = None
+
+    if first_wednesday is None:
+        p56_potential = 'No'
+        p56_reason = 'Cannot calculate P56 behavior date'
+    elif first_wednesday > behavior_window_end:
+        p56_potential = 'No'
+        p56_reason = 'No Wednesday in P42-49 window'
+    elif first_wednesday < today:
+        p56_potential = 'Past'
+        p56_reason = f'P56 window ({first_wednesday}) has passed'
+    else:
+        p56_potential = 'Yes'
+        p56_reason = f'Could schedule behavior on {first_wednesday.strftime("%A, %Y-%m-%d")}'
+        p56_harvest_date = first_wednesday + timedelta(days=P56_HARVEST_OFFSET_FROM_BEHAVIOR)
+
+    quota_status = 'Unknown'
+    quota_details = []
+    is_priority = is_priority_strain(strain)
+
+    if remaining_needs and pd.notna(strain):
+        strain_key = str(strain).strip().upper()
+        if strain_key in remaining_needs:
+            p14_needs = remaining_needs[strain_key]['P14']
+            p56_needs = remaining_needs[strain_key]['P56']
+            for timepoint, needs_dict in [('P14', p14_needs), ('P56', p56_needs)]:
+                for sex in ['Male', 'Female']:
+                    total = sum(needs_dict[sex][ht]['needed'] for ht in ['Perfusion', 'MERFISH', 'RNAseq'])
+                    if total > 0:
+                        quota_details.append(f"{timepoint} {sex}: {total} needed")
+            quota_status = 'NEEDED - ' + '; '.join(quota_details) if quota_details else 'Quota Complete'
+        else:
+            quota_status = 'Not tracked in requirements'
+
+    age_days = (today - birth_date_obj).days
+
+    return {
+        'P14_Potential': p14_potential,
+        'P14_Reason': p14_reason,
+        'P14_Expected_Date': p14_harvest.strftime('%Y-%m-%d'),
+        'P14_Day_of_Week': p14_harvest.strftime('%A'),
+        'P56_Potential': p56_potential,
+        'P56_Reason': p56_reason,
+        'P56_Expected_Behavior_Date': first_wednesday.strftime('%Y-%m-%d') if p56_potential != 'No' and first_wednesday else 'N/A',
+        'P56_Expected_Harvest_Date': p56_harvest_date.strftime('%Y-%m-%d') if p56_harvest_date else 'N/A',
+        'Quota_Status': quota_status,
+        'Priority_Strain': 'YES' if is_priority else 'No',
+        'Age_Today_Days': age_days,
+        'Sexing_Date': sexing_date.strftime('%Y-%m-%d') if sexing_date else 'N/A',
+        'Sexing_Day_of_Week': sexing_date.strftime('%A') if sexing_date else 'N/A',
+    }
+
+
+def estimate_expected_animals(birth: pd.Series) -> Dict:
+    num_pups = None
+    count_source = 'No count field'
+
+    if 'Live Count' in birth.index:
+        num_pups = birth.get('Live Count', None)
+        if pd.notna(num_pups):
+            count_source = 'Live Count'
+
+    if num_pups is None and '# of Pups' in birth.index:
+        num_pups = birth.get('# of Pups', None)
+        if pd.notna(num_pups):
+            count_source = '# of Pups'
+
+    strain = birth.get('Line (Short)', '')
+    breeding_type = get_strain_breeding_type(strain)
+
+    if pd.isna(num_pups):
+        return {
+            'Expected_Total_Born': 'Unknown', 'Expected_Usable': 'Unknown',
+            'Expected_Usable_Males': 'Unknown', 'Expected_Usable_Females': 'Unknown',
+            'Breeding_Type': breeding_type,
+            'Estimation_Note': 'No pup count in birth record'
+        }
+
+    try:
+        total_pups = int(num_pups)
+    except (ValueError, TypeError):
+        return {
+            'Expected_Total_Born': 'Unknown', 'Expected_Usable': 'Unknown',
+            'Expected_Usable_Males': 'Unknown', 'Expected_Usable_Females': 'Unknown',
+            'Breeding_Type': breeding_type,
+            'Estimation_Note': f'Invalid pup count: {num_pups}'
+        }
+
+    if breeding_type == 'Half':
+        expected_usable = total_pups // 2
+        expected_usable_males = expected_usable // 2
+        expected_usable_females = expected_usable - expected_usable_males
+        note = f'Het×WT: ~50% usable ({expected_usable} of {total_pups}) [from {count_source}]'
+    elif breeding_type == 'All':
+        expected_usable = total_pups
+        expected_usable_males = total_pups // 2
+        expected_usable_females = total_pups - expected_usable_males
+        note = f'Hom×Hom: All usable ({expected_usable} of {total_pups}) [from {count_source}]'
+    else:
+        expected_usable = total_pups // 2
+        expected_usable_males = expected_usable // 2
+        expected_usable_females = expected_usable - expected_usable_males
+        note = f'Unknown strain: Het×WT cross — ~50%) [from {count_source}]'
+
+    return {
+        'Expected_Total_Born': total_pups,
+        'Expected_Usable': expected_usable,
+        'Expected_Usable_Males': f'~{expected_usable_males}',
+        'Expected_Usable_Females': f'~{expected_usable_females}',
+        'Breeding_Type': breeding_type,
+        'Estimation_Note': note
+    }
+
+
+def determine_action_required(potential: Dict, expectations: Dict, age_days) -> str:
+    actions = []
+    if potential['P14_Potential'] == 'Yes' or potential['P56_Potential'] == 'Yes':
+        actions.append('🔍 VERIFY animals exist and have correct Birth ID')
+        if potential['Quota_Status'].startswith('NEEDED'):
+            actions.append('⚠️ URGENT: Quota needs exist - locate animals immediately')
+    if age_days is not None and age_days != 'N/A':
+        if age_days > 56:
+            actions.append('❌ Too old for P56 - consider P14 retrospective or exclude')
+        elif age_days > 49:
+            actions.append('⏰ P56 window closing - urgent genotyping needed')
+        elif age_days >= 42:
+            actions.append('📋 P56 window open - genotype and schedule behavior')
+        elif age_days > 14:
+            actions.append('⏰ P14 window passed - plan for P56')
+        elif age_days >= 10:
+            actions.append('📋 Genotype for P14 scheduling')
+        else:
+            actions.append('⏳ Monitor - too young for scheduling')
+    if expectations.get('Expected_Total_Born') == 0:
+        actions.append('ℹ️ Birth shows 0 pups - verify and update status')
+    if not actions:
+        actions.append('📧 Contact lab manager for clarification')
+    return ' | '.join(actions)
+
+
+def find_unmatched_births_enhanced(births_df: Optional[pd.DataFrame], animals_df: pd.DataFrame,
+                                    requirements: Dict, remaining_needs: Dict) -> pd.DataFrame:
+    if births_df is None or births_df.empty:
+        return pd.DataFrame()
+
+    today = datetime.now().date()
+    logger.info("Analyzing unmatched births...")
+
+    sing_inventory_births = births_df[
+        births_df['Status'].str.contains('Sing Inventory', na=False, case=False)
+    ].copy()
+
+    if sing_inventory_births.empty:
+        return pd.DataFrame()
+
+    animal_birth_ids = set(animals_df['Birth ID'].astype(str).unique())
+    unmatched_births = []
+
+    for idx, birth in sing_inventory_births.iterrows():
+        birth_id = str(birth['Birth ID'])
+        if birth_id == 'nan' or birth_id.strip() == '':
+            continue
+        if birth_id not in animal_birth_ids:
+            birth_date = birth['Birth Date']
+            birth_date_str = to_date(birth_date).strftime('%Y-%m-%d') if pd.notna(birth_date) else 'N/A'
+            strain = birth.get('Line (Short)', 'N/A')
+            dam = birth.get('Dam', 'N/A')
+            sire = birth.get('Sire', 'N/A')
+            num_pups = birth.get('# of Pups', 'N/A')
+
+            potential = analyze_birth_scheduling_potential(birth, requirements, remaining_needs, today)
+            expectations = estimate_expected_animals(birth)
+            age_days = potential.get('Age_Today_Days', 'N/A')
+
+            if age_days != 'N/A':
+                if age_days > 56:
+                    urgency = '🔴 URGENT - Past P56'
+                elif age_days > 42:
+                    urgency = '🟡 HIGH - In P56 window'
+                elif age_days > 14:
+                    urgency = '🟢 MEDIUM - Past P14'
+                elif age_days >= 10:
+                    urgency = '🟢 LOW - Approaching P14'
+                else:
+                    urgency = '⚪ INFO - Too young'
+            else:
+                urgency = '❓ UNKNOWN - No birth date'
+
+            possible_reasons = []
+            if pd.notna(num_pups) and num_pups == 0:
+                possible_reasons.append('Birth record shows 0 pups')
+            elif pd.notna(birth_date) and age_days != 'N/A' and age_days < 5:
+                possible_reasons.append('Birth too recent - animals may not be entered yet')
+            else:
+                possible_reasons.append('Animals not found/entered in Climb')
+                possible_reasons.append('Animals may have been culled')
+                possible_reasons.append('Birth ID mismatch possible')
+
+            unmatched_births.append({
+                'Urgency': urgency,
+                'Birth_ID': birth_id,
+                'Birth_Date': birth_date_str,
+                'Age_Days': age_days,
+                'Strain': strain if pd.notna(strain) else 'N/A',
+                'Priority_Strain': potential.get('Priority_Strain', 'Unknown'),
+                'Dam': dam if pd.notna(dam) else 'N/A',
+                'Sire': sire if pd.notna(sire) else 'N/A',
+                'Num_Pups_Recorded': num_pups if pd.notna(num_pups) else 'N/A',
+                'Status': birth['Status'],
+                **expectations,
+                'Sexing_Date': potential.get('Sexing_Date', 'N/A'),
+                'Sexing_Day_of_Week': potential.get('Sexing_Day_of_Week', 'N/A'),
+                'P14_Potential': potential['P14_Potential'],
+                'P14_Expected_Date': potential['P14_Expected_Date'],
+                'P14_Day_of_Week': potential['P14_Day_of_Week'],
+                'P14_Analysis': potential['P14_Reason'],
+                'P56_Potential': potential['P56_Potential'],
+                'P56_Expected_Behavior_Date': potential['P56_Expected_Behavior_Date'],
+                'P56_Expected_Harvest_Date': potential['P56_Expected_Harvest_Date'],
+                'P56_Analysis': potential['P56_Reason'],
+                'Quota_Status': potential['Quota_Status'],
+                'Possible_Reasons': ' | '.join(possible_reasons),
+                'Action_Required': determine_action_required(potential, expectations, age_days)
+            })
+
+    unmatched_df = pd.DataFrame(unmatched_births)
+
+    if len(unmatched_df) > 0:
+        urgency_order = {
+            '🔴 URGENT - Past P56': 0, '🟡 HIGH - In P56 window': 1,
+            '🟢 MEDIUM - Past P14': 2, '🟢 LOW - Approaching P14': 3,
+            '⚪ INFO - Too young': 4, '❓ UNKNOWN - No birth date': 5
+        }
+        unmatched_df['_urgency_sort'] = unmatched_df['Urgency'].map(urgency_order)
+        unmatched_df = unmatched_df.sort_values(['_urgency_sort', 'Birth_Date'])
+        unmatched_df = unmatched_df.drop(columns=['_urgency_sort'])
+
+    return unmatched_df
+
+
+# ============================================================================
+# REQUIREMENTS PARSING
 # ============================================================================
 
 def parse_requirements(tracking_df: Optional[pd.DataFrame]) -> Dict:
@@ -996,7 +1491,7 @@ def filter_animals_by_use(animals_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     if 'Use' not in animals_df.columns:
         return animals_df, pd.DataFrame()
 
-    mask = animals_df['Use'].str.contains('Sing Inventory', na=False, case=False)
+    mask = animals_df['Use'].str.strip().str.lower() == 'sing inventory'
     filtered = animals_df[mask].copy()
     excluded = animals_df[~mask].copy()
 
@@ -1049,7 +1544,7 @@ def filter_animals_by_genotype_first_pass(
         strain = row.get('Line (Short)', '')
         name   = row.get('Name', 'Unknown')
 
-        if geno == GENOTYPE_BLANK:
+        if geno in _NEEDS_GENOTYPE:
             blank_records.append(row)
             keep_mask.append(False)
 
@@ -1526,8 +2021,12 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                     perf_m = remaining_needs[strain_key_flex]['P56']['Male']['Perfusion']
                     perf_f = remaining_needs[strain_key_flex]['P56']['Female']['Perfusion']
                     total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
-                    total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
-                    already_over = total_completed >= total_target
+                    total_target    = perf_m.get('target', 5)    + perf_f.get('target', 5)
+                    # Flex is used if total meets the +1 cap, OR if either sex already
+                    # exceeds its per-sex base target (meaning the flex went to that sex)
+                    male_over   = perf_m.get('completed', 0) > perf_m.get('target', 5)
+                    female_over = perf_f.get('completed', 0) > perf_f.get('target', 5)
+                    already_over = total_completed >= (total_target + 1) or male_over or female_over
                 # Allow flex only if not B6, not already over, and not yet used this run
                 if (strain_key_flex not in _B6_STRAINS_UPPER
                         and not already_over
@@ -1552,6 +2051,18 @@ def assign_animals_smart(eligibility_df: pd.DataFrame, remaining_needs: Dict) ->
                 continue
 
             num_complete_groups = len(animals) // CONFIG['CAGE_SIZE']
+
+            # Batch-effect guard: only ONE cage of a given strain + sex + age may
+            # run in a behavior round. A second cage matching all three is a
+            # confound, so cap at one. The first cage survives; the rest fall into
+            # `leftover` below, become Unschedulable, and are released to
+            # 'Available' in Climb by release_unusable_to_available().
+            # 3 males and 3 females of the same age is fine — different sex.
+            if num_complete_groups > 1:
+                print(f"    Batch-effect cap: {strain} {sex} had "
+                      f"{num_complete_groups} cages this round — keeping 1, "
+                      f"releasing {(num_complete_groups - 1) * CONFIG['CAGE_SIZE']} to Available")
+                num_complete_groups = 1
 
             strain_key = str(strain).strip().upper()
             if remaining_needs and strain_key in remaining_needs and strain_key not in _B6_STRAINS_UPPER:
@@ -2162,14 +2673,23 @@ def _compute_auto_types(schedulable_df, remaining_needs):
                 perf_f = working[strain_key][timepoint]['Female']['Perfusion']
                 total_completed = perf_m.get('completed', 0) + perf_f.get('completed', 0)
                 total_target = perf_m.get('target', 5) + perf_f.get('target', 5)
-                already_over = total_completed >= total_target
+                # Flex is consumed only when the +1 cap is met, or when one sex
+                # has already gone past its base target (i.e. the flex went there).
+                # 5M + 5F leaves the flex OPEN — neither sex is at 6 yet.
+                # Must match the rule in create_p56_schedule; they disagreed before.
+                male_over   = perf_m.get('completed', 0) > perf_m.get('target', 5)
+                female_over = perf_f.get('completed', 0) > perf_f.get('target', 5)
+                already_over = (total_completed >= (total_target + 1)
+                                or male_over or female_over)
             if not already_over and not flex_used.get(flex_key, False):
                 flex_used[flex_key] = True
                 base = 'Perfusion'  # flex slot
             else:
                 base = 'Extra'
 
-        result[name] = f'{base} NB' if nb_flag and base != 'Extra' else base
+        # Extras follow the pen: if no animal in the group gets behavior,
+        # everything in it is NB — including the Extras ('Extra NB').
+        result[name] = f'{base} NB' if nb_flag else base
 
     return result
 
@@ -2273,6 +2793,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         'NB Perfusion':     '#a8d5b5',
         'NB MERFISH':       '#7ab8f5',
         'NB RNAseq':        '#f5d76e',
+        'NB Extra':         '#d9bce8',
         'Do Not Schedule':  '#f8d7da',
     }
 
@@ -2288,6 +2809,7 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         'P56 RNAseq':      'RNAseq',
         'NB RNAseq':       'RNAseq NB',
         'Extra':           'Extra',
+        'NB Extra':        'Extra NB',
         'Do Not Schedule': 'Do Not Schedule',
     }
 
@@ -2350,6 +2872,8 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
             for t in available:
                 options.append(f'NB {t}')
 
+        if nb_flag and timepoint == 'P56':
+            options += ['NB Extra']
         options += ['Extra', 'Do Not Schedule']
         return options
 
@@ -2451,11 +2975,12 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
         canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
     canvas.bind_all('<MouseWheel>', _on_mousewheel)
 
-    # Sort: by timepoint then harvest date then strain then name
+    # Sort: timepoint → date → strain → sex → name (keeps housing groups together)
     def _harvest_sort_key(row):
-        tp = str(row.get('Assigned_Timepoint', ''))
-        d  = str(row.get('P14_Date' if tp == 'P14' else 'P56_Harvest_Date', '') or '')
-        return (tp, d, str(row.get('Strain', '')), str(row.get('Animal_Name', '')))
+        tp  = str(row.get('Assigned_Timepoint', ''))
+        d   = str(row.get('P14_Date' if tp == 'P14' else 'P56_Harvest_Date', '') or '')
+        sex = str(row.get('Sex', ''))
+        return (tp, d, str(row.get('Strain', '')), sex, str(row.get('Animal_Name', '')))
 
     sorted_rows = sorted(schedulable.to_dict('records'), key=_harvest_sort_key)
 
@@ -2748,33 +3273,6 @@ def prompt_harvest_assignments_gui(assignments_df, remaining_needs, prior_select
             if birth_id not in birth_groups:
                 birth_groups[birth_id] = []
             birth_groups[birth_id].append((name, htype))
-
-        incomplete_groups = []
-        for birth_id, animals in birth_groups.items():
-            # NB types don't need a group of 3 — exclude from this check
-            active = [a for a in animals
-                      if a[1] not in ('Do Not Schedule',)
-                      and not str(a[1]).endswith(' NB')]
-            if 0 < len(active) < CONFIG['CAGE_SIZE']:
-                strain = str(df_map.get(animals[0][0], {}).get('Strain', '')).strip()
-                incomplete_groups.append(
-                    f"  Birth {birth_id} ({strain}): {len(active)} of {CONFIG['CAGE_SIZE']} animals active"
-                )
-
-        if incomplete_groups:
-            lines = '\n'.join(incomplete_groups[:8])
-            if len(incomplete_groups) > 8:
-                lines += f"\n  ... and {len(incomplete_groups) - 8} more"
-            proceed = messagebox.askyesno(
-                "Incomplete Cage Groups",
-                f"The following P56 cage groups have fewer than {CONFIG['CAGE_SIZE']} animals\n"
-                f"(counting Harvest + Extra, excluding Do Not Schedule):\n\n"
-                f"{lines}\n\n"
-                f"Proceed anyway?",
-                icon='warning'
-            )
-            if not proceed:
-                return
 
         confirmed['result'] = current
         root.destroy()
@@ -3717,14 +4215,23 @@ def parse_unschedulable_reason(reason) -> Dict:
             'Detail':          r,
         }
 
-    # ── Blank / inconclusive genotype — check BEFORE wild ────────────────────
+    # ── Inconclusive genotype — Climb's no-call symbol ───────────────────────
+    if r == GENOTYPE_INCONC or 'inconclusive' in rl:
+        return {
+            'Primary_Reason':  '\U0001f9ec Inconclusive Genotype \u2014 Released to Available',
+            'P14_Status':      '\U0001f9ec Released',
+            'P56_Status':      '\U0001f9ec Released',
+            'Too_Old_For_P14': too_old_p14,
+            'Too_Old_For_P56': too_old_p56,
+            'Unusable_Both':   unusable_both,
+            'Detail':          r,
+        }
+
+    # ── Blank genotype — never genotyped — check BEFORE wild ─────────────────
     _blank_reason_indicators = (
         r == GENOTYPE_BLANK,
-        'inconclusive' in rl,
-        'pending' in rl,
         rl == 'blank',
         r.startswith('Blank'),
-        'regenotype' in rl,
         'no genotype' in rl,
         'genotype not available' in rl,
         "'half' strain" in rl and 'blank genotype' in rl,
@@ -3733,9 +4240,9 @@ def parse_unschedulable_reason(reason) -> Dict:
         'blank genotype' in rl,
     )
     if any(_blank_reason_indicators):
-        primary    = '🧬 Blank / Inconclusive Genotype — Regenotype Needed'
-        p14_status = '🧬 Regenotype'
-        p56_status = '🧬 Regenotype'
+        primary    = '\U0001f9ec Blank Genotype \u2014 Genotype Needed'
+        p14_status = '\U0001f9ec Genotype'
+        p56_status = '\U0001f9ec Genotype'
         return {
             'Primary_Reason':  primary,
             'P14_Status':      p14_status,
@@ -4261,8 +4768,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
                              birth_date_end: Optional[date] = None,
                              behavior_date_start: Optional[date] = None,
                              behavior_date_end: Optional[date] = None,
-                             full_behavior_dates: Optional[List[date]] = None,
-                             breeding_reserves: Optional[set] = None) -> str:
+                             full_behavior_dates: Optional[List[date]] = None) -> str:
     logger.info("=" * 70)
     logger.info("COMPREHENSIVE ANIMAL SCHEDULER")
     logger.info("=" * 70)
@@ -4280,17 +4786,9 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     # Read data
     animals_df = read_animal_data(animal_file)
     total_alive_count = len(animals_df)
-    animals_df_raw = animals_df.copy()
-
-    # Remove breeding-reserved animals before scheduling
-    if breeding_reserves:
-        _res = {str(n) for n in breeding_reserves}
-        _mask = animals_df['Name'].astype(str).isin(_res)
-        animals_df = animals_df[~_mask].copy()
-        print(f'  \U0001F42D {_mask.sum()} animal(s) reserved for breeding '
-              f'\u2014 excluded from harvest scheduling.')
 
     tracking_df = read_tracking_data(tracking_file) if tracking_file else None
+    births_df = read_births_data(births_file) if births_file else None
 
     print(f"\nTotal alive animals loaded: {total_alive_count:,}")
 
@@ -4300,7 +4798,7 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     requirements = parse_requirements(tracking_df)
     remaining_needs = calculate_remaining_needs(requirements)
 
-    # Animal filtering
+    # Animal filtering — apply Use filter first so animals_df_raw is Sing Inventory only
     print("\n" + "=" * 70)
     print("ANIMAL FILTERING")
     print("=" * 70)
@@ -4311,6 +4809,32 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         print("  ⚠️  ALL animals were excluded by the Use filter.")
         print("  Check the 'Use' column values in your CSV.")
 
+    # Capture raw Sing Inventory animals — used for All Animals output and births sexing
+    animals_df_raw = animals_df.copy()
+
+    # Births analysis
+    print("\n" + "=" * 70)
+    print("BIRTHS ANALYSIS")
+    print("=" * 70)
+
+    sexing_schedule_df = pd.DataFrame()
+    if births_df is not None:
+        sexing_schedule_df = build_births_sexing_schedule(births_df, animals_df_raw)
+        upcoming = (
+            sexing_schedule_df[
+                sexing_schedule_df['Days_Until_Sexing'].apply(
+                    lambda x: isinstance(x, int) and 0 <= x <= 7
+                )
+            ] if len(sexing_schedule_df) > 0 else pd.DataFrame()
+        )
+        print(f"  Births needing sexing (not yet entered): {len(sexing_schedule_df)}")
+        if len(upcoming) > 0:
+            print(f"  ⚠️  {len(upcoming)} litter(s) need sexing within the next 7 days!")
+
+    unmatched_births_df = find_unmatched_births_enhanced(
+        births_df, animals_df, requirements, remaining_needs
+    )
+
     no_geno_strains = frozenset(
         k for k, v in requirements.items() if not v.get('genotyped', True)
     )
@@ -4319,7 +4843,13 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
     )
     print(f"After genotype first pass:     {len(animals_df):,} animals remain")
     print(f"  Excluded (Wild, Cre-only Wild, Inconclusive): {len(genotype_excluded_pass1)}")
-    print(f"  Blank genotypes (pending 2nd pass):           {len(blank_genotypes)}")
+    if len(blank_genotypes) > 0 and 'Genotype' in blank_genotypes.columns:
+        _n_inconc = int((blank_genotypes['Genotype'] == GENOTYPE_INCONC).sum())
+        _n_blank  = len(blank_genotypes) - _n_inconc
+        print(f"  Blank genotypes (pending 2nd pass):           {_n_blank}")
+        print(f"  Inconclusive genotypes (released):            {_n_inconc}")
+    else:
+        print(f"  Blank genotypes (pending 2nd pass):           {len(blank_genotypes)}")
     if animals_df.empty:
         print("  ⚠️  ALL animals were excluded by genotype filtering.")
 
@@ -4482,6 +5012,31 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         else 0
     )
 
+    unmatched_p14_count = (
+        len(unmatched_births_df[unmatched_births_df['P14_Potential'] == 'Yes'])
+        if len(unmatched_births_df) > 0 and 'P14_Potential' in unmatched_births_df.columns else 0
+    )
+    unmatched_p56_count = (
+        len(unmatched_births_df[unmatched_births_df['P56_Potential'] == 'Yes'])
+        if len(unmatched_births_df) > 0 and 'P56_Potential' in unmatched_births_df.columns else 0
+    )
+    unmatched_priority_count = (
+        len(unmatched_births_df[unmatched_births_df['Priority_Strain'] == 'YES'])
+        if len(unmatched_births_df) > 0 and 'Priority_Strain' in unmatched_births_df.columns else 0
+    )
+    unmatched_quota_count = (
+        len(unmatched_births_df[unmatched_births_df['Quota_Status'].str.contains('NEEDED', na=False)])
+        if len(unmatched_births_df) > 0 and 'Quota_Status' in unmatched_births_df.columns else 0
+    )
+
+    upcoming_sexing_count = 0
+    if len(sexing_schedule_df) > 0 and 'Days_Until_Sexing' in sexing_schedule_df.columns:
+        upcoming_sexing_count = len(sexing_schedule_df[
+            sexing_schedule_df['Days_Until_Sexing'].apply(
+                lambda x: isinstance(x, int) and 0 <= x <= 7
+            )
+        ])
+
     summary_data = {
         'Metric': [
             '── ANIMAL COUNTS ──',
@@ -4504,6 +5059,14 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             '── B6/B6N ──',
             'B6/B6N Monthly Minimum Required',
             'B6/B6N Top-Up Animals Added',
+            '── BIRTHS / SEXING ──',
+            'Births Needing Sexing (not yet entered)',
+            'Sexing Due Within 7 Days',
+            'Unmatched Births (Sing Inventory)',
+            'Unmatched - Can Schedule P14',
+            'Unmatched - Can Schedule P56',
+            'Unmatched - Priority Strains',
+            'Unmatched - With Quota Needs',
             '── SETTINGS ──',
             'Wednesday Capacity',
             'Sexing Day Offset (days)',
@@ -4538,6 +5101,14 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             '',
             CONFIG.get('B6_MIN_PER_MONTH', 3),
             b6_topup_count,
+            '',
+            len(sexing_schedule_df),
+            upcoming_sexing_count,
+            len(unmatched_births_df),
+            unmatched_p14_count,
+            unmatched_p56_count,
+            unmatched_priority_count,
+            unmatched_quota_count,
             '',
             CONFIG['WEDNESDAY_CAPACITY'],
             CONFIG.get('SEXING_OFFSET_DAYS', 9),
@@ -4574,10 +5145,6 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
 
     # Build a name → exclusion_reason lookup from all filter stages
     exclusion_reasons: Dict[str, str] = {}
-    # Breeding reserves get their own reason label
-    if breeding_reserves:
-        for _rn in breeding_reserves:
-            exclusion_reasons[str(_rn)] = 'Reserved — Breeding'
     if len(use_excluded) > 0:
         name_col = next((c for c in ['Name', 'Animal_Name', 'Animal ID'] if c in use_excluded.columns), None)
         use_col  = next((c for c in ['Use'] if c in use_excluded.columns), None)
@@ -4748,6 +5315,35 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
             # ── Formatting ────────────────────────────────────────────────────
             wb = writer.book
 
+            if 'Sexing Schedule' in wb.sheetnames:
+                ws = wb['Sexing Schedule']
+                headers = [cell.value for cell in ws[1]]
+                status_col = headers.index('Sexing_Status') + 1 if 'Sexing_Status' in headers else None
+
+                for row_idx in range(2, ws.max_row + 1):
+                    if status_col:
+                        cell = ws.cell(row=row_idx, column=status_col)
+                        val = str(cell.value) if cell.value else ''
+                        color = None
+                        if 'TODAY' in val:
+                            color = 'FF0000'
+                            cell.font = Font(bold=True, color='FFFFFF')
+                        elif 'TOMORROW' in val:
+                            color = 'FF8C00'
+                            cell.font = Font(bold=True)
+                        elif 'SOON' in val:
+                            color = 'FFD700'
+                        elif 'Upcoming' in val:
+                            color = 'A8E6CF'
+                        elif 'Done' in val:
+                            color = 'D3D3D3'
+                        if color:
+                            cell.fill = PatternFill(
+                                start_color=color, end_color=color, fill_type='solid'
+                            )
+
+
+
             geno_sheet = truncate_sheet_name('Genotype Excluded Details')
             if geno_sheet in wb.sheetnames:
                 ws = wb[geno_sheet]
@@ -4821,6 +5417,12 @@ def create_complete_schedule(animal_file: str, tracking_file: str, births_file: 
         print(f"  ⛔ Unusable for both:  {unusable_both:>6}  (too old for P14 AND P56)")
     if b6_topup_count > 0:
         print(f"  B6/B6N top-up added:  {b6_topup_count:>6}  (to meet {CONFIG['B6_MIN_PER_MONTH']}/month minimum)")
+    if len(sexing_schedule_df) > 0:
+        print(f"\n  Births needing sexing:    {len(sexing_schedule_df)}")
+        if upcoming_sexing_count > 0:
+            print(f"  ⚠️  Sexing due ≤7 days:    {upcoming_sexing_count}")
+    if len(unmatched_births_df) > 0:
+        print(f"\n  ⚠️  Unmatched births:       {len(unmatched_births_df)}")
     if genotype_critical_count > 0:
         print(f"\n  ⚠️  CRITICAL genotype issues: {genotype_critical_count}")
 
@@ -4901,14 +5503,23 @@ class TestSchedulerFunctions(unittest.TestCase):
         )
 
     def test_canonicalize_genotype_blank(self):
-        for raw in [None, '', 'nan', 'N/A', 'Inconclusive', 'Pending']:
+        for raw in [None, '', 'nan', 'N/A']:
             self.assertEqual(
                 canonicalize_genotype(raw), GENOTYPE_BLANK,
                 f"Expected Blank for '{raw}'"
             )
 
+    def test_canonicalize_inconclusive(self):
+        """Climb's Inconclusive symbol is its own label, not Blank."""
+        for raw in ['Inconclusive', 'inconclusive', 'Kdm5b Inconclusive']:
+            self.assertEqual(
+                canonicalize_genotype(raw), GENOTYPE_INCONC,
+                f"Expected Inconclusive for '{raw}'"
+            )
+
     def test_canonicalize_already_canonical(self):
-        for label in ['Wild', 'Het', 'Hom', 'Hemi', 'Inbred', 'Blank']:
+        for label in ['Wild', 'Het', 'Hom', 'Hemi', 'Inbred', 'Blank',
+                      'Inconclusive']:
             self.assertEqual(canonicalize_genotype(label), label)
 
     def test_is_wildtype_cre_only(self):
@@ -4934,6 +5545,18 @@ class TestSchedulerFunctions(unittest.TestCase):
         self.assertFalse(is_b6_strain('CHD8'))
         self.assertFalse(is_b6_strain(None))
         self.assertFalse(is_b6_strain(''))
+
+    def test_calculate_sexing_date(self):
+        bd = date(2025, 11, 1)
+        expected = date(2025, 11, 10)
+        self.assertEqual(calculate_sexing_date(bd), expected)
+        self.assertIsNone(calculate_sexing_date(None))
+        self.assertIsNone(calculate_sexing_date(pd.NaT))
+
+    def test_calculate_sexing_date_pd_timestamp(self):
+        ts = pd.Timestamp('2025-11-01')
+        expected = date(2025, 11, 10)
+        self.assertEqual(calculate_sexing_date(ts), expected)
 
     def test_sexing_date_in_schedule_dates(self):
         bd = date(2025, 11, 1)
@@ -5493,6 +6116,20 @@ class TestSchedulerFunctions(unittest.TestCase):
             self.assertIn('Blank', parsed['Primary_Reason'],
                 f"Reason '{reason[:60]}' should be Blank but got: "
                 f"'{parsed['Primary_Reason']}'")
+
+    def test_parse_reason_inconclusive_not_blank(self):
+        """Inconclusive must be reported distinctly from Blank."""
+        inconclusive_reasons = [
+            'Inconclusive',
+            GENOTYPE_INCONC,
+            'genotype inconclusive \u2014 released to available',
+        ]
+        for reason in inconclusive_reasons:
+            parsed = parse_unschedulable_reason(reason)
+            self.assertIn('Inconclusive', parsed['Primary_Reason'],
+                f"Reason '{reason[:60]}' should be Inconclusive but got: "
+                f"'{parsed['Primary_Reason']}'")
+            self.assertNotIn('Wild', parsed['Primary_Reason'])
 
     def test_parse_reason_wild_genotype_exact_string(self):
         """Exact wild-genotype exclusion reason must still be classified as Wild."""
@@ -6218,7 +6855,8 @@ HARVEST_SHEET_COLUMNS = [
     'Sex', 'Age (Days)', 'Envision Date', 'Harvest Date', 'Harvested by',
     'Protocol', 'Time Pickup', 'Time Start', 'Pickup to Harvest Time',
     'Weight g', '4% Tribro mL 10-14', '4% Tribro Units P14-10%', 'Dye',
-    '4% PFA per mouse', 'Time Complete', 'Round Duration', '4% PFA Total',
+    '4% PFA per mouse', 'Time Complete', 'Round Duration', 'Perfusion Quality',
+    '4% PFA Total',
     'Distilled Water', '2xPBS', '16% PFA', 'Notes'
 ]
 
@@ -6354,7 +6992,7 @@ def translate_protocol(harvest_type, timepoint):
         return 'MERFISH - OCT'
     elif base == 'RNAseq':
         return 'RNA-Seq'
-    elif harvest_type in ('COMPLETE (Quota Filled)', 'Extra'):
+    elif base in ('COMPLETE (Quota Filled)', 'Extra'):
         return 'Extra - Sex & Timepoint Full'
     else:
         return 'Extra - Sex & Timepoint Full'
@@ -6454,6 +7092,10 @@ def get_sample_count(protocol):
         return (8, ["-0", "-1", "-2", "-3", "-4", "-5", "-6", "-C"])
     elif protocol == "Extra - Sex & Timepoint Full":
         return (0, [])
+    elif protocol in ("WT Envison Controls", "WT Envision Controls", "Found Dead"):
+        # Behavior-only (WT Envision controls) or nothing to collect (Found Dead).
+        # Expected to produce no sample — not an error, so no alarm.
+        return (0, [])
     else:
         print(f"  Warning: Unknown protocol '{protocol}'. Defaulting to 1.")
         return (1, [""])
@@ -6533,9 +7175,164 @@ def build_working_data(all_animals_df):
 # STEPS 0+1: BUILD HARVEST WORKSHEET & CREATE SAMPLES
 # ============================================================
 
+def _next_sample_from_harvest(harvest_path: str) -> int:
+    """Read Harvest Worksheet and return max valid sample number + 1.
+
+    Handles all known formats: plain ints, ranges (1753-1754),
+    NB suffix (1224 NB), old A-suffix (295-295A), comma-separated (346, 347).
+    Skips Fail, QC Fail, Extra NB, Floxed, Found Dead, Extra, and blanks.
+    """
+    SKIP = {'fail', 'qc fail', 'extra nb', 'floxed', 'found dead', 'extra'}
+
+    def _parse_max(val: str) -> int:
+        nums = [int(n) for n in re.findall(r'\d+', val)]
+        return max(nums) if nums else 0
+
+    df = pd.read_excel(harvest_path, sheet_name='Harvest Worksheet', dtype=str).fillna('')
+    max_num = 0
+    for raw in df['Sample Number']:
+        s = str(raw).strip()
+        if not s or s.lower() in SKIP:
+            continue
+        n = _parse_max(s)
+        if n > max_num:
+            max_num = n
+    return max_num + 1
+
+
+# ── TEST MODE ────────────────────────────────────────────────────────────────
+# When on, NOTHING is written to Climb. Every live PUT/POST is intercepted and
+# logged instead of sent, and the Climb import CSV is renamed so it cannot be
+# uploaded by accident. Read-only GETs still run so the pipeline behaves
+# normally and all output files are still produced for inspection.
+TEST_MODE = False
+
+
+class _FakeResponse:
+    """Stand-in for a requests Response so callers' `if not r.ok` still works."""
+    ok = True
+    status_code = 200
+    text = '[TEST MODE] not sent'
+    def json(self):
+        return {}
+
+
+def _api_put(url, **kw):
+    if TEST_MODE:
+        print(f"    [TEST MODE] SKIPPED PUT  {url}")
+        return _FakeResponse()
+    return requests.put(url, **kw)
+
+
+def _api_post(url, **kw):
+    if TEST_MODE:
+        print(f"    [TEST MODE] SKIPPED POST {url}")
+        return _FakeResponse()
+    return requests.post(url, **kw)
+
+
+def _load_sing_climb():
+    """Load sing_climb from lib\\, falling back to the script folder.
+
+    Handles both sing_climb.py and date-suffixed sing_climb_YYYYMMDD.py.
+    Returns the loaded module.
+    """
+    import importlib.util as _ilu
+
+    # Try bare import first — lib\ and the script folder are already on sys.path
+    try:
+        import sing_climb as _sc
+        return _sc
+    except ModuleNotFoundError:
+        pass
+
+    # Fall back: find sing_climb*.py, most recent by filename, lib\ first
+    candidates = []
+    for _d in (_LIB_DIR, _SCRIPT_DIR):
+        if os.path.isdir(_d):
+            candidates += sorted(glob.glob(os.path.join(_d, 'sing_climb*.py')),
+                                 reverse=True)
+    if not candidates:
+        raise ModuleNotFoundError(
+            'sing_climb not found. Searched:\n'
+            f'  {_LIB_DIR}\n'
+            f'  {_SCRIPT_DIR}\n'
+            'Place sing_climb.py (or sing_climb_YYYYMMDD.py) in the lib folder.'
+        )
+    spec = _ilu.spec_from_file_location('sing_climb', candidates[0])
+    mod  = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def get_starting_sample_number():
-    """Ask user for the last sample number used — via GUI dialog."""
-    return _gui_ask('sample_number')
+    """Fetch next sample number from Climb (globally sequential across all projects)."""
+    try:
+        _sc = _load_sing_climb()
+        return _sc.get_next_sample_number(verbose=False)
+    except Exception as ex:
+        logger.error(f'Could not fetch next sample number from Climb: {ex}')
+        raise
+
+
+def _is_perfusion_protocol(protocol) -> bool:
+    """
+    True for the protocols that actually perfuse — the ones that consume PFA.
+
+    MERFISH, RNA-Seq and Extra rows get 0, matching how the sheet is filled in
+    by hand.
+    """
+    p = str(protocol).strip().lower()
+    if not p:
+        return False
+    if 'merfish' in p or 'rna-seq' in p or 'rnaseq' in p:
+        return False
+    if p.startswith('extra'):
+        return False
+    return 'pbs' in p and 'pfa' in p
+
+
+def add_harvest_reagent_totals(harvest_df):
+    """
+    Fill the batch reagent columns on the first row of each harvest date.
+
+        4% PFA Total    = PFA per mouse x number of perfusions that day
+        Distilled Water = Total x 0.25
+        2xPBS           = Total x 0.50
+        16% PFA         = Total x 0.25
+
+    Matches how the sheet is filled in by hand: one set of numbers per harvest
+    day, sitting on the first row, since the solution is mixed as a single
+    batch.
+    """
+    if harvest_df.empty or 'Harvest Date' not in harvest_df.columns:
+        return harvest_df
+
+    ratios = CONFIG.get('PFA_MIX_RATIOS',
+                        {'Distilled Water': 0.25, '2xPBS': 0.50, '16% PFA': 0.25})
+
+    # object dtype — pandas 3 infers str from '' and then refuses numbers
+    for col in ('4% PFA Total', *ratios):
+        if col in harvest_df.columns:
+            harvest_df[col] = pd.Series([''] * len(harvest_df),
+                                        index=harvest_df.index, dtype=object)
+
+    for date_val, group in harvest_df.groupby('Harvest Date', sort=False):
+        n_perf = sum(1 for _, r in group.iterrows()
+                     if _is_perfusion_protocol(r.get('Protocol')))
+        if n_perf == 0:
+            continue
+
+        total = n_perf * CONFIG['PFA_PER_MOUSE_ML']
+        first = group.index[0]
+        harvest_df.at[first, '4% PFA Total'] = total
+        for col, frac in ratios.items():
+            if col in harvest_df.columns:
+                harvest_df.at[first, col] = round(total * frac, 2)
+
+        print(f'    {date_val}: {n_perf} perfusion(s) \u2192 {total} mL 4% PFA')
+
+    return harvest_df
 
 
 def run_harvest_and_samples(working_df, timestamp):
@@ -6581,6 +7378,7 @@ def run_harvest_and_samples(working_df, timestamp):
     climb_import_rows = []
     chain_rows = []
     samples_added = 0
+    preservation_failures = []   # (animal, protocol) — no Preservation, no sample
 
     for idx, row in sorted_df.iterrows():
         animal_name = str(row.get('Animal_Name', '')).strip()
@@ -6589,6 +7387,15 @@ def run_harvest_and_samples(working_df, timestamp):
         envision_date = row.get('Envision_Date', '')
         preservation = get_preservation_method(protocol)
         count, suffixes = get_sample_count(protocol)
+
+        # TAILS guarantee: a sample is never created without a Preservation.
+        # A blank Preservation in Climb silently mis-routes tube labels and
+        # drops the sample from the Deliverables trackers (which filter on the
+        # exact string). If the protocol yields no preservation, create nothing
+        # and record it for the alarm below.
+        if count > 0 and str(preservation).strip() == '':
+            preservation_failures.append((animal_name, protocol))
+            count, suffixes = 0, []
 
         animal_id = animal_lookup.get(animal_name, animal_name)
 
@@ -6631,8 +7438,21 @@ def run_harvest_and_samples(working_df, timestamp):
             next_sample_num += 1
             samples_added += 1
 
-        # Combined sample number for harvest sheet
+        # Combined sample number for harvest sheet.
+        # Extras produce no samples, so combine_sample_numbers() returns '' —
+        # label them 'Extra' instead of leaving the cell blank to be typed by hand.
+        # Every NB animal gets ' NB' appended, real samples and Extras alike.
+        # This column is what gets read when loading Envision cages, so the flag
+        # has to be visible there and not only in the Envision Date column.
+        _htype = str(row.get('Harvest_Type', '')).strip()
+        _is_nb = _htype.endswith(' NB')
+        _base_htype = _htype.replace(' NB', '').strip()
+
         combined_sample = combine_sample_numbers(animal_samples)
+        if not combined_sample and _base_htype in ('Extra', 'COMPLETE (Quota Filled)'):
+            combined_sample = 'Extra'
+        if combined_sample and _is_nb:
+            combined_sample = f'{combined_sample} NB'
 
         # Harvest sheet row
         harvest_rows.append({
@@ -6652,12 +7472,16 @@ def run_harvest_and_samples(working_df, timestamp):
             'Time Start': '',
             'Pickup to Harvest Time': '',
             'Weight g': '',
-            '4% Tribro mL 10-14': '',
-            '4% Tribro Units P14-10%': '',
-            'Dye': '',
-            '4% PFA per mouse': '',
+            '4% Tribro mL 10-14': 0,
+            '4% Tribro Units P14-10%': 0,
+            'Dye': 0,
+            '4% PFA per mouse': (CONFIG['PFA_PER_MOUSE_ML']
+                                 if _is_perfusion_protocol(protocol) else 0),
             'Time Complete': '',
             'Round Duration': '',
+            # Blank on perfusions — filled in by hand after the harvest.
+            'Perfusion Quality': ('' if _is_perfusion_protocol(protocol)
+                                  else 'Not Perfusion'),
             '4% PFA Total': '',
             'Distilled Water': '',
             '2xPBS': '',
@@ -6667,6 +7491,8 @@ def run_harvest_and_samples(working_df, timestamp):
 
     # Build DataFrames
     harvest_df = pd.DataFrame(harvest_rows, columns=HARVEST_SHEET_COLUMNS)
+    print('  Reagent totals per harvest date:')
+    harvest_df = add_harvest_reagent_totals(harvest_df)
     climb_import_df = pd.DataFrame(climb_import_rows, columns=ADD_SAMPLE_COLUMNS)
     samples_for_chain = pd.DataFrame(chain_rows)
 
@@ -6678,13 +7504,58 @@ def run_harvest_and_samples(working_df, timestamp):
         print(f"    First row: {samples_for_chain.iloc[0].to_dict()}")
         print(f"    Unique Source values (first 5): {samples_for_chain['Source'].unique()[:5].tolist()}")
 
+    # ── ALARM: protocols that produced no Preservation ────────────────────────
+    # These animals got NO sample. Nothing with a blank Preservation is ever
+    # written to Climb. Fix the Protocol on the harvest sheet and re-run.
+    if preservation_failures:
+        print("")
+        print("  " + "!" * 70)
+        print(f"  !!  ALARM — {len(preservation_failures)} animal(s) have a Protocol that maps to NO")
+        print("  !!  Preservation method. NO SAMPLE was created for them.")
+        print("  " + "!" * 70)
+        for a_name, proto in preservation_failures:
+            print(f"  !!    Animal {a_name}   Protocol={proto!r}")
+        print("  !!")
+        print("  !!  A sample with a blank Preservation mis-routes its tube label and")
+        print("  !!  drops out of the Deliverables trackers. So none was made.")
+        print("  !!")
+        print("  !!  Recognised protocols:")
+        print("  !!    '8 Weeks - ...4%PFA...'  /  'P14 - ...4%PFA...'  -> 4% PFA Fixed")
+        print("  !!    'MERFISH - OCT'                                  -> OCT Block")
+        print("  !!    'RNA-Seq'                                        -> Flash Frozen")
+        print("  !!    'Extra - Sex & Timepoint Full'                   -> no sample (expected)")
+        print("  !!")
+        print("  !!  Fix the Protocol on the harvest sheet, then re-run this step.")
+        print("  " + "!" * 70)
+        print("")
+
     # Save Harvest Sheet Import
     harvest_file = f"Harvest_Sheet_Import_{timestamp}.xlsx"
     save_df_to_excel(harvest_df, harvest_file, sheet_name='Harvest Worksheet')
     print(f"\n  📄 Saved: {harvest_file}")
 
     # Save Climb Sample Import
-    climb_file = f"Climb_Sample_Import_{timestamp}.csv"
+    # Backstop: nothing with a blank Preservation Method may reach this file.
+    # The guard in the loop above should make this impossible; this catches any
+    # future path that bypasses it rather than letting a bad row through.
+    if len(climb_import_df) > 0:
+        _blank_pres = climb_import_df[
+            climb_import_df['Preservation Method'].fillna('').astype(str).str.strip() == ''
+        ]
+        if len(_blank_pres) > 0:
+            print("")
+            print("  " + "!" * 70)
+            print(f"  !!  ALARM — {len(_blank_pres)} Climb import row(s) have a blank Preservation")
+            print("  !!  Method. These rows were REMOVED from the import file.")
+            for _, _r in _blank_pres.iterrows():
+                print(f"  !!    Sample {_r.get('Sample Name')}  Animal {_r.get('Source AnimalID')}")
+            print("  !!  Do not hand-add these to Climb without a Preservation.")
+            print("  " + "!" * 70)
+            print("")
+            climb_import_df = climb_import_df.drop(_blank_pres.index)
+
+    climb_file = (f"TESTONLY_DO_NOT_IMPORT_Climb_Sample_Import_{timestamp}.csv"
+                  if TEST_MODE else f"Climb_Sample_Import_{timestamp}.csv")
     climb_import_df.to_csv(climb_file, index=False)
     print(f"  📄 Saved: {climb_file}")
 
@@ -6744,12 +7615,18 @@ class MultiSheetExporter:
             self.samples_df['Harvest Date'] = pd.to_datetime(
                 self.samples_df['Harvest Date'], errors='coerce')
 
-        # Rename sample columns for merge
-        # Source contains Animal_Name (not ID) for chain purposes
-        if 'Source' in self.samples_df.columns:
-            self.samples_df = self.samples_df.rename(columns={'Source': 'Animal_Name'})
-        if 'Name' in self.samples_df.columns:
-            self.samples_df = self.samples_df.rename(columns={'Name': 'Sample_Name'})
+        # Normalise Harvest Worksheet column names to internal format
+        _harvest_col_map = {
+            'Name':           'Animal_Name',
+            'Sample Number':  'Sample_Name',
+            'BD':             'Birth_Date',
+            'Harvest Date':   'Harvest Date',   # keep as-is
+        }
+        for _src, _dst in _harvest_col_map.items():
+            if _src in self.samples_df.columns and _dst not in self.samples_df.columns:
+                self.samples_df = self.samples_df.rename(columns={_src: _dst})
+            if _src in self.working_df.columns and _dst not in self.working_df.columns:
+                self.working_df = self.working_df.rename(columns={_src: _dst})
 
         if 'Animal_Name' in self.samples_df.columns:
             self.samples_df['Animal_Name'] = self.samples_df['Animal_Name'].astype(str).str.strip()
@@ -6768,18 +7645,49 @@ class MultiSheetExporter:
                 print(f"    ⚠ NO MATCHES! Sample names: {list(sample_names)[:3]}")
                 print(f"    ⚠ Working names: {list(working_names)[:3]}")
 
-        # Merge samples with working data
+        # Merge samples with working data.
+        # INNER join — only animals present in animals.csv are exported. The
+        # Harvest Worksheet holds the full project history; a left join would
+        # carry every historical row through with blank animal details.
         if 'Animal_Name' in self.samples_df.columns and 'Animal_Name' in self.working_df.columns:
+            before = len(self.samples_df)
             self.merged_df = pd.merge(
                 self.samples_df, self.working_df,
-                on='Animal_Name', how='left',
+                on='Animal_Name', how='inner',
                 suffixes=('_sample', '_animal')
             )
-            print(f"    Merged result: {len(self.merged_df)} rows")
-            print(f"    Merged columns: {list(self.merged_df.columns)}")
+            print(f"    Merged result: {len(self.merged_df)} rows "
+                  f"(dropped {before - len(self.merged_df)} not in animals.csv)")
         else:
             self.merged_df = self.samples_df.copy()
             print(f"    No merge possible — using {len(self.merged_df)} sample rows")
+
+        # ── Route each row to a tracker tab by Protocol ──────────────────────
+        # Same logic as Sing Sanity:
+        #   Protocol contains 'rna-seq' or 'rnaseq'  -> RNA-Seq
+        #   Protocol contains 'merfish'              -> MERFISH
+        #   anything else                            -> LSFM/MRI
+        prot_col = next((c for c in ['Protocol', 'Protocol_sample', 'Protocol_animal',
+                                     'Harvest Type', 'Harvest_Type', 'Assigned_Harvest_Type']
+                         if c in self.merged_df.columns), None)
+
+        def _route(protocol) -> str:
+            pl = str(protocol).strip().lower()
+            if 'rna-seq' in pl or 'rnaseq' in pl:
+                return 'RNA-Seq'
+            if 'merfish' in pl:
+                return 'MERFISH'
+            return 'LSFM/MRI'
+
+        if prot_col:
+            self.merged_df['_tracker'] = self.merged_df[prot_col].apply(_route)
+            print(f"    Routed on '{prot_col}': "
+                  f"{self.merged_df['_tracker'].value_counts().to_dict()}")
+        else:
+            self.merged_df['_tracker'] = 'LSFM/MRI'
+            print(f"    \u26a0 No Protocol column \u2014 all rows routed to LSFM/MRI")
+            print(f"      Looked for: Protocol, Harvest Type, Harvest_Type")
+            print(f"      Available: {list(self.merged_df.columns)}")
 
         if 'Sheet' in self.workbook.sheetnames:
             del self.workbook['Sheet']
@@ -6793,6 +7701,71 @@ class MultiSheetExporter:
         except Exception:
             pass
         return ''
+
+    @staticmethod
+    def _expand_sample_numbers(value) -> list:
+        """
+        Expand a combined sample-number string into individual numbers.
+
+            '1796'            -> ['1796']
+            '1805-1806'       -> ['1805', '1806']
+            '1807-1814'       -> ['1807', ..., '1814']
+            '1796, 1798-1800' -> ['1796', '1798', '1799', '1800']
+
+        Anything that does not start with a digit is dropped, so the row never
+        reaches the tracker:
+
+            'Extra'           -> []
+            'QC Fail'         -> []
+            'Found Dead'      -> []
+            ''                -> []
+
+        Returning an empty list means the caller adds no row at all.
+        """
+        raw = str(value).strip() if value is not None else ''
+        if raw == '' or raw.lower() in ('nan', 'none'):
+            return []
+
+        out = []
+        for chunk in raw.split(','):
+            seg = chunk.strip()
+            if not seg or not seg[0].isdigit():
+                continue                        # Extra, QC Fail, etc.
+            parts = seg.split('-')
+            if len(parts) == 2:
+                lo, hi = parts[0].strip(), parts[1].strip()
+                if lo.isdigit() and hi.isdigit():
+                    lo_i, hi_i = int(lo), int(hi)
+                    if 0 <= hi_i - lo_i < 1000:      # sanity guard
+                        width = len(lo)              # preserve zero padding
+                        out.extend(str(n).zfill(width)
+                                   for n in range(lo_i, hi_i + 1))
+                        continue
+            out.append(seg)
+        return out
+
+    # RNA-Seq tube suffixes, applied in order to each animal's samples.
+    # Eight tubes per animal: seven numbered, then C.
+    RNA_SUFFIXES = ['0', '1', '2', '3', '4', '5', '6', 'C']
+    RNA_PAD      = 5      # zero-pad sample numbers to this width
+
+    @classmethod
+    def _rna_sample_name(cls, sample_no: str, position: int) -> str:
+        """
+        Format an RNA-Seq sample name: zero-padded number + positional suffix.
+
+            (1608, 0) -> '01608-0'
+            (1615, 7) -> '01615-C'
+
+        Positions beyond the suffix list fall back to the index number so
+        nothing is silently dropped or duplicated.
+        """
+        num = str(sample_no).strip()
+        if num.isdigit():
+            num = num.zfill(cls.RNA_PAD)
+        suffix = (cls.RNA_SUFFIXES[position]
+                  if position < len(cls.RNA_SUFFIXES) else str(position))
+        return f'{num}-{suffix}'
 
     def _safe_get(self, row, *columns, default=''):
         """Try multiple column names, return first non-null value."""
@@ -6854,19 +7827,8 @@ class MultiSheetExporter:
         ws = self.workbook.create_sheet("Animal and Sample Tracking")
         print("\n  Creating Animal and Sample Tracking sheet...")
 
-        filtered_df = self.merged_df.copy()
-        pres_col = None
-        for col_name in ['Preservation', 'Preservation_sample', 'Preservation_animal']:
-            if col_name in filtered_df.columns:
-                pres_col = col_name
-                break
-
-        if pres_col:
-            filtered_df = filtered_df[filtered_df[pres_col] == '4% PFA Fixed']
-            print(f"    Filtered on '{pres_col}' to {len(filtered_df)} PFA Fixed samples")
-        else:
-            print(f"    ⚠ No Preservation column found")
-            print(f"    Available columns: {list(filtered_df.columns)}")
+        filtered_df = self.merged_df[self.merged_df['_tracker'] == 'LSFM/MRI'].copy()
+        print(f"    {len(filtered_df)} LSFM/MRI rows")
 
         tracking_data = []
         for idx, row in filtered_df.iterrows():
@@ -6874,24 +7836,27 @@ class MultiSheetExporter:
                 self._safe_get(row, 'Birth_Date'),
                 self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             )
-            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint') or ''
+            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint',
+                                       'Age (Days)', 'Age (Days)_sample') or ''
             harvest_date = self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             wean_date = harvest_date if str(timepoint).strip() == 'P14' else self._safe_get(row, 'Wean Date')
-            tracking_data.append({
-                'Name_sample': self._safe_get(row, 'Sample_Name'),
-                'Harvest Date': harvest_date,
-                'Age (weeks)_sample': age_weeks,
-                'Name_subject': self._safe_get(row, 'Animal_Name'),
-                'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
-                'Line (Short)': self._safe_get(row, 'Line (Short)'),
-                'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
-                'Species_subject': 'Mouse',
-                'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
-                'Birth Date': self._safe_get(row, 'Birth_Date'),
-                'Wean Date': wean_date,
-                'Harvest Timepoint': timepoint
-            })
+            for _sample_no in self._expand_sample_numbers(
+                    self._safe_get(row, 'Sample_Name')):
+                tracking_data.append({
+                    'Name_sample': _sample_no,
+                    'Harvest Date': harvest_date,
+                    'Age (weeks)_sample': age_weeks,
+                    'Name_subject': self._safe_get(row, 'Animal_Name'),
+                    'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
+                    'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
+                    'Line (Short)': self._safe_get(row, 'Line (Short)'),
+                    'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
+                    'Species_subject': 'Mouse',
+                    'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
+                    'Birth Date': self._safe_get(row, 'Birth_Date'),
+                    'Wean Date': wean_date,
+                    'Harvest Timepoint': timepoint
+                })
 
         column_order = [
             'Name_sample', 'Harvest Date', 'Age (weeks)_sample', 'Name_subject',
@@ -6913,18 +7878,8 @@ class MultiSheetExporter:
         ws = self.workbook.create_sheet("MERFISH Sample Tracker")
         print("\n  Creating MERFISH Sample Tracker sheet...")
 
-        filtered_df = self.merged_df.copy()
-        pres_col = None
-        for col_name in ['Preservation', 'Preservation_sample', 'Preservation_animal']:
-            if col_name in filtered_df.columns:
-                pres_col = col_name
-                break
-
-        if pres_col:
-            filtered_df = filtered_df[filtered_df[pres_col] == 'OCT Block']
-            print(f"    Filtered on '{pres_col}' to {len(filtered_df)} OCT Block samples")
-        else:
-            print(f"    ⚠ No Preservation column found")
+        filtered_df = self.merged_df[self.merged_df['_tracker'] == 'MERFISH'].copy()
+        print(f"    {len(filtered_df)} MERFISH rows")
 
         tracker_data = []
         for idx, row in filtered_df.iterrows():
@@ -6932,23 +7887,26 @@ class MultiSheetExporter:
                 self._safe_get(row, 'Birth_Date'),
                 self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             )
-            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint') or ''
+            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint',
+                                       'Age (Days)', 'Age (Days)_sample') or ''
             harvest_date = self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             wean_date = harvest_date if str(timepoint).strip() == 'P14' else self._safe_get(row, 'Wean Date')
-            tracker_data.append({
-                'Name_sample': self._safe_get(row, 'Sample_Name'),
-                'Age (weeks)_sample': age_weeks,
-                'Name_subject': self._safe_get(row, 'Animal_Name'),
-                'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
-                'Line (Short)': self._safe_get(row, 'Line (Short)'),
-                'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
-                'Species_subject': 'Mouse',
-                'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
-                'Birth Date': self._safe_get(row, 'Birth_Date'),
-                'Wean Date': wean_date,
-                'Dissect Date': harvest_date
-            })
+            for _sample_no in self._expand_sample_numbers(
+                    self._safe_get(row, 'Sample_Name')):
+                tracker_data.append({
+                    'Name_sample': _sample_no,
+                    'Age (weeks)_sample': age_weeks,
+                    'Name_subject': self._safe_get(row, 'Animal_Name'),
+                    'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
+                    'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
+                    'Line (Short)': self._safe_get(row, 'Line (Short)'),
+                    'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
+                    'Species_subject': 'Mouse',
+                    'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
+                    'Birth Date': self._safe_get(row, 'Birth_Date'),
+                    'Wean Date': wean_date,
+                    'Dissect Date': harvest_date
+                })
 
         column_order = [
             'Name_sample', 'Line (Short)', 'Age (weeks)_sample', 'Sex',
@@ -6969,19 +7927,8 @@ class MultiSheetExporter:
         ws = self.workbook.create_sheet("RNASeq Sample Tracker")
         print("\n  Creating RNASeq Sample Tracker sheet...")
 
-        filtered_df = self.merged_df.copy()
-        pres_col = None
-        for col_name in ['Preservation', 'Preservation_sample', 'Preservation_animal']:
-            if col_name in filtered_df.columns:
-                pres_col = col_name
-                break
-
-        if pres_col:
-            filtered_df = filtered_df[
-                filtered_df[pres_col].isin(['Flash Frozen', 'Frozen'])]
-            print(f"    Filtered on '{pres_col}' to {len(filtered_df)} Flash Frozen samples")
-        else:
-            print(f"    ⚠ No Preservation column found")
+        filtered_df = self.merged_df[self.merged_df['_tracker'] == 'RNA-Seq'].copy()
+        print(f"    {len(filtered_df)} RNA-Seq rows")
 
         tracker_data = []
         for idx, row in filtered_df.iterrows():
@@ -6989,23 +7936,26 @@ class MultiSheetExporter:
                 self._safe_get(row, 'Birth_Date'),
                 self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             )
-            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint') or ''
+            timepoint = self._safe_get(row, 'Assigned_Timepoint', 'Harvest Timepoint',
+                                       'Age (Days)', 'Age (Days)_sample') or ''
             harvest_date = self._safe_get(row, 'Harvest Date', 'Harvest_Date')
             wean_date = harvest_date if str(timepoint).strip() == 'P14' else self._safe_get(row, 'Wean Date')
-            tracker_data.append({
-                'Name_sample': self._safe_get(row, 'Sample_Name'),
-                'Age (weeks)_sample': age_weeks,
-                'Name_subject': self._safe_get(row, 'Animal_Name'),
-                'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
-                'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
-                'Line (Short)': self._safe_get(row, 'Line (Short)'),
-                'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
-                'Species_subject': 'Mouse',
-                'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
-                'Birth Date': self._safe_get(row, 'Birth_Date'),
-                'Wean Date': wean_date,
-                'Dissect Date': harvest_date
-            })
+            for _pos, _sample_no in enumerate(self._expand_sample_numbers(
+                    self._safe_get(row, 'Sample_Name'))):
+                tracker_data.append({
+                    'Name_sample': self._rna_sample_name(_sample_no, _pos),
+                    'Age (weeks)_sample': age_weeks,
+                    'Name_subject': self._safe_get(row, 'Animal_Name'),
+                    'Sex': self._safe_get(row, 'Sex', 'Sex_animal', 'Sex_sample'),
+                    'Line_subject': self._translate_line(self._safe_get(row, 'Line_animal', 'Line', 'Strain')),
+                    'Line (Short)': self._safe_get(row, 'Line (Short)'),
+                    'Line (Stock)': self._safe_get(row, 'Line (Stock)'),
+                    'Species_subject': 'Mouse',
+                    'Genotype': self._safe_get(row, 'Raw_Genotype', 'Raw_Genotype_animal', 'Genotype', 'Genotype_animal', 'Genotype_sample'),
+                    'Birth Date': self._safe_get(row, 'Birth_Date'),
+                    'Wean Date': wean_date,
+                    'Dissect Date': harvest_date
+                })
 
         column_order = [
             'Name_sample', 'Age (weeks)_sample', 'Name_subject', 'Sex',
@@ -7066,17 +8016,45 @@ class MultiSheetExporter:
         return self.output_filename
 
 
-def run_deliverables(working_df, samples_df, timestamp):
+def run_deliverables(working_df, samples_df, timestamp, output_dir=None):
     """STEP 2: Create multi-sheet deliverables Excel file."""
     print("\n" + "=" * 80)
     print("STEP 2: DELIVERABLES")
     print("=" * 80)
 
-    if samples_df.empty:
-        print("  ✗ No sample data. Skipping.")
+    if samples_df is None or samples_df.empty:
+        print("  \u2717 No sample data. Skipping.")
         return None
 
-    output_filename = f"Lab_Data_Export_{timestamp}.xlsx"
+    _out_dir = output_dir or _SCRIPT_DIR
+
+    # Filename carries every harvest date present in the export:
+    #   one date    -> Lab_Data_Export_2026_09_09.xlsx
+    #   a few dates -> Lab_Data_Export_2026_09_02_2026_09_09.xlsx
+    #   many dates  -> Lab_Data_Export_2026_09_02_to_2026_10_07.xlsx
+    _dates = []
+    for _col in ['Harvest Date', 'Harvest_Date', 'P56_Harvest_Date']:
+        if _col in samples_df.columns:
+            _parsed = pd.to_datetime(samples_df[_col], errors='coerce').dropna()
+            if not _parsed.empty:
+                _dates = sorted({d.strftime('%Y_%m_%d') for d in _parsed})
+                break
+
+    if not _dates:
+        _date_str = ''
+    elif len(_dates) <= 4:
+        _date_str = '_'.join(_dates)
+    else:
+        _date_str = f'{_dates[0]}_to_{_dates[-1]}'
+
+    if _dates:
+        print(f"  {len(_dates)} harvest date(s): {', '.join(_dates)}")
+
+    if _date_str:
+        output_filename = _make_dated_path(_out_dir, 'Lab_Data_Export', _date_str)
+    else:
+        output_filename = os.path.join(_out_dir, f'Lab_Data_Export_{timestamp}.xlsx')
+
     try:
         exporter = MultiSheetExporter(
             working_df=working_df,
@@ -7085,10 +8063,10 @@ def run_deliverables(working_df, samples_df, timestamp):
         )
         exporter.create_all_sheets()
         saved_file = exporter.save()
-        print(f"\n  ✓ Step 2 complete: 4 sheets created")
+        print(f"\n  \u2713 Step 2 complete: 4 sheets created")
         return saved_file
     except Exception as e:
-        print(f"  ✗ Error: {e}")
+        print(f"  \u2717 Error: {e}")
         traceback.print_exc()
         return None
 
@@ -7152,7 +8130,1172 @@ def group_animals_by_housing(df):
     return group_suffixes
 
 
-def run_climb_to_envision(working_df, timestamp):
+def _make_dated_path(folder: str, stem: str, date_str: str, ext: str = '.xlsx') -> str:
+    """Return a collision-safe path: stem_date.xlsx → stem_date (1).xlsx → ..."""
+    base = f"{stem}_{date_str}{ext}"
+    path = os.path.join(folder, base)
+    if not os.path.exists(path):
+        return path
+    n = 1
+    while True:
+        path = os.path.join(folder, f"{stem}_{date_str} ({n}){ext}")
+        if not os.path.exists(path):
+            return path
+        n += 1
+
+
+def _is_p14(timepoint) -> bool:
+    """True if a timepoint value represents P14."""
+    t = str(timepoint).strip().upper()
+    return t in ('P14', '14') or t.startswith('P14')
+
+
+def _file_date_for_row(row) -> str:
+    """
+    Pick the date that names the output file for one animal.
+
+        P14   -> harvest date
+        Adult -> behavior date (the Envision Date column)
+
+    Falls back to harvest date if no behavior date is recorded, so a file is
+    always named something meaningful rather than 'unknown_date'.
+    """
+    def _first(*names):
+        for n in names:
+            try:
+                v = row.get(n)
+            except AttributeError:
+                v = row[n] if n in row else None
+            if v is not None and str(v).strip() not in ('', 'nan', 'NaT', 'None'):
+                return v
+        return None
+
+    timepoint = _first('Age (Days)', 'Assigned_Timepoint', 'Harvest Timepoint',
+                       'Timepoint')
+    harvest   = _first('Harvest Date', 'Sample Harvest Date', 'Harvest_Date',
+                       'P14_Date', 'P56_Harvest_Date')
+    behavior  = _first('Envision Date', 'P56_Behavior_Date', 'Behavior Date',
+                       'Envision_Date')
+
+    if _is_p14(timepoint):
+        return harvest or behavior or ''
+    return behavior or harvest or ''
+
+
+def _harvest_date_str(val) -> str:
+    """Convert any date-like value to YYYY_MM_DD string for filenames."""
+    if val is None or str(val).strip() in ('', 'None', 'NaT', 'nan'):
+        return ''
+    try:
+        return pd.to_datetime(val).strftime('%Y_%m_%d')
+    except Exception:
+        return str(val).strip().replace('-', '_').replace('/', '_')[:10]
+
+
+def _norm_assay(name: str) -> str:
+    """Strip < > and spaces so TGS and Climb assay names compare equal.
+    'Shank3tm2Gfng Probe' == 'Shank3<tm2Gfng> Probe'"""
+    return (str(name).replace('<', '').replace('>', '')
+            .replace(' ', '').strip().lower())
+
+
+# TGS call column -> Climb genotype symbol
+_TGS_CALL_COLUMNS = {
+    'wild':         '+/+',
+    'het':          '-/+',
+    'hom':          '-/-',
+    'inconclusive': 'Inconclusive',
+}
+
+
+def parse_tgs_report(path):
+    """
+    Read the genotype calls out of one TGS typing report.
+
+    TGS reports are HTML tables saved with an .xls extension, so they're read
+    with pd.read_html rather than an Excel engine.
+
+    Animals are matched on 'Pedigree #', NOT 'Mouse Id' — Mouse Id is the ear
+    notch (R, 2R1L) which repeats across litters.
+
+    Returns (records, meta).
+    """
+    tables = pd.read_html(path)
+
+    meta = {'file': os.path.basename(path), 'strain': '',
+            'sampled': '', 'completed': '', 'assays': []}
+
+    try:
+        info = tables[1]
+        for _, r in info.iterrows():
+            label = str(r[0]).strip().rstrip(':').lower()
+            if label == 'strain':
+                meta['strain'] = str(r[1]).strip()
+            elif label == 'sampler' and len(r) > 3:
+                meta['sampled'] = str(r[3]).strip()
+    except Exception:
+        pass
+
+    try:
+        log  = tables[9]
+        done = log[log[0].astype(str).str.strip() == 'Completed']
+        if not done.empty:
+            meta['completed'] = str(done.iloc[-1][1]).strip()
+    except Exception:
+        pass
+
+    t          = tables[5]
+    assay_row  = t.iloc[0]
+    header_row = t.iloc[1]
+    body       = t.iloc[2:]
+
+    headers = {}
+    for i, h in enumerate(header_row):
+        key = str(h).strip().lower()
+        if key and key != 'nan':
+            headers.setdefault(key, []).append(i)
+
+    def col(name):
+        idx = headers.get(name)
+        return idx[0] if idx else None
+
+    c_animal = col('pedigree #')
+    c_notch  = col('mouse id')
+    if c_animal is None:
+        raise ValueError(f"{meta['file']}: no 'Pedigree #' column")
+
+    call_cols = []
+    for label, symbol in _TGS_CALL_COLUMNS.items():
+        for i in headers.get(label, []):
+            assay = str(assay_row.iloc[i]).strip()
+            if assay and assay.lower() != 'nan':
+                call_cols.append((i, symbol, assay))
+    if not call_cols:
+        raise ValueError(f"{meta['file']}: no call columns found")
+
+    meta['assays'] = sorted({a for _, _, a in call_cols})
+
+    records = []
+    for _, row in body.iterrows():
+        animal = str(row.iloc[c_animal]).strip()
+        if not animal or animal.lower() == 'nan':
+            continue
+        notch = str(row.iloc[c_notch]).strip() if c_notch is not None else ''
+        for i, symbol, assay in call_cols:
+            v = row.iloc[i]
+            if pd.notna(v) and str(v).strip() != '':
+                records.append({'animal': animal, 'assay': assay,
+                                'symbol': symbol, 'notch': notch})
+    return records, meta
+
+
+def run_tgs_genotypes(script_dir):
+    """
+    Upload TGS genotype calls to Climb before scheduling.
+
+    Looks for TGS_Typing_*.xls in a 'genotypes' subfolder (or the script
+    folder), and posts any call the animal does not already have. Animals that
+    already carry that assay and result are skipped — Climb does not
+    deduplicate genotypes.
+
+    Runs before the animals pull so the fresh CSV reflects the new calls, which
+    is what stops those animals scheduling as Blank.
+
+    Never raises — a failure here must not stop the run.
+    """
+    import requests, time, glob as _glob, json as _json_tgs
+
+    try:
+        folders = [os.path.join(script_dir, 'genotypes'), script_dir]
+        found = []
+        for f in folders:
+            if os.path.isdir(f):
+                found += sorted(_glob.glob(os.path.join(f, 'TGS_Typing_*.xls')))
+
+        if not found:
+            return
+
+        # Skip reports already uploaded. Every successful run writes a receipt
+        # (tgs_genotype_upload_*.json) listing the reports it processed, so a
+        # report named in one of those has already been done.
+        #
+        # This replaces the old age-based filter, which skipped anything over
+        # TGS_MAX_AGE_DAYS whether or not it had actually uploaded — so an old
+        # report that never went through was silently ignored forever.
+        #
+        # A report is only treated as done if its receipt recorded no failures
+        # for it. A partial upload gets retried rather than being written off.
+        done_files = set()
+        for f in folders:
+            if not os.path.isdir(f):
+                continue
+            for receipt in sorted(_glob.glob(os.path.join(
+                    f, 'tgs_genotype_upload_*.json'))):
+                try:
+                    with open(receipt, 'r', encoding='utf-8') as fh:
+                        data = _json_tgs.load(fh)
+                except Exception:
+                    continue                      # unreadable receipt — ignore
+                bad = set()
+                for key in ('failed', 'problems', 'parse_errors'):
+                    for item in (data.get(key) or []):
+                        if isinstance(item, dict) and item.get('file'):
+                            bad.add(str(item['file']).strip())
+                for rep in (data.get('reports') or []):
+                    name = str(rep.get('file', '')).strip()
+                    if name and name not in bad:
+                        done_files.add(name)
+
+        reports, already = [], []
+        for p in found:
+            (already if os.path.basename(p) in done_files else reports).append(p)
+
+        print('\n' + '=' * 80)
+        print('TGS GENOTYPES')
+        print('=' * 80)
+        print(f'  {len(found)} report(s) found')
+        if already:
+            print(f'  {len(already)} already uploaded (receipt on file) \u2014 skipped')
+            for a in already:
+                print(f'    {os.path.basename(a)}')
+
+        if not reports:
+            print('  Nothing new to upload.')
+            return
+        print(f'  {len(reports)} to process')
+
+        try:
+            import lxml  # noqa: F401
+        except ImportError:
+            print('  \u26a0 Cannot read TGS reports \u2014 lxml is not installed.')
+            print('    Run:  pip install lxml')
+            return
+
+        records, metas = [], []
+        for p in reports:
+            try:
+                recs, meta = parse_tgs_report(p)
+                try:
+                    d = pd.to_datetime(meta['completed']).strftime('%Y%m%d')
+                except Exception:
+                    d = datetime.now().strftime('%Y%m%d')
+                for r in recs:
+                    r['date'] = d
+                records += recs
+                metas.append(meta)
+                print(f"    {meta['file']}: {len(recs)} call(s), "
+                      f"{', '.join(meta['assays'])}")
+            except Exception as e:
+                print(f'    {os.path.basename(p)}: could not read \u2014 {e}')
+
+        if not records:
+            print('  No calls found.')
+            return
+
+        sc = _load_sing_climb()
+
+        def _hdr():
+            return {'Authorization':   f'Bearer {sc._get_token()}',
+                    'X-Workgroup-Key': sc._WORKGROUP_KEY,
+                    'Content-Type':    'application/json'}
+
+        def _vocab(endpoint):
+            out, page = {}, 1
+            while True:
+                time.sleep(0.12)
+                r = requests.get(f'{sc._API_BASE}{endpoint}', headers=_hdr(),
+                                 params={'pageNumber': page, 'pageSize': 100},
+                                 timeout=30)
+                r.raise_for_status()
+                body = r.json().get('data', {})
+                for item in body.get('items', []):
+                    out[item['name']] = int(item['key'])
+                if page >= body.get('pageCount', 1):
+                    break
+                page += 1
+            return out
+
+        animals = sc._get_all('/api/animals')
+        by_name = {str(a.get('animalName', '')).strip(): a for a in animals
+                   if str(a.get('animalName', '')).strip()}
+
+        assay_keys  = _vocab('/api/vocabulary/genotypeAssay')
+        symbol_keys = _vocab('/api/vocabulary/genotypeSymbol')
+        assay_lookup = {_norm_assay(k): (k, v) for k, v in assay_keys.items()}
+
+        # Animals that already have this assay — skip regardless of the call,
+        # so a re-genotype never silently adds a second conflicting record.
+        have_assay = set()
+        for g in sc._get_all('/api/genotypes'):
+            nm = str(g.get('animalName', '')).strip()
+            if nm:
+                have_assay.add((nm, _norm_assay(g.get('assay', ''))))
+
+        jobs, skipped, problems = [], [], []
+        for r in records:
+            climb = by_name.get(r['animal'])
+            if not climb:
+                problems.append(f"{r['animal']}: not in Climb")
+                continue
+            hit = assay_lookup.get(_norm_assay(r['assay']))
+            if not hit:
+                problems.append(f"{r['animal']}: assay '{r['assay']}' not in Climb")
+                continue
+            climb_assay, assay_key = hit
+            if r['symbol'] not in symbol_keys:
+                problems.append(f"{r['animal']}: symbol '{r['symbol']}' not in Climb")
+                continue
+            if (r['animal'], _norm_assay(climb_assay)) in have_assay:
+                skipped.append(r['animal'])
+                continue
+            jobs.append({
+                'animal':    r['animal'],
+                'animal_id': climb.get('animalId') or climb.get('animalID'),
+                'assay':     climb_assay,
+                'assay_key': assay_key,
+                'symbol':    r['symbol'],
+                'symbol_key': symbol_keys[r['symbol']],
+                'date':      r['date'],
+            })
+
+        print(f'\n  To upload        : {len(jobs)}')
+        print(f'  Already genotyped: {len(skipped)}  (skipped)')
+        if problems:
+            print(f'  Problems         : {len(problems)}')
+            for p in problems[:10]:
+                print(f'    {p}')
+            if len(problems) > 10:
+                print(f'    ... and {len(problems) - 10} more')
+
+        if not jobs:
+            print('  Nothing to upload.')
+            return
+
+        ok, failed = 0, []
+        for j in jobs:
+            payload = {'genotypeRequestDtos': [{
+                'animalID': j['animal_id'],
+                'genotypes': [{
+                    'date':              j['date'],
+                    'genotypeAssayKey':  j['assay_key'],
+                    'genotypeSymbolKey': j['symbol_key'],
+                }]
+            }]}
+            try:
+                time.sleep(0.12)
+                r = _api_post(f'{sc._API_BASE}/api/genotypes',
+                                  headers=_hdr(), json=payload, timeout=30)
+                if not r.ok:
+                    raise requests.HTTPError(f'{r.status_code} {r.text[:200]}')
+                ok += 1
+                print(f"    {j['animal']}  {j['assay']}  {j['symbol']}")
+            except Exception as e:
+                failed.append((j['animal'], str(e)))
+                print(f"    {j['animal']}: FAILED \u2014 {e}")
+
+        print(f'\n  \u2713 {ok} genotype(s) uploaded')
+        if failed:
+            print(f'  \u26a0 {len(failed)} failed \u2014 re-run to retry')
+
+    except Exception as e:
+        print(f'  \u26a0 TGS genotype upload failed: {e}')
+        print('    Continuing with the run.')
+
+
+def _push_rapid_markers_to_climb(output_df, source_df, marker_type='RapID',
+                                 separator=', '):
+    """
+    Write Envision RapID tags into Climb.
+
+        Marker      ->  "<original marker>, <RapID tag>"    e.g. "R, S4"
+        Marker Type ->  RapID
+
+    Only runs on a COMPLETE list — if any animal in the export is missing a
+    tag, nothing is pushed. A partial export must not leave Climb half-updated.
+
+    Climb's PUT /api/animals/{id} replaces the whole record, so each animal is
+    read first and every other field carried back unchanged.
+
+    Never raises: a failure here must not lose the Envision export that was
+    already written.
+    """
+    import requests, time
+
+    try:
+        # ── Completeness gate ────────────────────────────────────────────────
+        tags = output_df['Envision Ear Tag'].astype(str).str.strip()
+        missing = int((tags == '').sum())
+        if missing:
+            print(f"  \u26a0 Climb marker push skipped \u2014 {missing} of "
+                  f"{len(output_df)} animals have no tag.")
+            print("    Climb is only updated from a complete list.")
+            return
+        if output_df.empty:
+            print("  \u26a0 Climb marker push skipped \u2014 nothing in the export.")
+            return
+
+        sc = _load_sing_climb()
+
+        def _hdr():
+            return {'Authorization':   f'Bearer {sc._get_token()}',
+                    'X-Workgroup-Key': sc._WORKGROUP_KEY,
+                    'Content-Type':    'application/json'}
+
+        # ── Look up animals and the marker-type key ──────────────────────────
+        animals   = sc._get_all('/api/animals')
+        by_name   = {}
+        type_keys = {}
+        for a in animals:
+            n = str(a.get('animalName', '')).strip()
+            if n:
+                by_name[n] = a
+            if a.get('physicalMarkerTypeKey') and a.get('markerType'):
+                type_keys[a['markerType']] = a['physicalMarkerTypeKey']
+
+        if marker_type not in type_keys:
+            print(f"  \u26a0 Climb marker push skipped \u2014 marker type "
+                  f"'{marker_type}' not found in Climb.")
+            return
+        type_key = type_keys[marker_type]
+
+        # Original markers from the source data (animals.csv), keyed by name
+        orig_markers = {}
+        if 'Marker' in source_df.columns and 'Animal_Name' in source_df.columns:
+            for _, r in source_df.iterrows():
+                orig_markers[str(r['Animal_Name']).strip()] = str(r.get('Marker') or '').strip()
+
+        PRESERVE = [
+            'alternatePhysicalID', 'heldFor', 'citesNumber', 'lineKey', 'sexKey',
+            'generationKey', 'breedingStatusKey', 'dietKey', 'animalStatusKey',
+            'exitReasonKey', 'animalName', 'dateBorn', 'dateExit', 'comments',
+            'commentStatus', 'owner', 'arrivalDate', 'animalUseKey',
+            'iacucprotocolKey', 'materialOriginKey', 'externalIdentifier',
+            'microchipIdentifier',
+        ]
+        # Dates are passed straight back as Climb returned them. Reformatting
+        # to date-only sets the stored time to 00:00 UTC, which renders as the
+        # PREVIOUS day in Eastern. Never touch a date you are only carrying
+        # through.
+
+        # ── Build the work list — must resolve fully before writing ──────────
+        jobs, unknown, already = [], [], []
+        for _, row in output_df.iterrows():
+            name = str(row['Animal ID']).strip()
+            tag  = str(row['Envision Ear Tag']).strip()
+
+            climb = by_name.get(name)
+            if not climb:
+                unknown.append(name)
+                continue
+
+            current = str(climb.get('physicalMarker') or '').strip()
+            if current.endswith(tag):
+                already.append(name)
+                continue
+
+            orig = orig_markers.get(name)
+            if orig is None:
+                orig = current          # fall back to what Climb already holds
+            new_marker = tag if orig == '' else f'{orig}{separator}{tag}'
+
+            jobs.append((name, climb, new_marker, current))
+
+        if unknown:
+            print(f"  \u26a0 Climb marker push skipped \u2014 {len(unknown)} animal(s) "
+                  f"not found in Climb: {unknown[:5]}")
+            print("    Climb is only updated from a complete list.")
+            return
+
+        if not jobs:
+            print(f"  Climb markers already up to date ({len(already)} animals).")
+            return
+
+        # ── Write ────────────────────────────────────────────────────────────
+        print(f"  Updating {len(jobs)} markers in Climb "
+              f"({len(already)} already tagged)...")
+        ok, failed = 0, []
+        for name, climb, new_marker, was in jobs:
+            payload = {}
+            for f in PRESERVE:
+                v = climb.get(f)
+                if v is not None:
+                    payload[f] = v
+            payload['physicalMarker']        = new_marker
+            payload['physicalMarkerTypeKey'] = type_key
+            # Climb rejects the PUT without these four arrays. cohortKeys must
+            # carry the real cohorts — [] would remove the animal from them.
+            payload['cohortKeys'] = [c.get('cohortKey')
+                                     for c in (climb.get('cohorts') or [])
+                                     if c.get('cohortKey') is not None]
+            payload['jobKeys']               = []
+            payload['housings']              = []
+            payload['animalCharacteristics'] = []
+
+            animal_id = climb.get('animalId') or climb.get('animalID')
+            try:
+                time.sleep(0.12)
+                r = _api_put(f'{sc._API_BASE}/api/animals/{animal_id}',
+                                 headers=_hdr(), json=payload, timeout=30)
+                if not r.ok:
+                    raise requests.HTTPError(f'{r.status_code} {r.text[:200]}')
+                ok += 1
+                print(f'    {name}: {was or "(blank)"} \u2192 {new_marker}')
+            except Exception as e:
+                failed.append((name, str(e)))
+                print(f'    {name}: FAILED \u2014 {e}')
+
+        print(f"  \u2713 Climb markers updated: {ok} of {len(jobs)}")
+        if failed:
+            print(f"  \u26a0 {len(failed)} failed \u2014 re-run to retry "
+                  f"(animals already updated are skipped).")
+
+    except Exception as e:
+        print(f'  \u26a0 Climb marker push failed: {e}')
+        print('    The Envision export was still written.')
+
+
+def release_unusable_to_available(animals_df, use_available='Available'):
+    """
+    Move Wild and Inconclusive animals out of the Sing pool.
+
+    Neither can be scheduled, so they sit in Sing Inventory indefinitely.
+    Setting Use to 'Available' frees them for other projects.
+
+    Excluded lines (CONFIG['RELEASE_EXCLUDE_LINES']) are left alone — those
+    colonies keep their wild-types as controls or breeders.
+
+    Never raises.
+    """
+    import requests, time
+
+    print('\n' + '=' * 80)
+    print('RELEASE UNUSABLE ANIMALS')
+    print('=' * 80)
+
+    try:
+        exclude  = [s.strip().lower()
+                    for s in CONFIG.get('RELEASE_EXCLUDE_LINES', [])]
+        statuses = {s.strip().lower()
+                    for s in CONFIG.get('RELEASE_GENOTYPES',
+                                        [GENOTYPE_WILD, GENOTYPE_INCONC])}
+
+        line_col = next((c for c in ('Line (Short)', 'Strain', 'Line_Short')
+                         if c in animals_df.columns), None)
+        geno_col = next((c for c in ('Genotype', 'Genotype_clean')
+                         if c in animals_df.columns), None)
+        name_col = next((c for c in ('Animal_Name', 'Name')
+                         if c in animals_df.columns), None)
+
+        if not (geno_col and name_col):
+            print('  \u2717 Need Genotype and Name columns \u2014 skipping.')
+            return
+        if not line_col:
+            print('  \u2717 No line column \u2014 cannot honour the exclusions, skipping.')
+            return
+
+        print(f"  Releasing   : {', '.join(sorted(statuses))}")
+        print(f"  Excluding   : {', '.join(CONFIG.get('RELEASE_EXCLUDE_LINES', []))}")
+
+        # -- Pick candidates --------------------------------------------------
+        candidates, excluded_counts = [], {}
+        for _, row in animals_df.iterrows():
+            geno = canonicalize_genotype(row.get(geno_col))
+            if geno.lower() not in statuses:
+                continue
+
+            line = str(row.get(line_col) or '').strip()
+            if any(x and x in line.lower() for x in exclude):
+                excluded_counts[line] = excluded_counts.get(line, 0) + 1
+                continue
+
+            name = str(row.get(name_col) or '').strip()
+            if name:
+                candidates.append((name, line, geno))
+
+        if excluded_counts:
+            print('\n  Left alone (excluded lines):')
+            for line, n in sorted(excluded_counts.items()):
+                print(f'    {line:34} {n}')
+
+        if not candidates:
+            print('\n  Nothing to release.')
+            return
+
+        # -- Climb ------------------------------------------------------------
+        sc = _load_sing_climb()
+
+        def _hdr():
+            return {'Authorization':   f'Bearer {sc._get_token()}',
+                    'X-Workgroup-Key': sc._WORKGROUP_KEY,
+                    'Content-Type':    'application/json'}
+
+        animals  = sc._get_all('/api/animals')
+        by_name  = {}
+        use_keys = {}
+        for a in animals:
+            n = str(a.get('animalName', '')).strip()
+            if n:
+                by_name[n] = a
+            if a.get('animalUseKey') and a.get('use'):
+                use_keys[a['use']] = a['animalUseKey']
+
+        if use_available not in use_keys:
+            print(f"\n  \u2717 Use '{use_available}' not found in Climb.")
+            print(f'    Available: {sorted(use_keys)}')
+            return
+        target_key = use_keys[use_available]
+
+        PRESERVE = [
+            'alternatePhysicalID', 'heldFor', 'citesNumber', 'lineKey', 'sexKey',
+            'generationKey', 'breedingStatusKey', 'dietKey', 'animalStatusKey',
+            'exitReasonKey', 'animalName', 'physicalMarker', 'dateBorn',
+            'dateExit', 'comments', 'commentStatus', 'owner', 'arrivalDate',
+            'iacucprotocolKey', 'physicalMarkerTypeKey', 'materialOriginKey',
+            'externalIdentifier', 'microchipIdentifier',
+        ]
+
+        jobs, already, missing = [], [], []
+        by_geno = {}
+        for name, line, geno in candidates:
+            climb = by_name.get(name)
+            if not climb:
+                missing.append(name)
+                continue
+            if climb.get('animalUseKey') == target_key:
+                already.append(name)
+                continue
+            jobs.append({'name': name, 'line': line, 'geno': geno,
+                         'climb': climb, 'was': climb.get('use', '')})
+            by_geno[geno] = by_geno.get(geno, 0) + 1
+
+        print(f'\n  To release   : {len(jobs)}')
+        for g, n in sorted(by_geno.items()):
+            print(f'    {g:16} {n}')
+        print(f'  Already set  : {len(already)}')
+        if missing:
+            print(f'  Not in Climb : {len(missing)}')
+
+        if not jobs:
+            print('  Nothing to change.')
+            return
+
+        ok, failed = 0, []
+        for j in jobs:
+            climb   = j['climb']
+            payload = {f: climb[f] for f in PRESERVE if climb.get(f) is not None}
+            payload['animalUseKey'] = target_key
+            payload['cohortKeys']   = [c.get('cohortKey')
+                                       for c in (climb.get('cohorts') or [])
+                                       if c.get('cohortKey') is not None]
+            payload['jobKeys']               = []
+            payload['housings']              = []
+            payload['animalCharacteristics'] = []
+
+            animal_id = climb.get('animalId') or climb.get('animalID')
+            try:
+                time.sleep(0.12)
+                r = _api_put(f'{sc._API_BASE}/api/animals/{animal_id}',
+                                 headers=_hdr(), json=payload, timeout=30)
+                if not r.ok:
+                    raise requests.HTTPError(f'{r.status_code} {r.text[:200]}')
+                ok += 1
+                print(f"    {j['name']:10} {j['line'][:18]:18} {j['geno']:14} "
+                      f"{j['was'] or '(blank)'} \u2192 {use_available}")
+            except Exception as e:
+                failed.append((j['name'], str(e)))
+                print(f"    {j['name']}: FAILED \u2014 {e}")
+
+        print(f'\n  \u2713 Released {ok} of {len(jobs)} animals')
+        if failed:
+            print(f'  \u26a0 {len(failed)} failed \u2014 re-run to retry')
+
+    except Exception as e:
+        print(f'  \u26a0 Release failed: {e}')
+        print('    The schedule is unaffected.')
+
+
+def update_animal_use(working_df, use_p14='Sing - P14', use_p56='Sing - P56'):
+    """
+    Set the Use field on scheduled animals according to their timepoint.
+
+        P14   -> 'Sing - P14'
+        Adult -> 'Sing - P56'
+
+    Runs after harvest assignments are confirmed. Animals already carrying the
+    right Use are skipped, so it is safe to re-run.
+
+    Uses the same read-modify-write as every other write path: PUT replaces the
+    whole animal record, so everything else is carried back untouched and the
+    four array fields are required.
+
+    Never raises — a failure here must not lose the schedule.
+    """
+    import requests, time
+
+    print('\n' + '=' * 80)
+    print('ANIMAL USE UPDATE')
+    print('=' * 80)
+
+    try:
+        sc = _load_sing_climb()
+
+        def _hdr():
+            return {'Authorization':   f'Bearer {sc._get_token()}',
+                    'X-Workgroup-Key': sc._WORKGROUP_KEY,
+                    'Content-Type':    'application/json'}
+
+        animals   = sc._get_all('/api/animals')
+        by_name   = {}
+        use_keys  = {}
+        for a in animals:
+            n = str(a.get('animalName', '')).strip()
+            if n:
+                by_name[n] = a
+            if a.get('animalUseKey') and a.get('use'):
+                use_keys[a['use']] = a['animalUseKey']
+
+        missing = [u for u in (use_p14, use_p56) if u not in use_keys]
+        if missing:
+            print(f'  \u2717 Use value(s) not found in Climb: {missing}')
+            print(f'    Available: {sorted(use_keys)}')
+            return
+
+        key_p14, key_p56 = use_keys[use_p14], use_keys[use_p56]
+
+        PRESERVE = [
+            'alternatePhysicalID', 'heldFor', 'citesNumber', 'lineKey', 'sexKey',
+            'generationKey', 'breedingStatusKey', 'dietKey', 'animalStatusKey',
+            'exitReasonKey', 'animalName', 'physicalMarker', 'dateBorn',
+            'dateExit', 'comments', 'commentStatus', 'owner', 'arrivalDate',
+            'iacucprotocolKey', 'physicalMarkerTypeKey', 'materialOriginKey',
+            'externalIdentifier', 'microchipIdentifier',
+        ]
+
+        jobs, already, not_found = [], [], []
+
+        for _, row in working_df.iterrows():
+            name = str(row.get('Animal_Name') or row.get('Name') or '').strip()
+            if not name:
+                continue
+
+            timepoint = (row.get('Assigned_Timepoint')
+                         or row.get('Harvest Timepoint')
+                         or row.get('Age (Days)') or '')
+            want_key, want_name = ((key_p14, use_p14) if _is_p14(timepoint)
+                                   else (key_p56, use_p56))
+
+            climb = by_name.get(name)
+            if not climb:
+                not_found.append(name)
+                continue
+
+            if climb.get('animalUseKey') == want_key:
+                already.append(name)
+                continue
+
+            jobs.append({'name': name, 'climb': climb,
+                         'was': climb.get('use', ''),
+                         'want_key': want_key, 'want_name': want_name})
+
+        print(f'  To update  : {len(jobs)}')
+        print(f'  Already set: {len(already)}')
+        if not_found:
+            print(f'  Not in Climb: {len(not_found)}  {not_found[:5]}')
+
+        if not jobs:
+            print('  Nothing to change.')
+            return
+
+        counts = {}
+        for j in jobs:
+            counts[j['want_name']] = counts.get(j['want_name'], 0) + 1
+        for k, v in sorted(counts.items()):
+            print(f'    {k:16} {v}')
+
+        ok, failed = 0, []
+        for j in jobs:
+            climb   = j['climb']
+            payload = {f: climb[f] for f in PRESERVE if climb.get(f) is not None}
+            payload['animalUseKey'] = j['want_key']
+            payload['cohortKeys']   = [c.get('cohortKey')
+                                       for c in (climb.get('cohorts') or [])
+                                       if c.get('cohortKey') is not None]
+            payload['jobKeys']               = []
+            payload['housings']              = []
+            payload['animalCharacteristics'] = []
+
+            animal_id = climb.get('animalId') or climb.get('animalID')
+            try:
+                time.sleep(0.12)
+                r = _api_put(f'{sc._API_BASE}/api/animals/{animal_id}',
+                                 headers=_hdr(), json=payload, timeout=30)
+                if not r.ok:
+                    raise requests.HTTPError(f'{r.status_code} {r.text[:200]}')
+                ok += 1
+                print(f"    {j['name']}: {j['was'] or '(blank)'} \u2192 {j['want_name']}")
+            except Exception as e:
+                failed.append((j['name'], str(e)))
+                print(f"    {j['name']}: FAILED \u2014 {e}")
+
+        print(f'\n  \u2713 Use updated on {ok} of {len(jobs)} animals')
+        if failed:
+            print(f'  \u26a0 {len(failed)} failed \u2014 re-run to retry')
+
+    except Exception as e:
+        print(f'  \u26a0 Use update failed: {e}')
+        print('    The schedule is unaffected.')
+
+
+def _cohort_name_for_row(row) -> str:
+    """
+    Cohort a scheduled animal belongs in.
+
+        P14   -> 'P14 <harvest date>'
+        Adult -> 'P56 <behavior date>'
+
+    Returns '' if no usable date, so the animal is reported rather than
+    silently assigned to the wrong cohort.
+    """
+    date_val = _file_date_for_row(row)
+    if not date_val:
+        return ''
+    date_str = _harvest_date_str(date_val)
+    if not date_str:
+        return ''
+
+    def _get(name):
+        try:
+            return row.get(name)
+        except AttributeError:
+            return row[name] if name in row else None
+
+    timepoint = (_get('Age (Days)') or _get('Assigned_Timepoint')
+                 or _get('Harvest Timepoint') or '')
+    prefix = 'P14' if _is_p14(timepoint) else 'P56'
+    return f'{prefix} {date_str}'
+
+
+def plan_cohorts(working_df):
+    """
+    Work out which cohorts the scheduled animals need.
+
+    Returns (plan, unassignable) where plan is:
+        { cohort_name: {'animals': [names], 'birth_dates': [sorted unique]} }
+    and unassignable is a list of animal names with no usable date.
+    """
+    plan = {}
+    unassignable = []
+
+    for _, row in working_df.iterrows():
+        try:
+            name = str(row.get('Animal_Name') or row.get('Name') or '').strip()
+        except AttributeError:
+            name = ''
+        if not name:
+            continue
+
+        cohort = _cohort_name_for_row(row)
+        if not cohort:
+            unassignable.append(name)
+            continue
+
+        entry = plan.setdefault(cohort, {'animals': [], 'birth_dates': set()})
+        entry['animals'].append(name)
+
+        bd = None
+        for col in ('Birth_Date', 'Birth Date', 'BD'):
+            try:
+                v = row.get(col)
+            except AttributeError:
+                v = row[col] if col in row else None
+            if v is not None and str(v).strip() not in ('', 'nan', 'NaT', 'None'):
+                bd = v
+                break
+        if bd is not None:
+            try:
+                entry['birth_dates'].add(pd.to_datetime(bd).strftime('%m/%d/%Y'))
+            except Exception:
+                entry['birth_dates'].add(str(bd).strip())
+
+    for c in plan.values():
+        c['birth_dates'] = sorted(c['birth_dates'])
+
+    return plan, unassignable
+
+
+def fetch_existing_cohorts():
+    """Return {cohort_name: cohortKey} for every cohort in Climb."""
+    sc = _load_sing_climb()
+    out = {}
+    for c in sc._get_all('/api/cohorts'):
+        name = str(c.get('name', '') or '').strip()
+        key  = c.get('cohortKey') or c.get('key')
+        if name and key is not None:
+            out[name] = int(key)
+    return out
+
+
+def _cohort_description(cohort_name: str, birth_dates: list) -> str:
+    """
+    Description text for a cohort, matching how they're written in Climb.
+
+        P14  ->  'BD 08/26/2026'
+                 One date. P14 harvest is a fixed 14 days after birth, so every
+                 animal in the cohort shares a birth date.
+
+        P56  ->  'BD 06/24/2026 - 07/01/2026'
+                 A range. Behavior happens on day 42-49, both multiples of 7,
+                 so the window runs Wednesday to Wednesday.
+
+    The dates are derived from the cohort's own date, not from the animals, so
+    the range is the full eligible window even if the animals in it don't span
+    all of it. Falls back to the observed birth dates if the name won't parse.
+    """
+    try:
+        prefix, date_part = cohort_name.split(' ', 1)
+        anchor = datetime.strptime(date_part.strip(), '%Y_%m_%d')
+    except Exception:
+        return 'BD ' + ', '.join(birth_dates) if birth_dates else ''
+
+    if prefix.upper() == 'P14':
+        born = anchor - timedelta(days=CONFIG['P14_HARVEST_AGE_DAYS'])
+        return f'BD {born.strftime("%m/%d/%Y")}'
+
+    # P56 — behavior date minus the far and near ends of the window
+    start = anchor - timedelta(days=CONFIG['P56_BEHAVIOR_END_DAY'])
+    end   = anchor - timedelta(days=CONFIG['P56_BEHAVIOR_START_DAY'])
+    return f'BD {start.strftime("%m/%d/%Y")} - {end.strftime("%m/%d/%Y")}'
+
+
+def write_cohort_report(plan, existing, unassignable, output_dir, timestamp):
+    """
+    Write an XLSX listing the cohorts to create and which animals go in each.
+
+    Sheet 'Cohorts to Create' — one row per missing cohort, with the born dates
+                                that belong in its description.
+    Sheet 'Animal Assignments' — every animal and its cohort.
+    """
+    missing = {n: d for n, d in plan.items() if n not in existing}
+
+    cohort_rows = []
+    for name in sorted(plan):
+        info = plan[name]
+        cohort_rows.append({
+            'Cohort Name':   name,
+            'Status':        'EXISTS' if name in existing else 'CREATE',
+            'Cohort Key':    existing.get(name, ''),
+            'Animals':       len(info['animals']),
+            'Description':   _cohort_description(name, info['birth_dates']),
+            'Born Dates':    ', '.join(info['birth_dates']),
+        })
+
+    animal_rows = []
+    for name in sorted(plan):
+        for a in sorted(plan[name]['animals'], key=natural_sort_key):
+            animal_rows.append({
+                'Animal':      a,
+                'Cohort Name': name,
+                'Status':      'EXISTS' if name in existing else 'CREATE',
+            })
+    for a in sorted(unassignable, key=natural_sort_key):
+        animal_rows.append({
+            'Animal': a, 'Cohort Name': '', 'Status': 'NO DATE — cannot assign',
+        })
+
+    dates = sorted({n.split(' ', 1)[1] for n in plan if ' ' in n})
+    if not dates:
+        date_str = timestamp
+    elif len(dates) <= 4:
+        date_str = '_'.join(dates)
+    else:
+        date_str = f'{dates[0]}_to_{dates[-1]}'
+
+    out_path = _make_dated_path(output_dir, 'Cohorts_To_Create', date_str)
+    with pd.ExcelWriter(out_path, engine='openpyxl') as w:
+        pd.DataFrame(cohort_rows).to_excel(w, sheet_name='Cohorts to Create',
+                                          index=False)
+        pd.DataFrame(animal_rows).to_excel(w, sheet_name='Animal Assignments',
+                                          index=False)
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(out_path)
+        for ws in wb.worksheets:
+            auto_width_worksheet(ws)
+        wb.save(out_path)
+    except Exception:
+        pass
+
+    print(f'  \U0001f4c4 Saved: {os.path.basename(out_path)}  '
+          f'({len(missing)} to create, {len(plan) - len(missing)} existing)')
+    return out_path
+
+
+def assign_animals_to_cohorts(plan, existing):
+    """
+    Add scheduled animals to their cohorts via PUT /api/animals/{animalID}.
+
+    Read-modify-write: the PUT replaces the whole record, so every other field
+    is carried back unchanged and existing cohort membership is preserved.
+
+    Returns (updated, skipped, failed).
+    """
+    import requests, time
+
+    sc = _load_sing_climb()
+
+    def _hdr():
+        return {'Authorization':   f'Bearer {sc._get_token()}',
+                'X-Workgroup-Key': sc._WORKGROUP_KEY,
+                'Content-Type':    'application/json'}
+
+    animals = sc._get_all('/api/animals')
+    by_name = {str(a.get('animalName', '')).strip(): a for a in animals
+               if str(a.get('animalName', '')).strip()}
+
+    PRESERVE = [
+        'alternatePhysicalID', 'heldFor', 'citesNumber', 'lineKey', 'sexKey',
+        'generationKey', 'breedingStatusKey', 'dietKey', 'animalStatusKey',
+        'exitReasonKey', 'animalName', 'physicalMarker', 'dateBorn', 'dateExit',
+        'comments', 'commentStatus', 'owner', 'arrivalDate', 'animalUseKey',
+        'iacucprotocolKey', 'physicalMarkerTypeKey', 'materialOriginKey',
+        'externalIdentifier', 'microchipIdentifier',
+    ]
+    # Dates go back exactly as received — see the marker push for why.
+
+    updated, skipped, failed = [], [], []
+
+    for cohort_name in sorted(plan):
+        key = existing.get(cohort_name)
+        if key is None:
+            continue                      # not created — caller handles this
+        for name in plan[cohort_name]['animals']:
+            climb = by_name.get(name)
+            if not climb:
+                failed.append((name, 'not found in Climb'))
+                continue
+
+            current_keys = [c.get('cohortKey') for c in (climb.get('cohorts') or [])
+                            if c.get('cohortKey') is not None]
+            if key in current_keys:
+                skipped.append(name)
+                continue
+
+            payload = {}
+            for f in PRESERVE:
+                v = climb.get(f)
+                if v is not None:
+                    payload[f] = v
+            payload['cohortKeys'] = sorted(set(current_keys) | {key})
+            # Required by Climb or the PUT 400s
+            payload['jobKeys']               = []
+            payload['housings']              = []
+            payload['animalCharacteristics'] = []
+
+            animal_id = climb.get('animalId') or climb.get('animalID')
+            try:
+                time.sleep(0.12)
+                r = _api_put(f'{sc._API_BASE}/api/animals/{animal_id}',
+                                 headers=_hdr(), json=payload, timeout=30)
+                if not r.ok:
+                    raise requests.HTTPError(f'{r.status_code} {r.text[:200]}')
+                updated.append((name, cohort_name))
+                print(f'    {name} \u2192 {cohort_name}')
+            except Exception as e:
+                failed.append((name, str(e)))
+                print(f'    {name}: FAILED \u2014 {e}')
+
+    return updated, skipped, failed
+
+
+def run_cohorts(working_df, timestamp, output_dir=None):
+    """
+    Assign scheduled animals to cohorts.
+
+    Cohorts cannot be created through the API (see CLIMB_API_LIMITATIONS.md), so
+    if any are missing this pauses, lists what to create, and waits. On resume
+    it re-checks; anything still missing is listed again. Skippable at any point.
+    """
+    print('\n' + '=' * 80)
+    print('COHORT ASSIGNMENT')
+    print('=' * 80)
+
+    out_dir = output_dir or _SCRIPT_DIR
+
+    plan, unassignable = plan_cohorts(working_df)
+    if not plan:
+        print('  No cohorts needed \u2014 no animals with usable dates.')
+        return None
+
+    print(f'  {len(plan)} cohort(s) needed for '
+          f'{sum(len(v["animals"]) for v in plan.values())} animals')
+    if unassignable:
+        print(f'  \u26a0 {len(unassignable)} animal(s) have no date and cannot be '
+              f'assigned: {unassignable[:5]}')
+
+    try:
+        existing = fetch_existing_cohorts()
+    except Exception as e:
+        print(f'  \u2717 Could not read cohorts from Climb: {e}')
+        return None
+
+    report = write_cohort_report(plan, existing, unassignable, out_dir, timestamp)
+
+    # ── Wait for missing cohorts to be created ───────────────────────────────
+    attempt = 0
+    while True:
+        missing = {n: v for n, v in plan.items() if n not in existing}
+        if not missing:
+            break
+
+        attempt += 1
+        print(f'\n  {len(missing)} cohort(s) do not exist in Climb yet:')
+        for n in sorted(missing):
+            info = missing[n]
+            bd = _cohort_description(n, info['birth_dates'])
+            print(f'    {n}   ({len(info["animals"])} animals)   {bd}')
+
+        answer = _gui_ask('cohort_create',
+                          missing=[{'name': n,
+                                    'count': len(v['animals']),
+                                    'description': _cohort_description(n, v['birth_dates'])}
+                                   for n, v in sorted(missing.items())],
+                          attempt=attempt,
+                          report=os.path.basename(report))
+
+        if answer == 'skip':
+            print('\n  Cohort assignment skipped.')
+            print(f'  See {os.path.basename(report)} for what still needs creating.')
+            return report
+
+        # 'recheck' — pull the list again
+        print('\n  Re-checking Climb...')
+        try:
+            existing = fetch_existing_cohorts()
+        except Exception as e:
+            print(f'  \u2717 Could not re-read cohorts: {e}')
+            return report
+        still = [n for n in plan if n not in existing]
+        if still:
+            print(f'  {len(still)} still missing.')
+        else:
+            print('  All cohorts found.')
+            write_cohort_report(plan, existing, unassignable, out_dir, timestamp)
+
+    # ── Assign ───────────────────────────────────────────────────────────────
+    print(f'\n  Adding animals to {len(plan)} cohort(s)...')
+    updated, skipped, failed = assign_animals_to_cohorts(plan, existing)
+
+    print(f'\n  \u2713 Cohort assignment complete')
+    print(f'    Added        : {len(updated)}')
+    print(f'    Already in   : {len(skipped)}')
+    print(f'    Failed       : {len(failed)}')
+    for name, err in failed[:10]:
+        print(f'      {name}: {err}')
+
+    return report
+
+
+def run_climb_to_envision(working_df, timestamp, output_dir=None):
     """STEP 3: Create Envision translation."""
     print("\n" + "=" * 80)
     print("STEP 3: CLIMB TO ENVISION")
@@ -7164,18 +9307,40 @@ def run_climb_to_envision(working_df, timestamp):
 
     df = working_df.copy()
 
+    # Normalise column names from CSV variants to internal names
+    _col_map = {
+        'Name':       'Animal_Name',
+        'Birth Date': 'Birth_Date',
+    }
+    for _src, _dst in _col_map.items():
+        if _src in df.columns and _dst not in df.columns:
+            df = df.rename(columns={_src: _dst})
+
     required = ['Genotype', 'Sex', 'Housing ID', 'Animal_Name', 'Line', 'Birth_Date']
     missing = [col for col in required if col not in df.columns]
     if missing:
-        print(f"  ✗ Missing columns: {missing}")
-        return None
+        print(f"  \u274c Envision: missing columns: {missing}")
+        print(f"  Available: {list(df.columns)}")
+        raise RuntimeError(
+            f"Envision translation cannot run \u2014 missing columns: {missing}"
+        )
 
     print(f"  Processing {len(df)} animals...")
 
     df['genotype_base'] = df.apply(
         lambda row: clean_genotype_base(row['Genotype'], row['Line']), axis=1)
     df['sex_initial'] = df['Sex'].str[0].str.upper()
-    df['Group_base'] = df['genotype_base'] + '-' + df['sex_initial']
+
+    # Use Line (Short) for the group label so it shows e.g. "Dll1-F" not "Het-F".
+    # Fall back to genotype_base if Line (Short) is missing or empty.
+    if 'Line (Short)' in df.columns:
+        line_short = df['Line (Short)'].str.strip()
+    elif 'Strain' in df.columns:
+        line_short = df['Strain'].str.strip()
+    else:
+        line_short = pd.Series('', index=df.index)
+    line_short = line_short.where(line_short != '', df['genotype_base'])
+    df['Group_base'] = line_short + '-' + df['sex_initial']
 
     group_suffixes = group_animals_by_housing(df)
     df['Group'] = df.index.map(group_suffixes)
@@ -7204,35 +9369,35 @@ def run_climb_to_envision(working_df, timestamp):
     })
     output_df = output_df[ENVISION_TEMPLATE_COLUMNS]
 
-    output_filename = f"Envision_{timestamp}.xlsx"
+    # File date: harvest date for P14, behavior date for adults
+    output_df['_harvest_date'] = df.apply(_file_date_for_row, axis=1).values
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = 'template_csv_v1.0'
+    _out_dir = output_dir if output_dir else _SCRIPT_DIR
+    saved_paths = []
 
-    for col_num, header in enumerate(ENVISION_TEMPLATE_COLUMNS, 1):
-        ws.cell(row=1, column=col_num, value=header)
+    for date_val, group in output_df.groupby('_harvest_date', sort=True):
+        date_str = _harvest_date_str(date_val) if date_val else 'unknown_date'
+        out_path = _make_dated_path(_out_dir, 'Envision', date_str)
+        export_df = group.drop(columns=['_harvest_date'])
 
-    for row_num, row_data in enumerate(output_df.values, 2):
-        for col_num, value in enumerate(row_data, 1):
-            cell = ws.cell(row=row_num, column=col_num)
-            if pd.isna(value):
-                cell.value = ''
-            else:
-                cell.value = value
+        wb = Workbook()
+        ws = wb.active
+        ws.title = 'template_csv_v1.0'
+        ws.append(list(export_df.columns))
+        for _, row in export_df.iterrows():
+            ws.append([row[c] for c in export_df.columns])
+        auto_width_worksheet(ws)
+        wb.save(out_path)
+        saved_paths.append(out_path)
+        print(f"  \U0001f4c4 Saved: {os.path.basename(out_path)}  ({len(export_df)} animals)")
 
-    auto_width_worksheet(ws)
-    wb.save(output_filename)
+    print(f"  \u2713 Envision complete: {len(saved_paths)} file(s)")
 
-    print(f"  📄 Saved: {output_filename}")
-    print(f"  ✓ Step 3 complete: {len(output_df)} animals")
+    # Push the assigned tags into Climb — only from a complete list.
+    if saved_paths and CONFIG.get('PUSH_RAPID_MARKERS_TO_CLIMB', True):
+        _push_rapid_markers_to_climb(output_df, df)
 
-    group_counts = output_df.groupby(['Group', 'Cage']).size().reset_index(name='Count')
-    print(f"\n  Group Summary:")
-    for _, row in group_counts.iterrows():
-        print(f"    {row['Group']} | Cage {row['Cage']} | {row['Count']} animals")
-
-    return output_filename
+    return saved_paths if saved_paths else None
 
 
 # ============================================================
@@ -7280,7 +9445,11 @@ def determine_label_type(preservation):
     elif 'pfa' in preservation_str or 'fixed' in preservation_str:
         return 'perfusion', 2
     else:
-        return 'rna', 1
+        # Unrecognised / blank Preservation. Previously defaulted to 'rna',
+        # which silently gave perfusion animals RNA tube labels (e.g. the
+        # 'Extra - Sex & Timepoint Full' protocol yields Preservation = '').
+        # Now produces no label and is reported at the end of the run.
+        return 'unknown', 0
 
 
 def format_sample_number(sample_name, pad=True):
@@ -7329,26 +9498,43 @@ def create_rna_excel(rna_labels, output_folder, timestamp):
                              'text': f'  ❌ RNA label number mismatch at positions: {mismatches}'})
         raise ValueError(f'RNA label number mismatch at rows: {mismatches}')
 
-    sides_df = pd.DataFrame({
-        'Label Number':  [l['Sides_Label_Num'] for l in rna_labels],
-        'Sample_Date':   [l['Sides_B']         for l in rna_labels],
-        'Animal_Strain': [l['Sides_C']         for l in rna_labels],
-    })
-    tops_df = pd.DataFrame({
-        'Label Number':  [l['Tops_Label_Num'] for l in rna_labels],
-        'Sample Number': [l['Tops_B']         for l in rna_labels],
-        'Animal Number': [l['Tops_C']         for l in rna_labels],
-    })
+    output_files = []
+    from itertools import groupby as _groupby
+    labels_by_date = {}
+    for lbl in rna_labels:
+        d = lbl.get('_harvest_date', '') or 'unknown_date'
+        labels_by_date.setdefault(d, []).append(lbl)
 
-    output_file = _os.path.join(output_folder, f'Tube_Labeler_RNA_{timestamp}.xlsx')
-    with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
-        sides_df.to_excel(writer, sheet_name='Sides', index=False, header=False)
-        tops_df.to_excel(writer,  sheet_name='Tops',  index=False, header=False)
+    for date_str, date_labels in sorted(labels_by_date.items()):
+        # Convert display date (MM/DD/YY) to filename format (YYYY_MM_DD)
+        try:
+            fname_date = pd.to_datetime(date_str).strftime('%Y_%m_%d')
+        except Exception:
+            fname_date = date_str.replace('/', '_').replace('-', '_')
 
-    _pipeline_queue.put({'kind': _MSG_LOG,
-                         'text': f'  ✓ RNA Tube Labeler saved: {_os.path.basename(output_file)}'
-                                 f'  (Sides={len(sides_df)}, Tops={len(tops_df)})'})
-    return output_file
+        output_file = _make_dated_path(output_folder, 'Tube_Labeler_RNA', fname_date)
+
+        sides_df = pd.DataFrame({
+            'Label Number':  [l['Sides_Label_Num'] for l in date_labels],
+            'Sample_Date':   [l['Sides_B']          for l in date_labels],
+            'Animal_Strain': [l['Sides_C']          for l in date_labels],
+        })
+        tops_df = pd.DataFrame({
+            'Label Number':  [l['Tops_Label_Num'] for l in date_labels],
+            'Sample Number': [l['Tops_B']          for l in date_labels],
+            'Animal Number': [l['Tops_C']          for l in date_labels],
+        })
+
+        with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+            sides_df.to_excel(writer, sheet_name='Sides', index=False, header=False)
+            tops_df.to_excel(writer,  sheet_name='Tops',  index=False, header=False)
+
+        _pipeline_queue.put({'kind': _MSG_LOG,
+                             'text': f'  \u2713 RNA Tube Labeler saved: {_os.path.basename(output_file)}'
+                                     f'  (Sides={len(sides_df)}, Tops={len(tops_df)})'})
+        output_files.append(output_file)
+
+    return output_files if output_files else None
 
 
 def format_label_rows(row, label_type):
@@ -7420,6 +9606,7 @@ def generate_all_labels(merged_df):
     perfusion_count  = 0
     rna_count        = 0
     oct_count        = 0
+    unknown_rows     = []   # (sample, animal, preservation) — reported below
 
     for _, data_row in merged_df.iterrows():
         preservation = safe_get_label(data_row, 'Preservation', 'Preservation_sample', 'Preservation_animal')
@@ -7431,6 +9618,10 @@ def generate_all_labels(merged_df):
             oct_count += 1
             continue
 
+        if label_type == 'unknown':
+            unknown_rows.append((sample_name, animal_name, preservation))
+            continue
+
         if label_type == 'perfusion':
             perfusion_count += 1
             try:
@@ -7440,9 +9631,10 @@ def generate_all_labels(merged_df):
                 traceback.print_exc()
                 continue
             for _ in range(copies):
-                perfusion_labels.append(
-                    {'Row 1': row1, 'Row 2': row2, 'Row 3': row3, 'Row 4': row4}
-                )
+                perfusion_labels.append({
+                    'Row 1': row1, 'Row 2': row2, 'Row 3': row3, 'Row 4': row4,
+                    '_harvest_date': safe_date_format(_file_date_for_row(data_row))
+                })
 
         else:  # rna
             rna_count += 1
@@ -7461,6 +9653,7 @@ def generate_all_labels(merged_df):
                     'Tops_Label_Num':  rna_count,
                     'Tops_B':          sample_raw,
                     'Tops_C':          animal_str,
+                    '_harvest_date':   safe_date_format(_file_date_for_row(data_row)),
                 })
             except Exception as e:
                 print(f"    ✗ Error formatting RNA '{sample_name}': {e}")
@@ -7473,6 +9666,15 @@ def generate_all_labels(merged_df):
         print(f"    OCT Block: {oct_count} × 0 = skipped")
     print(f"    Total perfusion labels: {len(perfusion_labels)}")
     print(f"    Total RNA labels:       {rna_count}")
+
+    if unknown_rows:
+        print("")
+        print(f"    !! {len(unknown_rows)} sample(s) had an unrecognised Preservation "
+              f"value — NO LABEL was made for these:")
+        for s_name, a_name, pres in unknown_rows:
+            print(f"       Sample {s_name}  Animal {a_name}  Preservation={pres!r}")
+        print("       Check the Protocol on these animals in the harvest sheet.")
+        print("")
 
     return perfusion_labels, rna_labels, perfusion_count, rna_count, oct_count
 
@@ -7487,6 +9689,11 @@ def run_labels(samples_df, working_df, timestamp):
     print("STEP 4: LABELS")
     print("=" * 80)
 
+    if samples_df is None:
+        print("  ✗ No sample data — the Climb Samples module did not run.")
+        print("    Labels are built from sample records, so tick 'Climb Samples'")
+        print("    as well as 'Labels', or place a samples.csv in the script folder.")
+        return None
     if samples_df.empty:
         print("  ✗ No sample data. Skipping.")
         return None
@@ -7505,9 +9712,14 @@ def run_labels(samples_df, working_df, timestamp):
         s_rename['Harvest Date'] = 'Sample Harvest Date'
     s_df = s_df.rename(columns=s_rename)
 
-    # Prepare animals — rename Animal_Name for merge
+    # Prepare animals — rename Animal_Name for merge.
+    # Scheduler output uses 'Animal_Name'; a raw Climb animals.csv uses 'Name'.
+    # Accept either so Labels can run standalone against a Climb export.
     a_df = working_df.copy()
-    a_df = a_df.rename(columns={'Animal_Name': 'Animal Name'})
+    if 'Animal_Name' in a_df.columns:
+        a_df = a_df.rename(columns={'Animal_Name': 'Animal Name'})
+    elif 'Name' in a_df.columns:
+        a_df = a_df.rename(columns={'Name': 'Animal Name'})
 
     if 'Animal Name' not in s_df.columns:
         print("  ✗ 'Animal Name' not found in samples after rename")
@@ -7563,23 +9775,38 @@ def run_labels(samples_df, working_df, timestamp):
             print("  ✗ No labels generated.")
         return None
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
+    script_dir = _SCRIPT_DIR
     created_files = []
 
-    # --- RNA Tube Labeler ---
+    # --- RNA Tube Labeler (already grouped by date inside create_rna_excel) ---
     if rna_labels:
-        rna_file = create_rna_excel(rna_labels, script_dir, timestamp)
-        if rna_file:
-            created_files.append(rna_file)
+        rna_files = create_rna_excel(rna_labels, script_dir, timestamp)
+        if rna_files:
+            if isinstance(rna_files, list):
+                created_files.extend(rna_files)
+            else:
+                created_files.append(rna_files)
 
-    # --- Perfusion Mail-Merge sheets ---
+    # --- Perfusion Mail-Merge sheets — grouped by harvest date ---
     if perfusion_labels:
-        num_sheets, perf_files = create_label_sheets(perfusion_labels, script_dir, timestamp)
-        created_files.extend(perf_files)
+        labels_by_date = {}
+        for lbl in perfusion_labels:
+            d = lbl.get('_harvest_date', '') or 'unknown_date'
+            labels_by_date.setdefault(d, []).append(lbl)
+
+        for date_disp, date_labels in sorted(labels_by_date.items()):
+            try:
+                date_str = pd.to_datetime(date_disp).strftime('%Y_%m_%d')
+            except Exception:
+                date_str = date_disp.replace('/', '_').replace('-', '_')
+            num_sheets, perf_files = _create_label_sheets_gui(
+                date_labels, script_dir, timestamp, date_str=date_str
+            )
+            created_files.extend(perf_files)
 
     total = len(created_files)
     if total > 0:
-        print(f"\n  ✓ Step 4 complete: {total} label file(s)")
+        print(f"\n  \u2713 Step 4 complete: {total} label file(s)")
         if oct_count > 0:
             print(f"    Note: {oct_count} OCT Block sample(s) skipped")
 
@@ -7650,58 +9877,59 @@ class _QueueWriter:
 # Replacements for terminal input() calls inside the pipeline
 # ---------------------------------------------------------------------------
 def get_starting_sample_number():
-    """GUI version — pauses pipeline, shows dialog, returns int."""
-    return _gui_ask('sample_number')
+    """Fetch next sample number from Climb (globally sequential across all projects)."""
+    try:
+        _sc = _load_sing_climb()
+        fetched = _sc.get_next_sample_number(verbose=False)
+    except Exception as ex:
+        _pipeline_queue.put({'kind': _MSG_LOG,
+                             'text': f'ERROR: Could not fetch sample number from Climb: {ex}'})
+        raise
+    _pipeline_queue.put({'kind': _MSG_LOG,
+                         'text': f'  Next sample number: {fetched}'})
+    return fetched
 
 
-def _create_label_sheets_gui(all_labels, output_folder, timestamp):
-    """GUI version of create_label_sheets — asks offsets via dialog."""
+def _create_label_sheets_gui(all_labels, output_folder, timestamp, date_str=''):
+    """GUI version of create_label_sheets — always starts from label position 1."""
     if not all_labels:
-        _pipeline_queue.put({'kind': _MSG_LOG, 'text': '    ✗ No labels to create!'})
+        _pipeline_queue.put({'kind': _MSG_LOG, 'text': '    \u2717 No labels to create!'})
         return 0, []
 
-    created_files      = []
+    created_files       = []
     current_label_index = 0
     sheet_num           = 1
 
     while current_label_index < len(all_labels):
         labels_remaining = len(all_labels) - current_label_index
         _pipeline_queue.put({'kind': _MSG_LOG,
-                              'text': f'    📄 Label sheet {sheet_num}  ({labels_remaining} labels remaining)'})
+                              'text': f'    \U0001f4c4 Label sheet {sheet_num}  ({labels_remaining} labels remaining)'})
 
-        labels_used = _gui_ask('label_offset',
-                                sheet_num=sheet_num,
-                                labels_remaining=labels_remaining)
-
-        sheet_labels = [{'Row 1': '', 'Row 2': '', 'Row 3': '', 'Row 4': ''}
-                        for _ in range(labels_used)]
-
-        labels_placed = 0
+        # Always start from position 1 — no skipped labels
+        sheet_labels = []
         ci = current_label_index
         while len(sheet_labels) < LABELS_PER_PAGE and ci < len(all_labels):
-            sheet_labels.append(all_labels[ci])
+            lbl = all_labels[ci]
+            sheet_labels.append({k: v for k, v in lbl.items() if not k.startswith('_')})
             ci += 1
-            labels_placed += 1
+
+        labels_placed = ci - current_label_index
 
         import pandas as _pd
         df = _pd.DataFrame(sheet_labels)
-        output_file = _os.path.join(output_folder,
-                                    f'Labels_Mailmerge_{timestamp}_sheet{sheet_num}.xlsx')
-        save_df_to_excel(df, output_file, sheet_name='Labels')
+        if date_str:
+            out_path = _make_dated_path(output_folder, f'Labels_Mailmerge_sheet{sheet_num}', date_str)
+        else:
+            out_path = _os.path.join(output_folder, f'Labels_Mailmerge_{timestamp}_sheet{sheet_num}.xlsx')
+        save_df_to_excel(df, out_path, sheet_name='Labels')
 
         _pipeline_queue.put({'kind': _MSG_LOG,
-                              'text': f'    📄 Saved: {_os.path.basename(output_file)}  '
-                                      f'(empty={labels_used}, placed={labels_placed})'})
+                              'text': f'    \U0001f4c4 Saved: {_os.path.basename(out_path)}  '
+                                      f'(placed={labels_placed})'})
 
-        created_files.append(output_file)
+        created_files.append(out_path)
         current_label_index += labels_placed
         sheet_num += 1
-
-        if current_label_index < len(all_labels):
-            remaining = len(all_labels) - current_label_index
-            _pipeline_queue.put({'kind': _MSG_LOG,
-                                  'text': f'    ⚠  {remaining} labels still to place.'})
-            _gui_ask('label_continue', sheet_num=sheet_num)
 
     return len(created_files), created_files
 
@@ -7832,36 +10060,36 @@ def prompt_wednesday_capacity_gui(parent=None):
 # ── Design tokens ────────────────────────────────────────────────────────────
 _T = {
     # Surfaces
-    'bg':          '#ffffff',
-    'bg_subtle':   '#f7f8f9',
-    'bg_inset':    '#f1f3f5',
+    'bg':          '#1a1f2e',   # main body
+    'bg_subtle':   '#13161f',   # header / footer strips
+    'bg_inset':    '#242836',   # cards, inset sections
     # Text
-    'text':        '#111827',
-    'text_muted':  '#6b7280',
-    'text_faint':  '#9ca3af',
+    'text':        '#e2e8f0',   # primary — high contrast on dark
+    'text_muted':  '#a0aec0',   # descriptions, secondary
+    'text_faint':  '#718096',   # hints, disabled-ish
     # Borders
-    'border':      '#e5e7eb',
-    'border_mid':  '#d1d5db',
+    'border':      '#2f3550',   # default hairline
+    'border_mid':  '#3d4a6b',   # stronger divider
     # Accent (teal)
-    'accent':      '#1D9E75',
-    'accent_lt':   '#EAF3DE',
-    'accent_text': '#3B6D11',
+    'accent':      '#4fd1c5',   # teal — main action color
+    'accent_lt':   '#1a3535',   # teal tint background
+    'accent_text': '#4fd1c5',   # teal text on dark surfaces
     # Status
-    'red':         '#A32D2D',
-    'red_lt':      '#FCEBEB',
-    'amber':       '#854F0B',
-    'amber_lt':    '#FAEEDA',
+    'red':         '#fc8181',   # bright red — visible on dark
+    'red_lt':      '#2d1515',   # red tint background
+    'amber':       '#f6ad55',   # bright amber — visible on dark
+    'amber_lt':    '#2d1e0a',   # amber tint background
     # Header strip
-    'hdr_bg':      '#f7f8f9',
-    'hdr_border':  '#e5e7eb',
+    'hdr_bg':      '#13161f',
+    'hdr_border':  '#2f3550',
 }
 
 def _make_styled_button(parent, text, command, style='primary', **kwargs):
     """Return a flat styled button. style = 'primary' | 'secondary' | 'ghost'."""
     styles = {
-        'primary':   {'bg': _T['accent'],    'fg': '#ffffff',         'ab': '#15825f'},
-        'secondary': {'bg': _T['bg_subtle'], 'fg': _T['text'],        'ab': _T['bg_inset']},
-        'ghost':     {'bg': _T['bg'],        'fg': _T['text_muted'],  'ab': _T['bg_subtle']},
+        'primary':   {'bg': _T['accent'],    'fg': '#0f2929',         'ab': '#38b2ac'},
+        'secondary': {'bg': _T['bg_inset'],  'fg': _T['text'],        'ab': _T['border']},
+        'ghost':     {'bg': _T['bg'],        'fg': _T['text_muted'],  'ab': _T['bg_inset']},
     }
     s = styles.get(style, styles['secondary'])
     btn = tk.Button(
@@ -7874,234 +10102,526 @@ def _make_styled_button(parent, text, command, style='primary', **kwargs):
     return btn
 
 
-
-# =============================================================================
-# COLONY ROTATION HELPERS
-# =============================================================================
-
-# Maps Climb full Line name (matings.csv) -> Line (Short) used in animals.csv.
-# Trailing-space variant of Unaffected included for robustness.
-_CLIMB_TO_SHORT = {
-    'B6.129-Shank3<tm2Gfng>/J':                                          'SHANK3',
-    'B6NJ-Kcnd3-/- Cyfip2-S968F<J> Hom Breed Well':                      'KCND3',
-    'B6J-Fmr1 -/- (X chr)':                                              'FMR1',
-    'B6.129(FVB)-Cdkl5<tm1.1Joez>/J':                                    'CDKL5',
-    'B6J-Cntnap2-/-':                                                     'CNTNAP2',
-    'B6.129S4-C3<tm1Crr>/J':                                              'C3',
-    'B6NJ-Bcl11b Cyfip2-S968F<J> H Lethal':                              'BCL11B',
-    'B6NJ-Cyfip2-S968F<J> (GET204)':                                      'GET204',
-    'C57BL/6J':                                                           'B6J',
-    'C57BL/6NJ':                                                          'B6NJ',
-    '(C57BL/6J x 129S1/SvImJ-Scn1a<em1Dsf>/J)F1 - Affected':            'Dravet',
-    '129S1/SvImJ-Scn1a<em1Dsf>/J - Unaffected':                          'Dravet',
-    '129S1/SvImJ-Scn1a<em1Dsf>/J - Unaffected ':                         'Dravet',
-}
-
-
-def _parse_geno_symbol(geno_str: str) -> str:
-    """Extract allele symbol from a Climb genotype string.
-
-    Examples: 'Shank3<tm2Gfng> Probe -/+' -> '-/+'
-              'Fmr1<tm1Cgr> -/Y'          -> '-/Y'
-              '' or nan                   -> 'WT'
-    """
-    import re as _re
-    s = str(geno_str).strip() if geno_str and str(geno_str).strip().lower() != 'nan' else ''
-    if not s:
-        return 'WT'
-    m = _re.search(r'([-+*/]/[-+*YyWw])', s)
-    return m.group(1) if m else 'WT'
-
-
-def _load_matings(filepath: str) -> 'pd.DataFrame':
-    """Load Climb matings export — Active Mating rows only."""
-    df = pd.read_csv(filepath, encoding='utf-8-sig', dtype=str)
-    df = df[df['Status'] == 'Active Mating'].copy()
-    df['Line']        = df['Line'].str.strip()
-    df['Mating Date'] = pd.to_datetime(df['Mating Date'], errors='coerce')
-    df = df.dropna(subset=['Mating Date'])
-    today             = pd.Timestamp(date.today())
-    df['days_active'] = (today - df['Mating Date']).dt.days.astype(int)
-    df['Births']      = pd.to_numeric(df['Births'],  errors='coerce').fillna(0).astype(int)
-    df['Comments']    = df['Comments'].fillna('').str.strip()
-    # Blank Name field = no animal physically logged in that slot (dead / touring)
-    df['sire_blank']  = df['Sire(s) Name(s)'].fillna('').str.strip() == ''
-    df['dam_blank']   = df['Dam(s) Name(s)'].fillna('').str.strip()  == ''
-    return df
-
-
-def _enrich_with_births(matings_df: 'pd.DataFrame', births_filepath: str) -> 'pd.DataFrame':
-    """Join births CSV to matings on Mating ID; attach NP flags and live birth totals."""
-    births = pd.read_csv(births_filepath, encoding='utf-8-sig', dtype=str)
-    births['Birth Date'] = pd.to_datetime(births['Birth Date'], errors='coerce')
-    births['Live Count'] = pd.to_numeric(births['Live Count'], errors='coerce').fillna(0).astype(int)
-
-    last_litter = (births.groupby('Mating ID')['Birth Date']
-                         .max().rename('last_litter_date'))
-    total_live  = (births.groupby('Mating ID')['Live Count']
-                         .sum().rename('live_births'))
-
-    df = matings_df.join(last_litter, on='Mating ID')
-    df = df.join(total_live,          on='Mating ID')
-    df['live_births'] = df['live_births'].fillna(0).astype(int)
-
-    today                  = pd.Timestamp(date.today())
-    df['days_since_litter'] = (today - df['last_litter_date']).dt.days
-
-    np_days    = CONFIG['COLONY_NP_NO_BIRTHS_DAYS']
-    quiet_days = CONFIG['COLONY_NP_GONE_QUIET_DAYS']
-    df['np_zero']  = (df['days_active'] >= np_days)    & (df['live_births'] == 0)
-    df['np_quiet'] = (df['live_births'] > 0)           & (df['days_since_litter'] >= quiet_days)
-    df['is_np']    = df['np_zero'] | df['np_quiet']
-    return df
-
-
-
-def _monthly_pattern(N: int, cycle: int = 6) -> list:
-    """Bresenham-style distribution of N retirements across cycle months.
-
-    Returns a list of `cycle` ints that sum to N, as evenly spaced as possible.
-    Examples:
-        N=9  -> [1, 2, 1, 2, 1, 2]   (Tim's 1,2,1,2,1,2)
-        N=4  -> [0, 1, 1, 0, 1, 1]   (approx every 2 months)
-        N=6  -> [1, 1, 1, 1, 1, 1]   (every month)
-    """
-    pattern, error = [], 0
-    for _ in range(cycle):
-        error += N
-        pattern.append(error // cycle)
-        error %= cycle
-    return pattern
-
-def _build_rotation_analysis(matings_df: 'pd.DataFrame') -> list:
-    """Return per-strain rotation status as a list of dicts, urgency-sorted."""
-    completing    = set(CONFIG.get('COMPLETING_STRAINS', []))
-    rotation_days = CONFIG['COLONY_ROTATION_DAYS']
-    today         = pd.Timestamp(date.today())
-    results       = []
-
-    for line, grp in matings_df.groupby('Line'):
-        grp           = grp.sort_values('Mating Date').copy()
-        N             = len(grp)
-        from math import ceil as _ceil
-        interval_mo   = max(1, _ceil(6 / N))        # whole months, rounded up
-        pat           = _monthly_pattern(N)         # retirements per month pattern
-        newest_date   = grp['Mating Date'].max()
-        days_since_new = int((today - newest_date).days)
-        months_since_new = days_since_new / 30
-        swap_due      = months_since_new >= interval_mo
-
-        np_units      = grp[grp['is_np']]
-        overdue_units = grp[grp['days_active'] >= rotation_days]
-        missing_units = grp[grp['sire_blank'] | grp['dam_blank']]
-
-        # Cadence candidate: least productive non-NP unit (oldest breaks ties)
-        non_np = grp[~grp['is_np']].sort_values(
-            ['live_births', 'days_active'], ascending=[True, False])
-        cadence_candidate = non_np.iloc[0] if (swap_due and not non_np.empty) else None
-
-        # Representative genotypes for replacement lookup —
-        # use the first mating that has a logged sire/dam respectively
-        sire_geno = ''
-        dam_geno  = ''
-        for _, r in grp.iterrows():
-            sg = str(r.get("Sire(s) Genotype(s)", '') or '').strip()
-            dg = str(r.get("Dam(s) Genotype(s)",  '') or '').strip()
-            if not r['sire_blank'] and not sire_geno and sg:
-                sire_geno = sg
-            if not r['dam_blank'] and not dam_geno and dg:
-                dam_geno = dg.split(',')[0].strip()  # trios: take first dam
-
-        results.append({
-            'line':              line,
-            'N':                 N,
-            'interval_months':   interval_mo,
-            'monthly_pattern':   pat,
-            'is_completing':     line in completing,
-            'swap_due':          swap_due,
-            'days_since_newest': days_since_new,
-            'next_swap_date':    newest_date + pd.DateOffset(months=interval_mo),
-            'np_units':          np_units,
-            'overdue_units':     overdue_units,
-            'missing_units':     missing_units,
-            'cadence_candidate': cadence_candidate,
-            'sire_geno':         sire_geno,
-            'dam_geno':          dam_geno,
-            'all_units':         grp,
-        })
-
-    # Urgency sort: completing strains last; within groups by action count desc
-    results.sort(key=lambda x: (
-        x['is_completing'],
-        -(len(x['np_units']) + len(x['overdue_units']) + len(x['missing_units']))
-    ))
-    return results
-
-
-def _find_breeding_candidates(animals_df: 'pd.DataFrame', line: str,
-                               sire_geno: str, dam_geno: str) -> dict:
-    """Find animals at breeding age (56-84 days) matching required genotypes.
-
-    Returns dict: males (list), females (list), line_short (str|None),
-                  sufficient (bool — at least 1M + 1F available)
-    """
-    line_short = _CLIMB_TO_SHORT.get(line.strip())
-    empty = {'males': [], 'females': [], 'line_short': line_short, 'sufficient': False}
-
-    if not line_short or animals_df is None or animals_df.empty:
-        return empty
-
-    today  = pd.Timestamp(date.today())
-    ls_col = animals_df.get('Line (Short)', pd.Series(dtype=str)).str.strip()
-    strain = animals_df[ls_col == line_short].copy()
-    if strain.empty:
-        return empty
-
-    strain['_bd']  = pd.to_datetime(strain['Birth Date'], errors='coerce')
-    strain         = strain.dropna(subset=['_bd'])
-    strain['_age'] = (today - strain['_bd']).dt.days
-    strain         = strain[(strain['_age'] >= 56) & (strain['_age'] <= 84)]
-    if strain.empty:
-        return empty
-
-    req_sire = _parse_geno_symbol(sire_geno)
-    req_dam  = _parse_geno_symbol(dam_geno)
-
-    def _matches(geno: str, required: str) -> bool:
-        if required == 'WT':
-            return _parse_geno_symbol(geno) in ('+/+', 'WT')
-        return _parse_geno_symbol(geno) == required
-
-    males   = strain[strain['Sex'].str.strip().str.upper() == 'M'].copy()
-    females = strain[strain['Sex'].str.strip().str.upper() == 'F'].copy()
-
-    if req_sire != 'WT':
-        males = males[males['Genotype'].apply(lambda g: _matches(str(g), req_sire))]
-    if req_dam != 'WT':
-        females = females[females['Genotype'].apply(lambda g: _matches(str(g), req_dam))]
-
-    def _fmt(row):
-        return {'name': row['Name'], 'age_days': int(row['_age']),
-                'genotype': str(row.get('Genotype', ''))}
-
-    male_list   = [_fmt(r) for _, r in males.iterrows()]
-    female_list = [_fmt(r) for _, r in females.iterrows()]
-
-    return {
-        'males':      male_list,
-        'females':    female_list,
-        'line_short': line_short,
-        'sufficient': len(male_list) >= 1 and len(female_list) >= 1,
-    }
+def _run_sing_sanity(script_dir: str, timestamp: str) -> None:
+    """Run the Sing Sanity tracker comparison and write a report to script_dir."""
+    # TODO: integrate Sing_Sanity logic here when Sing Sanity is ported in
+    print('  Sing Sanity not yet integrated into the pipeline — run Sing_Sanity.py directly.')
 
 
 def run_pipeline_gui():
     """Entry point — shows the full GUI pipeline."""
 
     root = tk.Tk()
-    root.title('SING Pipeline Scheduler')
+    root.title('TAILS')
     root.configure(bg=_T['bg'])
-    root.resizable(True, True)
+    # ── Module definitions ────────────────────────────────────────────────────
+    MODULES = [
+        {
+            'key':   'schedule',
+            'label': 'Schedule Harvest',
+            'desc':  'Pull animals from Climb, assign to harvest dates, generate calendar events.',
+            'needs': ['climb'],
+        },
+        {
+            'key':   'labels',
+            'label': 'Generate Labels',
+            'desc':  'Create MRI, MERFISH, and RNA-Seq label sheets.',
+            'needs': ['csv', 'harvest_xlsx'],
+        },
+        {
+            'key':   'climb_samples',
+            'label': 'Create Climb Samples',
+            'desc':  'Register new samples in Climb for the scheduled animals.',
+            'needs': ['csv'],
+        },
+        {
+            'key':   'envision',
+            'label': 'Climb to Envision Translation',
+            'desc':  'Generate Envision-formatted output for tag attachment.',
+            'needs': ['csv'],
+        },
+        {
+            'key':   'deliverables',
+            'label': 'Export Deliverables Sheet',
+            'desc':  'Write confirmed harvest data to the collaborator deliverables sheet.',
+            'needs': ['csv', 'harvest_xlsx'],
+        },
+        {
+            'key':   'sanity',
+            'label': 'Sing Sanity',
+            'desc':  'Compare Harvest Worksheet against LSFM, MERFISH, and RNA-Seq trackers.',
+            'needs': ['harvest_xlsx', 'tracker_xlsx'],
+        },
+    ]
+
+    AUTO_FILES = {
+        'harvest_xlsx': ('Sing Harvest Sheet.xlsx',           'Harvest Sheet'),
+        'tracker_lsfm': ('Animal and sample tracking.xlsx',   'Animal & Sample Tracking'),
+        'tracker_mrf':  ('MERFISH-RNASeq_SampleTracker.xlsx', 'MERFISH / RNA-Seq Tracker'),
+    }
+    REQUIRED_ANIMAL_COLS = CONFIG.get('REQUIRED_ANIMAL_COLUMNS', [])
+
+    # ── Screen 1: Module selector ─────────────────────────────────────────────
+    def screen_module_select():
+        root.title('TAILS')
+
+        # Header
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=14)
+        hdr.pack(fill='x', side='top')
+        tk.Label(hdr, text='TAILS',
+                 font=('Helvetica', 18, 'bold'),
+                 bg=_T['hdr_bg'], fg=_T['text']).pack()
+        tk.Label(hdr, text='Tracking Animal Inventory, Logging Shipments',
+                 font=('Helvetica', 9),
+                 bg=_T['hdr_bg'], fg=_T['text_faint']).pack(pady=(1, 0))
+        badge_var = tk.StringVar(value='\u25c9  Full Pipeline')
+        badge_lbl = tk.Label(hdr, textvariable=badge_var,
+                             font=('Helvetica', 10),
+                             bg=_T['hdr_bg'], fg='#63e6be')
+        badge_lbl.pack(pady=(2, 0))
+
+        # Footer packed before body so it is always visible
+        tk.Frame(root, bg=_T['border'], height=1).pack(fill='x', side='bottom')
+        foot = tk.Frame(root, bg=_T['bg_subtle'], pady=10, padx=20)
+        foot.pack(fill='x', side='bottom')
+        err_lbl = tk.Label(foot, text='', font=('Helvetica', 9, 'italic'),
+                           bg=_T['bg_subtle'], fg=_T['red'])
+        err_lbl.pack(anchor='w')
+        tk.Label(foot, text=f'v{PIPELINE_VERSION}', font=('Helvetica', 8),
+                 bg=_T['bg_subtle'], fg=_T['text_muted']).pack(anchor='w')
+
+        module_vars = {m['key']: tk.BooleanVar(value=True) for m in MODULES}
+
+        def _update_badge(*_):
+            all_on = all(v.get() for v in module_vars.values())
+            n      = sum(1 for v in module_vars.values() if v.get())
+            if all_on:
+                badge_var.set('\u25c9  Full Pipeline')
+                badge_lbl.configure(fg='#63e6be')
+            elif n == 0:
+                badge_var.set('\u25ce  No modules selected')
+                badge_lbl.configure(fg=_T['red'])
+            else:
+                badge_var.set(f'\u25ce  {n} of {len(MODULES)} modules')
+                badge_lbl.configure(fg=_T['text_muted'])
+
+        def _proceed():
+            selected = {m['key']: module_vars[m['key']].get() for m in MODULES}
+            if not any(selected.values()):
+                err_lbl.configure(text='\u26a0  Select at least one module.')
+                return
+            err_lbl.configure(text='')
+            state['modules'] = selected
+            if selected.get('schedule'):
+                # Schedule pulls from Climb — go to preflight
+                _switch(screen_preflight)
+            else:
+                # Labels/Samples/Envision/Deliverables — use CSV from script folder
+                _switch(screen_file_check)
+
+        _make_styled_button(foot, 'Run  \u2192', _proceed, style='primary').pack(side='right')
+
+        # Body
+        body = tk.Frame(root, bg=_T['bg'])
+        body.pack(fill='both', expand=True, side='top')
+
+        tk.Label(body, text='What do you need?',
+                 font=('Helvetica', 11, 'bold'),
+                 bg=_T['bg'], fg=_T['text']).pack(anchor='w', padx=18, pady=(12, 6))
+
+        for m in MODULES:
+            card = tk.Frame(body, bg=_T['bg_inset'], relief='solid', bd=1, padx=12, pady=6)
+            card.pack(fill='x', padx=18, pady=3)
+            row = tk.Frame(card, bg=_T['bg_inset'])
+            row.pack(fill='x')
+            tk.Checkbutton(row, variable=module_vars[m['key']],
+                           bg=_T['bg_inset'], activebackground=_T['bg_inset'],
+                           selectcolor=_T['accent'],
+                           cursor='hand2', command=_update_badge).pack(side='left')
+            tf = tk.Frame(row, bg=_T['bg_inset'])
+            tf.pack(side='left', fill='x', expand=True, padx=(4, 0))
+            tk.Label(tf, text=m['label'],
+                     font=('Helvetica', 10, 'bold'),
+                     bg=_T['bg_inset'], fg=_T['text'], anchor='w').pack(fill='x')
+            tk.Label(tf, text=m['desc'],
+                     font=('Helvetica', 9),
+                     bg=_T['bg_inset'], fg=_T['text_muted'], anchor='w').pack(fill='x')
+
+        # ── TEST MODE toggle ─────────────────────────────────────────────
+        # Blocks every write to Climb. Output files are still produced so the
+        # run can be checked, but the Climb import CSV is renamed so it can't
+        # be uploaded by mistake.
+        test_var = tk.BooleanVar(value=bool(globals().get('TEST_MODE', False)))
+
+        def _toggle_test():
+            globals()['TEST_MODE'] = bool(test_var.get())
+            _test_lbl.config(
+                text=('TEST MODE ON \u2014 nothing will be written to Climb'
+                      if test_var.get() else
+                      'Test mode (no Climb writes)'),
+                fg=(_T['amber'] if test_var.get() else _T['text']))
+
+        test_card = tk.Frame(body, bg=_T['bg_inset'], relief='solid', bd=1,
+                             padx=12, pady=6)
+        test_card.pack(fill='x', padx=18, pady=(10, 3))
+        trow = tk.Frame(test_card, bg=_T['bg_inset'])
+        trow.pack(fill='x')
+        tk.Checkbutton(trow, variable=test_var,
+                       bg=_T['bg_inset'], activebackground=_T['bg_inset'],
+                       selectcolor=_T['accent'],
+                       cursor='hand2', command=_toggle_test).pack(side='left')
+        ttf = tk.Frame(trow, bg=_T['bg_inset'])
+        ttf.pack(side='left', fill='x', expand=True, padx=(4, 0))
+        _test_lbl = tk.Label(ttf, text='Test mode (no Climb writes)',
+                             font=('Helvetica', 10, 'bold'),
+                             bg=_T['bg_inset'], fg=_T['text'], anchor='w')
+        _test_lbl.pack(fill='x')
+        tk.Label(ttf, text=('Runs everything and makes all files, but blocks '
+                            'every write to Climb. Import CSV is renamed so it '
+                            'cannot be uploaded by accident.'),
+                 font=('Helvetica', 9), wraplength=520, justify='left',
+                 bg=_T['bg_inset'], fg=_T['text_muted'], anchor='w').pack(fill='x')
+
+        ctrl = tk.Frame(body, bg=_T['bg'])
+        ctrl.pack(fill='x', padx=18, pady=(8, 12))
+
+        def _select_all():
+            for v in module_vars.values(): v.set(True)
+            _update_badge()
+
+        def _clear_all():
+            for v in module_vars.values(): v.set(False)
+            _update_badge()
+
+        tk.Button(ctrl, text='Select All', command=_select_all,
+                  bg=_T['bg'], fg=_T['text_muted'],
+                  relief='flat', font=('Helvetica', 9),
+                  cursor='hand2').pack(side='left')
+        tk.Label(ctrl, text='\u00b7',
+                 bg=_T['bg'], fg=_T['text_faint']).pack(side='left', padx=6)
+        tk.Button(ctrl, text='Clear All', command=_clear_all,
+                  bg=_T['bg'], fg=_T['text_muted'],
+                  relief='flat', font=('Helvetica', 9),
+                  cursor='hand2').pack(side='left')
+
+        # Size window to fit content exactly, capped at screen height - 80px
+        root.update_idletasks()
+        w = 660
+        h = min(root.winfo_reqheight(), root.winfo_screenheight() - 80)
+        x = (root.winfo_screenwidth()  - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f'{w}x{h}+{x}+{y}')
+
+    # ── Screen 2 (partial runs): file check ───────────────────────────────────
+    def screen_file_check():
+        import datetime as _dt
+        import pandas as _pd
+
+        root.title('TAILS \u2014 Files')
+        root.geometry('660x520')
+
+        selected_modules = state.get('modules', {})
+        needed = set()
+        for m in MODULES:
+            if selected_modules.get(m['key']):
+                needed.update(m.get('needs', []))
+
+        needs_csv     = 'csv'          in needed
+        needs_harvest = 'harvest_xlsx' in needed
+        needs_tracker = 'tracker_xlsx' in needed
+
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=14)
+        hdr.pack(fill='x')
+        tk.Label(hdr, text='Files Needed',
+                 font=('Helvetica', 16, 'bold'),
+                 bg=_T['hdr_bg'], fg=_T['text']).pack()
+        tk.Label(hdr, text='Confirm the files below before running.',
+                 font=('Helvetica', 9),
+                 bg=_T['hdr_bg'], fg=_T['text_muted']).pack(pady=(2, 0))
+
+        body = tk.Frame(root, bg=_T['bg_subtle'], padx=20, pady=14)
+        body.pack(fill='both', expand=True)
+
+        def _check_auto(filename):
+            path = _os.path.join(_SCRIPT_DIR, filename)
+            if not _os.path.exists(path):
+                return False, False
+            mtime = _dt.date.fromtimestamp(_os.path.getmtime(path))
+            return True, mtime == _dt.date.today()
+
+        if needs_harvest or needs_tracker:
+            tk.Label(body, text='Found automatically',
+                     font=('Helvetica', 10, 'bold'),
+                     bg=_T['bg_subtle'], fg=_T['text']).pack(anchor='w', pady=(0, 4))
+            check_keys = []
+            if needs_harvest: check_keys.append('harvest_xlsx')
+            if needs_tracker: check_keys.extend(['tracker_lsfm', 'tracker_mrf'])
+            for key in check_keys:
+                fname, display = AUTO_FILES[key]
+                found, today = _check_auto(fname)
+                if found:
+                    icon  = '\u2713' if today else '\u26a0'
+                    age   = 'today'  if today else 'not from today'
+                    color = _T['accent'] if today else _T['amber']
+                else:
+                    icon, age, color = '\u2717', 'not found', _T['red']
+                row = tk.Frame(body, bg=_T['bg_subtle'])
+                row.pack(fill='x', pady=1)
+                tk.Label(row, text=f'{icon}  {display}',
+                         font=('Helvetica', 10),
+                         bg=_T['bg_subtle'], fg=color).pack(side='left')
+                tk.Label(row, text=f'  ({fname}  \u00b7  {age})',
+                         font=('Helvetica', 9),
+                         bg=_T['bg_subtle'], fg=_T['text_faint']).pack(side='left')
+            tk.Frame(body, bg=_T['border'], height=1).pack(fill='x', pady=10)
+
+        csv_path    = _os.path.join(_SCRIPT_DIR, 'animals.csv')
+        confirm_btn = [None]
+
+        def _validate_csv():
+            if not _os.path.exists(csv_path):
+                return False, 'Not found  \u2014  drop animals.csv in the script folder'
+            try:
+                test = _pd.read_csv(csv_path, nrows=2)
+                missing = [c for c in REQUIRED_ANIMAL_COLS if c not in test.columns]
+                if missing:
+                    return False, f'Missing columns: {missing}'
+            except Exception as ex:
+                return False, f'Cannot read file: {ex}'
+            return True, 'animals.csv  \u00b7  columns OK'
+
+        if needs_csv:
+            tk.Label(body, text='Animal list  (you provide)',
+                     font=('Helvetica', 10, 'bold'),
+                     bg=_T['bg_subtle'], fg=_T['text']).pack(anchor='w', pady=(0, 6))
+
+            csv_row = tk.Frame(body, bg=_T['bg_subtle'])
+            csv_row.pack(fill='x')
+            csv_icon_lbl = tk.Label(csv_row, text='',
+                                    font=('Helvetica', 10),
+                                    bg=_T['bg_subtle'], width=2)
+            csv_icon_lbl.pack(side='left')
+            csv_msg_lbl = tk.Label(csv_row, text='',
+                                   font=('Helvetica', 10),
+                                   bg=_T['bg_subtle'], fg=_T['text_muted'], anchor='w')
+            csv_msg_lbl.pack(side='left', fill='x', expand=True)
+
+            tk.Label(body,
+                     text='\u26a0  This should be a specific list for this run,\n'
+                          '    not the full Climb inventory.',
+                     font=('Helvetica', 9, 'italic'),
+                     bg=_T['amber_lt'], fg=_T['amber'],
+                     padx=10, pady=6, justify='left', anchor='w').pack(fill='x', pady=(8, 0))
+
+            tk.Label(body,
+                     text=f'Export from Climb \u2192 save as animals.csv \u2192 drop in:\n{_SCRIPT_DIR}',
+                     font=('Helvetica', 9),
+                     bg=_T['bg_subtle'], fg=_T['text_muted'],
+                     justify='left', anchor='w').pack(fill='x', pady=(8, 0))
+
+            def _refresh():
+                ok, msg = _validate_csv()
+                csv_icon_lbl.configure(text='\u2713' if ok else '\u2026',
+                                       fg=_T['accent'] if ok else _T['text_faint'])
+                csv_msg_lbl.configure(text=msg,
+                                      fg=_T['accent'] if ok else _T['text_muted'])
+                if confirm_btn[0]:
+                    confirm_btn[0].configure(state='normal' if ok else 'disabled')
+                if not ok:
+                    root.after(2000, _refresh)
+
+            root.after(50, _refresh)
+
+        tk.Frame(root, bg=_T['border'], height=1).pack(fill='x')
+        foot = tk.Frame(root, bg=_T['bg_subtle'], pady=12, padx=20)
+        foot.pack(fill='x')
+        err_lbl = tk.Label(foot, text='', font=('Helvetica', 9, 'italic'),
+                           bg=_T['bg_subtle'], fg=_T['red'])
+        err_lbl.pack(anchor='w')
+        _make_styled_button(foot, '\u2190 Back',
+                            lambda: _switch(screen_module_select),
+                            style='ghost').pack(side='left')
+
+        def _confirm():
+            if needs_csv:
+                ok, msg = _validate_csv()
+                if not ok:
+                    err_lbl.configure(text=f'\u26a0  {msg}')
+                    return
+                state['animal_file'] = csv_path
+            err_lbl.configure(text='')
+            # Ensure keys needed by _run_pipeline are present for partial runs
+            state.setdefault('wednesday_dates',     get_next_wednesdays(6))
+            state.setdefault('full_behavior_dates', None)
+            state.setdefault('births_file',         None)
+            import traceback as _tb, pathlib as _pl
+            try:
+                _switch(screen_progress)
+            except Exception as _ex:
+                log_path = _pl.Path(script_dir) / 'pipeline_error.log'
+                log_path.write_text(
+                    f'Confirm button error:\n{_tb.format_exc()}', encoding='utf-8'
+                )
+                messagebox.showerror(
+                    'Error',
+                    f'Failed to start pipeline:\n{_ex}\n\nSee pipeline_error.log for details.'
+                )
+
+        btn = _make_styled_button(foot, 'Confirm  \u2192', _confirm, style='primary')
+        btn.configure(state='normal' if not needs_csv else 'disabled')
+        btn.pack(side='right')
+        confirm_btn[0] = btn
+
+    # ── Screen 2 (full pipeline): pre-flight file check ───────────────────────
+    def screen_preflight():
+        import datetime as _dt
+        import pandas as _pd
+
+        root.title('TAILS \u2014 Getting Ready')
+
+        # Header
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=14)
+        hdr.pack(fill='x', side='top')
+        tk.Label(hdr, text='Getting Ready',
+                 font=('Helvetica', 18, 'bold'),
+                 bg=_T['hdr_bg'], fg=_T['text']).pack()
+        tk.Label(hdr, text='Checking for required files\u2026',
+                 font=('Helvetica', 10),
+                 bg=_T['hdr_bg'], fg=_T['text_muted']).pack(pady=(2, 0))
+
+        # Footer pinned at bottom
+        tk.Frame(root, bg=_T['border'], height=1).pack(fill='x', side='bottom')
+        foot = tk.Frame(root, bg=_T['bg_subtle'], pady=10, padx=20)
+        foot.pack(fill='x', side='bottom')
+        _make_styled_button(foot, '\u2190 Back',
+                            lambda: _switch(screen_module_select),
+                            style='ghost').pack(side='left')
+        proceed_btn = _make_styled_button(foot, 'Continue \u2192',
+                                          lambda: _switch(screen_wednesday),
+                                          style='primary')
+        proceed_btn.configure(state='disabled')
+        proceed_btn.pack(side='right')
+
+        # Body
+        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=16)
+        body.pack(fill='both', expand=True, side='top')
+
+        # Build the file list based on which modules are selected.
+        # Animals and births come from Climb API — never manual at this screen.
+        selected_modules = state.get('modules', {})
+        FILE_DEFS = [
+            ('Harvest Sheet', 'Sing Harvest Sheet.xlsx', True, None),
+        ]
+        if selected_modules.get('sanity'):
+            FILE_DEFS += [
+                ('Animal & Sample Tracking', 'Animal and sample tracking.xlsx',    True, None),
+                ('MERFISH / RNA-Seq Tracker', 'MERFISH-RNASeq_SampleTracker.xlsx', True, None),
+            ]
+
+        REQUIRED_COLS = {}
+
+        def _file_status(fname, auto):
+            """Return (ok, today, msg) for a file in the script folder."""
+            path = _os.path.join(_SCRIPT_DIR, fname)
+            if not _os.path.exists(path):
+                return False, False, 'Not found'
+            mtime = _dt.date.fromtimestamp(_os.path.getmtime(path))
+            today = mtime == _dt.date.today()
+            if not auto and not today:
+                return False, False, f'Found but not from today ({mtime})'
+            if fname in REQUIRED_COLS:
+                try:
+                    test = _pd.read_csv(path, nrows=2)
+                    missing = [c for c in REQUIRED_COLS[fname] if c not in test.columns]
+                    if missing:
+                        return False, today, f'Wrong columns: {missing}'
+                except Exception as ex:
+                    return False, today, f'Cannot read: {ex}'
+            return True, today, 'Ready'
+
+        # Build status rows
+        status_labels = {}
+        for display, fname, auto, instructions in FILE_DEFS:
+            row = tk.Frame(body, bg=_T['bg'])
+            row.pack(fill='x', pady=4)
+
+            icon_lbl = tk.Label(row, text='\u231b', width=3,
+                                font=('Helvetica', 12),
+                                bg=_T['bg'], fg=_T['text_faint'], anchor='w')
+            icon_lbl.pack(side='left')
+
+            right = tk.Frame(row, bg=_T['bg'])
+            right.pack(side='left', fill='x', expand=True)
+
+            name_lbl = tk.Label(right, text=display,
+                                font=('Helvetica', 10, 'bold'),
+                                bg=_T['bg'], fg=_T['text'], anchor='w')
+            name_lbl.pack(fill='x')
+
+            msg_lbl = tk.Label(right, text='Checking\u2026',
+                               font=('Helvetica', 9),
+                               bg=_T['bg'], fg=_T['text_muted'], anchor='w')
+            msg_lbl.pack(fill='x')
+
+            if instructions:
+                tk.Label(right,
+                         text=f'\u2192  {instructions}\n'
+                              f'   Drop in:  {_SCRIPT_DIR}',
+                         font=('Helvetica', 8, 'italic'),
+                         bg=_T['bg'], fg=_T['text_faint'],
+                         justify='left', anchor='w').pack(fill='x', pady=(2, 0))
+
+            status_labels[fname] = (icon_lbl, msg_lbl)
+
+        tk.Frame(body, bg=_T['border'], height=1).pack(fill='x', pady=(12, 0))
+
+        ready_lbl = tk.Label(body, text='',
+                             font=('Helvetica', 10, 'bold'),
+                             bg=_T['bg'], fg=_T['text_muted'])
+        ready_lbl.pack(anchor='w', pady=(8, 0))
+
+        def _refresh():
+            all_ready = True
+            n_ready = 0
+            for display, fname, auto, instructions in FILE_DEFS:
+                ok, today, msg = _file_status(fname, auto)
+                icon_lbl, msg_lbl = status_labels[fname]
+                if ok:
+                    icon_lbl.configure(text='\u2713', fg=_T['accent'])
+                    msg_lbl.configure(text=msg if not auto else fname,
+                                      fg=_T['accent'])
+                    n_ready += 1
+                elif not auto:
+                    icon_lbl.configure(text='\u25cb', fg=_T['text_faint'])
+                    msg_lbl.configure(text=msg, fg=_T['text_muted'])
+                    all_ready = False
+                else:
+                    icon_lbl.configure(text='\u2717', fg=_T['red'])
+                    msg_lbl.configure(text=msg, fg=_T['red'])
+                    all_ready = False
+
+            total = len(FILE_DEFS)
+            if all_ready:
+                ready_lbl.configure(
+                    text=f'\u2713  All {total} files ready \u2014 good to go.',
+                    fg=_T['accent'])
+                proceed_btn.configure(state='normal')
+            else:
+                waiting = total - n_ready
+                ready_lbl.configure(
+                    text=f'{n_ready} of {total} ready \u2014 waiting on {waiting} file{"s" if waiting != 1 else ""}\u2026',
+                    fg=_T['text_muted'])
+                proceed_btn.configure(state='disabled')
+                root.after(2000, _refresh)
+
+        _refresh()
+
+        root.update_idletasks()
+        w = 680
+        h = min(root.winfo_reqheight() + 20, root.winfo_screenheight() - 80)
+        x = (root.winfo_screenwidth()  - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f'{w}x{h}+{x}+{y}')
 
     script_dir = _os.path.dirname(_os.path.abspath(__file__))
 
@@ -8110,8 +10630,6 @@ def run_pipeline_gui():
         'animal_file':   _os.path.join(script_dir, CONFIG['INPUT_ANIMAL_FILE']),
         'tracking_file': _os.path.join(script_dir, CONFIG['INPUT_TRACKING_FILE']),
         'births_file':   _os.path.join(script_dir, CONFIG['INPUT_BIRTHS_FILE']),
-        'matings_file':  _os.path.join(script_dir, CONFIG['INPUT_MATINGS_FILE']),
-        'breeding_reserves': set(),
     }
 
     REQUIRED_COLOR = _T['red']
@@ -8157,19 +10675,22 @@ def run_pipeline_gui():
     # SCREEN 1: File Setup
     # ─────────────────────────────────────────────────────────────────────────
     def screen_file_setup():
-        root.title('Sing Lab Scheduler')
+        root.title('TAILS')
         root.geometry('700x560')
 
         # ── Header ────────────────────────────────────────────────────────────
-        hdr = tk.Frame(root, bg='#2c3e50', pady=18)
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=18)
         hdr.pack(fill='x')
-        tk.Label(hdr, text='Sing Lab Scheduler',
+        tk.Label(hdr, text='TAILS',
                  font=('Helvetica', 20, 'bold'),
-                 bg='#2c3e50', fg='white').pack()
+                 bg=_T['hdr_bg'], fg=_T['text']).pack()
+        tk.Label(hdr, text='Tracking Animal Inventory, Logging Shipments',
+                 font=('Helvetica', 9),
+                 bg=_T['hdr_bg'], fg=_T['text_faint']).pack(pady=(1, 0))
         tk.Label(hdr, text='Which input files do you have ready?',
-                 font=('Helvetica', 10), bg='#2c3e50', fg='#bdc3c7').pack(pady=(4, 0))
+                 font=('Helvetica', 10), bg=_T['hdr_bg'], fg=_T['text_muted']).pack(pady=(4, 0))
 
-        body = tk.Frame(root, bg='#f0f0f0', padx=24, pady=18)
+        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=18)
         body.pack(fill='both', expand=True)
 
         # ── File card definitions ─────────────────────────────────────────────
@@ -8198,14 +10719,6 @@ def run_pipeline_gui():
                 'hint':     'Optional  •  check the box to include in this run',
                 'desc':     'Log of recent births used to identify new P14 animals.',
             },
-            {
-                'key':      'matings_file',
-                'default':  CONFIG['INPUT_MATINGS_FILE'],
-                'required': False,
-                'label':    'Colony Matings',
-                'hint':     'Optional  •  check the box to include in this run',
-                'desc':     'Climb active matings export — enables colony rotation review.',
-            },
         ]
 
         path_vars   = {}
@@ -8214,15 +10727,15 @@ def run_pipeline_gui():
         detail_frames = {}
 
         err_lbl = tk.Label(body, text='', font=('Helvetica', 9, 'italic'),
-                           bg='#f0f0f0', fg='#c0392b')
+                           bg=_T['bg'], fg=_T['red'])
 
         def _update_status(key, path, lbl):
             if not path.strip():
-                lbl.configure(text='', fg='#7f8c8d')
+                lbl.configure(text='', fg=_T['text_faint'])
             elif _os.path.exists(path):
-                lbl.configure(text='✓ Found', fg='#27ae60')
+                lbl.configure(text='✓ Found', fg=_T['accent'])
             else:
-                lbl.configure(text='✗ File not found at this path', fg='#c0392b')
+                lbl.configure(text='✗ File not found at this path', fg=_T['red'])
 
         def _browse(key, var, lbl, title):
             path = filedialog.askopenfilename(
@@ -8249,11 +10762,11 @@ def run_pipeline_gui():
             initial_path = default if exists else state.get(key, default)
 
             # ── Card frame ────────────────────────────────────────────────────
-            card = tk.Frame(body, bg='#ffffff', relief='solid', bd=1, padx=12, pady=10)
+            card = tk.Frame(body, bg=_T['bg_inset'], relief='solid', bd=1, padx=12, pady=10)
             card.pack(fill='x', pady=6)
 
             # Top row: toggle + label
-            top_row = tk.Frame(card, bg='#ffffff')
+            top_row = tk.Frame(card, bg=_T['bg_inset'])
             top_row.pack(fill='x')
 
             tvar = tk.BooleanVar(value=exists or required)
@@ -8262,32 +10775,32 @@ def run_pipeline_gui():
             # Checkbox (disabled for required file)
             chk = tk.Checkbutton(
                 top_row, variable=tvar,
-                bg='#ffffff', activebackground='#ffffff',
+                bg=_T['bg_inset'], activebackground=_T['bg_inset'],
                 cursor='hand2' if not required else 'arrow',
                 state='normal' if not required else 'disabled',
             )
             chk.pack(side='left', padx=(0, 6))
 
-            name_color = '#2c3e50' if required else '#34495e'
+            name_color = _T['text'] if required else _T['text_muted']
             tk.Label(top_row, text=fd['label'],
                      font=('Helvetica', 11, 'bold'),
-                     bg='#ffffff', fg=name_color).pack(side='left')
+                     bg=_T['bg_inset'], fg=name_color).pack(side='left')
 
             badge_text  = '  Required  ' if required else '  Optional  '
-            badge_color = '#e74c3c'       if required else '#95a5a6'
+            badge_color = '#f87171' if required else _T['text_faint']
             tk.Label(top_row, text=badge_text,
                      font=('Helvetica', 8, 'bold'),
                      bg=badge_color, fg='white', padx=4).pack(side='left', padx=8)
 
             tk.Label(card, text=fd['desc'],
-                     font=('Helvetica', 9), bg='#ffffff', fg='#7f8c8d',
+                     font=('Helvetica', 9), bg=_T['bg_inset'], fg=_T['text_muted'],
                      anchor='w').pack(fill='x')
 
             # Expandable detail section (path + browse)
-            detail = tk.Frame(card, bg='#f8f9fa', padx=8, pady=6, relief='groove', bd=1)
+            detail = tk.Frame(card, bg=_T['bg'], padx=8, pady=6, relief='groove', bd=1)
             detail_frames[key] = detail
 
-            path_row = tk.Frame(detail, bg='#f8f9fa')
+            path_row = tk.Frame(detail, bg=_T['bg'])
             path_row.pack(fill='x')
 
             pvar = tk.StringVar(value=initial_path)
@@ -8295,21 +10808,21 @@ def run_pipeline_gui():
             state[key] = initial_path
 
             tk.Label(path_row, text=fd['hint'],
-                     font=('Helvetica', 8), bg='#f8f9fa', fg='#7f8c8d',
+                     font=('Helvetica', 8), bg=_T['bg'], fg=_T['text_faint'],
                      anchor='w').pack(fill='x', pady=(0, 4))
 
-            entry_row = tk.Frame(detail, bg='#f8f9fa')
+            entry_row = tk.Frame(detail, bg=_T['bg'])
             entry_row.pack(fill='x')
 
             # Create status label first, then Browse (pack order = right-to-left)
             slbl = tk.Label(entry_row, text='', font=('Helvetica', 9),
-                            bg='#f8f9fa', width=14, anchor='w')
+                            bg=_T['bg'], width=14, anchor='w')
             status_lbls[key] = slbl
 
             tk.Button(entry_row, text='Browse…',
                       command=lambda k=key, v=pvar, l=slbl, t=fd['label']:
                           _browse(k, v, l, f'Select {t}'),
-                      font=('Helvetica', 9), bg='#3498db', fg='white',
+                      font=('Helvetica', 9), bg=_T['accent'], fg='#0f2929',
                       relief='flat', padx=8, pady=2, cursor='hand2').pack(side='right', padx=(4, 0))
 
             slbl.pack(side='right', padx=(6, 0))
@@ -8331,7 +10844,7 @@ def run_pipeline_gui():
         err_lbl.pack(fill='x', pady=(4, 0))
 
         # ── Footer ────────────────────────────────────────────────────────────
-        foot = tk.Frame(root, bg='#ecf0f1', pady=10)
+        foot = tk.Frame(root, bg=_T['bg_subtle'], pady=10)
         foot.pack(fill='x', padx=24)
 
         def _proceed():
@@ -8360,7 +10873,7 @@ def run_pipeline_gui():
 
             state['animal_file'] = animal
 
-            for key in ('tracking_file', 'births_file', 'matings_file'):
+            for key in ('tracking_file', 'births_file'):
                 if toggle_vars[key].get():
                     p = path_vars[key].get().strip()
                     state[key] = p if _os.path.exists(p) else None
@@ -8373,14 +10886,11 @@ def run_pipeline_gui():
                 else:
                     state[key] = None
 
-            if state.get('matings_file'):
-                _switch(screen_breeding_rotation)
-            else:
-                _switch(screen_wednesday)
+            _switch(screen_wednesday)
 
         tk.Button(foot, text='Next: Wednesday Capacity  →',
                   command=_proceed,
-                  font=('Helvetica', 11, 'bold'), bg='#27ae60', fg='white',
+                  font=('Helvetica', 11, 'bold'), bg=_T['accent'], fg='#0f2929',
                   relief='flat', padx=16, pady=7, cursor='hand2').pack(side='right')
 
         # Fit window height to content
@@ -8396,349 +10906,156 @@ def run_pipeline_gui():
         root.after(10, _fit_window)
 
 
-    def screen_breeding_rotation():
-        root.title('SING Pipeline Scheduler — Colony Rotation')
-        root.geometry('960x700')
-    
-        matings_df = None
-        try:
-            matings_df = _load_matings(state['matings_file'])
-            if state.get('births_file'):
-                matings_df = _enrich_with_births(matings_df, state['births_file'])
-            else:
-                for col, val in [('live_births', 0), ('np_zero', False),
-                                  ('np_quiet', False), ('is_np', False)]:
-                    matings_df[col] = val
-                matings_df['last_litter_date']  = pd.NaT
-                matings_df['days_since_litter'] = pd.NA
-        except Exception as ex:
-            messagebox.showerror('Colony Rotation', f'Could not load matings:\n{ex}')
-    
-        animals_df = None
-        if state.get('animal_file'):
-            try:
-                animals_df = pd.read_csv(state['animal_file'], dtype=str,
-                                         encoding='utf-8-sig')
-            except Exception:
-                pass
-    
-        analysis = _build_rotation_analysis(matings_df) if matings_df is not None else []
-    
-        _make_header(
-            eyebrow='Step 1.5  —  Colony Rotation',
-            title='Reserve animals for breeding',
-            subtitle=('Check animals to reserve — excluded from harvest scheduling, '
-                      'appear as “Reserved — Breeding” in output.'),
-        )
-    
-        body = tk.Frame(root, bg=_T['bg'])
-        body.pack(fill='both', expand=True)
-    
-        canvas = tk.Canvas(body, bg=_T['bg'], highlightthickness=0)
-        vsb    = ttk.Scrollbar(body, orient='vertical', command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side='right', fill='y')
-        canvas.pack(side='left', fill='both', expand=True)
-    
-        inner  = tk.Frame(canvas, bg=_T['bg'])
-        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
-        inner.bind('<Configure>',
-                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>',
-                    lambda e: canvas.itemconfig(win_id, width=e.width))
-    
-        def _wheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-        canvas.bind_all('<MouseWheel>', _wheel)
-    
-        check_vars = {}
-    
-        def _update_count(*_):
-            n = sum(1 for v in check_vars.values() if v.get())
-            count_lbl.configure(
-                text=f'{n} animal{"s" if n != 1 else ""} reserved for breeding',
-                fg=_T['accent'] if n else _T['text_muted'],
-            )
-    
-        def _render_block(s):
-            line        = s['line']
-            has_np      = len(s['np_units'])      > 0
-            has_missing = len(s['missing_units']) > 0
-            has_over    = len(s['overdue_units']) > 0
-            is_done     = s['is_completing']
-    
-            if has_np or has_missing:
-                bg, border = _T['red_lt'],    _T['red']
-            elif has_over or s['swap_due']:
-                bg, border = _T['amber_lt'],  _T['amber']
-            elif is_done:
-                bg, border = _T['bg_inset'],  _T['border_mid']
-            else:
-                bg, border = _T['accent_lt'], _T['accent']
-    
-            card = tk.Frame(inner, bg=bg, padx=14, pady=10,
-                            highlightbackground=border, highlightthickness=1)
-            card.pack(fill='x', padx=10, pady=3)
-    
-            hrow = tk.Frame(card, bg=bg)
-            hrow.pack(fill='x')
-            short = _CLIMB_TO_SHORT.get(line.strip(), line[:35])
-            tk.Label(hrow, text=short,
-                     font=('Helvetica', 12, 'bold'), bg=bg,
-                     fg=_T['text']).pack(side='left')
-            N      = s['N']
-            pat_str = ','.join(str(x) for x in s['monthly_pattern'])
-            suffix = ('  [COMPLETING]' if is_done
-                      else f'   {N} unit{"s" if N != 1 else ""}  '
-                           f'•  {pat_str} /mo')
-            tk.Label(hrow, text=suffix, font=('Helvetica', 9), bg=bg,
-                     fg=_T['text_muted']).pack(side='left', padx=4)
-    
-            if not (has_np or has_missing or has_over or s['swap_due']):
-                nxt = s['next_swap_date'].strftime('%b %d')
-                tk.Label(card,
-                         text=f'✅  On track  —  next swap due {nxt}',
-                         font=('Helvetica', 9), bg=bg,
-                         fg=_T['accent_text']).pack(anchor='w', pady=(2, 0))
-                return
-    
-            tbl = tk.Frame(card, bg=bg)
-            tbl.pack(fill='x', pady=(6, 2))
-            col_specs = [('Housing', 7), ('Mating', 7), ('Days\nActive', 6),
-                         ('Live\nBirths', 7), ('Last\nLitter', 11), ('Status', 30)]
-            for ci, (txt, w) in enumerate(col_specs):
-                tk.Label(tbl, text=txt, width=w, anchor='center',
-                         font=('Helvetica', 8), bg=bg,
-                         fg=_T['text_faint']).grid(row=0, column=ci, padx=2)
-    
-            for ri, (_, r) in enumerate(s['all_units'].iterrows(), 1):
-                flags = []
-                if r.get('np_zero'):
-                    flags.append('NP: no births 90d+')
-                if r.get('np_quiet'):
-                    flags.append(f'NP: quiet {int(r.get("days_since_litter", 0))}d')
-                if r['days_active'] >= CONFIG['COLONY_ROTATION_DAYS']:
-                    flags.append(f'Overdue {r["days_active"]}d')
-                if r.get('sire_blank'):
-                    flags.append('⚠ No sire logged')
-                if r.get('dam_blank'):
-                    flags.append('⚠ No dam(s) logged')
-                is_cad = (s['cadence_candidate'] is not None
-                          and r['Housing ID'] == s['cadence_candidate']['Housing ID']
-                          and not flags)
-                if is_cad:
-                    flags.append('→ Retire next (cadence)')
-                ll    = (r['last_litter_date'].strftime('%b %d')
-                         if pd.notna(r.get('last_litter_date')) else '—')
-                row_bg = (_T['red_lt']   if any('NP' in f or 'No sire' in f
-                                                 or 'No dam' in f for f in flags)
-                          else _T['amber_lt'] if flags else bg)
-                fg_c   = _T['red'] if row_bg == _T['red_lt'] else _T['text']
-                vals   = [r['Housing ID'], r['Mating ID'], str(r['days_active']),
-                          str(r.get('live_births', 0)), ll,
-                          '  '.join(flags) or 'OK']
-                for ci, (v, w) in enumerate(zip(vals, [7, 7, 6, 7, 11, 30])):
-                    tk.Label(tbl, text=v, width=w, anchor='center',
-                             font=('Helvetica', 9), bg=row_bg,
-                             fg=fg_c).grid(row=ri, column=ci, padx=2, pady=1)
-    
-            if not is_done and (s['swap_due'] or has_np):
-                cands   = _find_breeding_candidates(
-                    animals_df, line, s['sire_geno'], s['dam_geno'])
-                comment = (s['all_units'].iloc[0]['Comments']
-                           if not s['all_units'].empty else '')
-                tk.Label(card,
-                         text=f'SET UP REPLACEMENT   [{comment or "see matings"}]',
-                         font=('Helvetica', 9, 'bold'), bg=bg,
-                         fg=_T['text']).pack(anchor='w', pady=(8, 0))
-                if not cands.get('line_short'):
-                    tk.Label(card,
-                             text='⚠  Line (Short) mapping unknown — update _CLIMB_TO_SHORT',
-                             font=('Helvetica', 9, 'italic'), bg=bg,
-                             fg=_T['amber']).pack(anchor='w')
-                elif not cands.get('sufficient'):
-                    nm = len(cands.get('males',   []))
-                    nf = len(cands.get('females', []))
-                    tk.Label(card,
-                             text=(f'  No sufficient candidates  '
-                                   f'({nm} male{"s" if nm != 1 else ""},  '
-                                   f'{nf} female{"s" if nf != 1 else ""}  at 56–84d)'),
-                             font=('Helvetica', 9, 'italic'), bg=bg,
-                             fg=_T['amber']).pack(anchor='w')
-                else:
-                    sire_sym = _parse_geno_symbol(s['sire_geno'])
-                    dam_sym  = _parse_geno_symbol(s['dam_geno'])
-                    cgrid    = tk.Frame(card, bg=bg)
-                    cgrid.pack(fill='x', pady=(4, 0))
-                    for ci, (sex_lbl, lst) in enumerate([
-                        (f'Males  ({sire_sym})',  cands['males']),
-                        (f'Females  ({dam_sym})', cands['females']),
-                    ]):
-                        col_f = tk.Frame(cgrid, bg=bg, padx=4)
-                        col_f.grid(row=0, column=ci, sticky='nw', padx=(0, 20))
-                        tk.Label(col_f, text=sex_lbl,
-                                 font=('Helvetica', 9, 'bold'), bg=bg,
-                                 fg=_T['text_muted']).pack(anchor='w')
-                        for animal in lst[:6]:
-                            name = animal['name']
-                            var  = check_vars.setdefault(
-                                name, tk.BooleanVar(value=False))
-                            var.trace_add('write', _update_count)
-                            lbl  = (f"  {name}  ({animal['age_days']}d)"
-                                    f"  {animal['genotype']}")
-                            tk.Checkbutton(col_f, text=lbl, variable=var,
-                                           font=('Helvetica', 9), bg=bg,
-                                           fg=_T['text'], activebackground=bg,
-                                           selectcolor=bg,
-                                           cursor='hand2').pack(anchor='w')
-    
-            for _, mr in s['missing_units'].iterrows():
-                parts = []
-                if mr.get('sire_blank'): parts.append('sire')
-                if mr.get('dam_blank'):  parts.append('dam(s)')
-                who = ' & '.join(parts)
-                tk.Label(card,
-                         text=(f'⚠  H{mr["Housing ID"]}  M{mr["Mating ID"]}  —  '
-                               f'no {who} logged (touring male, death, or other)  —  '
-                               f'replace {who} individually or retire unit.'),
-                         font=('Helvetica', 9), bg=bg, fg=_T['red'],
-                         wraplength=860, justify='left',
-                         ).pack(anchor='w', pady=(4, 0))
-    
-        for sd in analysis:
-            _render_block(sd)
-        if not analysis:
-            tk.Label(inner, text='No matings data to display.',
-                     font=('Helvetica', 11), bg=_T['bg'],
-                     fg=_T['text_muted']).pack(pady=40)
-    
-        foot = _make_footer()
-    
-        _make_styled_button(
-            foot, '← Back to Files',
-            lambda: [canvas.unbind_all('<MouseWheel>'), _switch(screen_file_setup)],
-            style='ghost',
-        ).pack(side='left', padx=16)
-    
-        count_lbl = tk.Label(foot, text='0 animals reserved for breeding',
-                             font=('Helvetica', 10), bg=_T['bg_subtle'],
-                             fg=_T['text_muted'])
-        count_lbl.pack(side='left', padx=8)
-    
-        def _proceed():
-            state['breeding_reserves'] = {
-                name for name, var in check_vars.items() if var.get()
-            }
-            canvas.unbind_all('<MouseWheel>')
-            _switch(screen_wednesday)
-    
-        _make_styled_button(
-            foot, 'Next: Wednesday Capacity  →', _proceed, style='primary',
-        ).pack(side='right', padx=16)
-
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 2: Wednesday Capacity
     # ─────────────────────────────────────────────────────────────────────────
     def screen_wednesday():
-        root.title('SING Pipeline Scheduler — Wednesday capacity')
-        root.geometry('620x460')
+        import datetime as _dt
+        import pandas as _pd
+        import re as _re
 
-        wednesdays = get_next_wednesdays(6)
-        capacity   = CONFIG['WEDNESDAY_CAPACITY']
+        root.title('TAILS \u2014 Scheduled Harvests')
 
-        _make_header(
-            eyebrow='Step 2 of 2',
-            title='Wednesday behavior slots',
-            subtitle=f'Max {capacity} animals per Wednesday. Enter how many are already booked.',
-        )
+        SKIP = {'fail', 'qc fail', 'extra nb', 'floxed', 'found dead'}
 
-        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=14)
-        body.pack(fill='both', expand=True)
+        def _classify(age_str):
+            s = str(age_str).strip().upper()
+            if s == 'P14':
+                return 'P14'
+            num = _re.sub(r'[^0-9]', '', s)
+            if num and int(num) <= 21:
+                return 'P14'
+            return 'Adult'
 
-        # Column headers
-        col_specs = [('Wednesday', 22, 'w'), ('Booked', 9, 'center'),
-                     ('Remaining', 10, 'center'), ('Status', 12, 'center')]
-        for col, (txt, w, anchor) in enumerate(col_specs):
-            tk.Label(body, text=txt.upper(), width=w, anchor=anchor,
-                     font=('Helvetica', 8), fg=_T['text_faint'],
-                     bg=_T['bg']).grid(row=0, column=col, pady=(0, 6), sticky='w' if anchor=='w' else '')
+        def _norm_date(raw):
+            for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y'):
+                try:
+                    return _dt.datetime.strptime(str(raw).strip(), fmt).date()
+                except ValueError:
+                    continue
+            return None
 
-        # Separator line
-        sep = tk.Frame(body, bg=_T['border'], height=1)
-        sep.grid(row=1, column=0, columnspan=4, sticky='ew', pady=(0, 4))
+        # Read Harvest Worksheet and group future scheduled animals
+        harvest_path = _os.path.join(script_dir, 'Sing Harvest Sheet.xlsx')
+        rows_by_date = {}   # {date: {'P14': int, 'Adult': int}}
+        load_error   = None
+        today        = _dt.date.today()
 
-        entries = {}
+        try:
+            df = _pd.read_excel(harvest_path, sheet_name='Harvest Worksheet', dtype=str).fillna('')
+            for _, row in df.iterrows():
+                sample = str(row.get('Sample Number', '')).strip()
+                if sample.lower() in SKIP:
+                    continue
+                d = _norm_date(row.get('Harvest Date', ''))
+                if d is None or d < today:
+                    continue
+                tp = _classify(row.get('Age (Days)', ''))
+                if d not in rows_by_date:
+                    rows_by_date[d] = {'P14': 0, 'Adult': 0}
+                rows_by_date[d][tp] += 1
+        except Exception as ex:
+            load_error = str(ex)
 
-        def _update_row(wed, var, rl, sl):
-            try:
-                booked = int(var.get()) if var.get().strip() else 0
-                booked = max(0, booked)
-            except ValueError:
-                booked = 0
-            rem = capacity - booked
-            rl.configure(text=str(rem))
-            if rem <= 0:
-                sl.configure(text='● Full',  fg=_T['red'])
-                rl.configure(fg=_T['red'])
-            elif rem <= 3:
-                sl.configure(text='● Low',   fg=_T['amber'])
-                rl.configure(fg=_T['amber'])
-            else:
-                sl.configure(text='● Open',  fg=_T['accent'])
-                rl.configure(fg=_T['accent_text'])
+        sorted_dates = sorted(rows_by_date.keys())
 
-        for i, wed in enumerate(wednesdays, 2):
-            label_date = wed.strftime('%a, %b ') + str(wed.day)
-            label_full = wed.strftime('%Y-%m-%d')
+        # Header
+        hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=14)
+        hdr.pack(fill='x', side='top')
+        tk.Label(hdr, text='Scheduled Harvests',
+                 font=('Helvetica', 18, 'bold'),
+                 bg=_T['hdr_bg'], fg=_T['text']).pack()
+        sub = f'{len(sorted_dates)} dates with animals scheduled' if sorted_dates else 'No upcoming harvests found'
+        tk.Label(hdr, text=sub,
+                 font=('Helvetica', 10),
+                 bg=_T['hdr_bg'], fg=_T['text_muted']).pack(pady=(2, 0))
 
-            date_frame = tk.Frame(body, bg=_T['bg'])
-            date_frame.grid(row=i, column=0, sticky='w', pady=5)
-            tk.Label(date_frame, text=label_date, width=14, anchor='w',
-                     font=('Helvetica', 10), bg=_T['bg'], fg=_T['text']).pack(anchor='w')
-            tk.Label(date_frame, text=label_full, anchor='w',
-                     font=('Helvetica', 8), bg=_T['bg'], fg=_T['text_faint']).pack(anchor='w')
-
-            var = tk.StringVar(value='0')
-            ttk.Spinbox(body, from_=0, to=capacity, textvariable=var, width=6
-                        ).grid(row=i, column=1, pady=5)
-            entries[wed] = var
-
-            rl = tk.Label(body, text=str(capacity), width=10, anchor='center',
-                          font=('Helvetica', 10), bg=_T['bg'], fg=_T['accent_text'])
-            rl.grid(row=i, column=2)
-
-            sl = tk.Label(body, text='● Open', width=12, anchor='center',
-                          font=('Helvetica', 10), bg=_T['bg'], fg=_T['accent'])
-            sl.grid(row=i, column=3)
-
-            var.trace_add('write', lambda *_, w=wed, v=var, r=rl, s=sl:
-                          _update_row(w, v, r, s))
+        # Footer
+        tk.Frame(root, bg=_T['border'], height=1).pack(fill='x', side='bottom')
+        foot = tk.Frame(root, bg=_T['bg_subtle'], pady=10, padx=20)
+        foot.pack(fill='x', side='bottom')
+        _make_styled_button(foot, '\u2190 Back',
+                            lambda: _switch(screen_preflight),
+                            style='ghost').pack(side='left')
 
         def _proceed():
-            full_dates = []
-            for wed in wednesdays:
-                try:
-                    booked = int(entries[wed].get()) if entries[wed].get().strip() else 0
-                except ValueError:
-                    booked = 0
-                if capacity - booked <= 0:
-                    full_dates.append(wed)
-            state['wednesday_dates']     = wednesdays
-            state['full_behavior_dates'] = full_dates if full_dates else None
+            state['wednesday_dates']     = get_next_wednesdays(6)
+            state['full_behavior_dates'] = None
             _switch(screen_progress)
 
-        foot = _make_footer()
-        _make_styled_button(foot, '← Back',
-                            command=lambda: _switch(screen_file_setup),
-                            style='ghost').pack(side='left', padx=8)
-        _make_styled_button(foot, 'Run pipeline  →',
-                            command=_proceed, style='primary').pack(side='right', padx=8)
+        _make_styled_button(foot, 'Run pipeline  \u2192',
+                            command=_proceed, style='primary').pack(side='right')
+
+        # Body
+        body = tk.Frame(root, bg=_T['bg'], padx=24, pady=16)
+        body.pack(fill='both', expand=True, side='top')
+
+        if load_error:
+            tk.Label(body,
+                     text=f'\u26a0  Could not read Harvest Sheet:\n{load_error}',
+                     font=('Helvetica', 9), bg=_T['bg'], fg=_T['amber'],
+                     justify='left', anchor='w').pack(fill='x', pady=(0, 12))
+
+        if not sorted_dates:
+            tk.Label(body,
+                     text='No incomplete scheduled harvests found from today forward.',
+                     font=('Helvetica', 10), bg=_T['bg'], fg=_T['text_muted'],
+                     anchor='w').pack(fill='x', pady=12)
+        else:
+            tbl = tk.Frame(body, bg=_T['bg'])
+            tbl.pack(fill='x')
+
+            # Fixed column widths in pixels via minsize
+            COL_W = [160, 60, 70, 70, 70]
+            for i, w in enumerate(COL_W):
+                tbl.columnconfigure(i, minsize=w)
+
+            # Headers
+            for col, txt in enumerate(['Date', 'Day', 'P14', 'Adult', 'Total']):
+                anchor = 'w' if col < 2 else 'e'
+                tk.Label(tbl, text=txt.upper(),
+                         font=('Helvetica', 8), fg=_T['text_faint'],
+                         bg=_T['bg'], anchor=anchor).grid(
+                    row=0, column=col, sticky='ew', pady=(0, 4))
+
+            # Divider
+            div = tk.Frame(tbl, bg=_T['border'], height=1)
+            div.grid(row=1, column=0, columnspan=5, sticky='ew', pady=(0, 6))
+
+            # Data rows
+            for r, d in enumerate(sorted_dates, start=2):
+                counts = rows_by_date[d]
+                p14    = counts['P14']
+                adult  = counts['Adult']
+                total  = p14 + adult
+
+                vals = [
+                    (d.strftime('%Y-%m-%d'), 'w', _T['text'],       False),
+                    (d.strftime('%a'),        'w', _T['text_muted'], False),
+                    (str(p14)   if p14   else '\u2014', 'e',
+                     _T['accent'] if p14   else _T['text_faint'], False),
+                    (str(adult) if adult else '\u2014', 'e',
+                     _T['accent'] if adult else _T['text_faint'], False),
+                    (str(total), 'e', _T['text'], True),
+                ]
+                for col, (txt, anchor, color, bold) in enumerate(vals):
+                    tk.Label(tbl, text=txt,
+                             font=('Helvetica', 10, 'bold' if bold else 'normal'),
+                             bg=_T['bg'], fg=color, anchor=anchor).grid(
+                        row=r, column=col, sticky='ew', pady=3)
+
+        root.update_idletasks()
+        w = 560
+        h = min(root.winfo_reqheight() + 10, root.winfo_screenheight() - 80)
+        x = (root.winfo_screenwidth()  - w) // 2
+        y = (root.winfo_screenheight() - h) // 2
+        root.geometry(f'{w}x{h}+{x}+{y}')
 
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN 3: Progress + mid-run dialogs
     # ─────────────────────────────────────────────────────────────────────────
     def screen_progress():
-        root.title('SING Pipeline Scheduler — Running…')
+        root.title('TAILS — Running…')
         root.geometry('760x560')
 
         hdr = tk.Frame(root, bg=_T['hdr_bg'], pady=14)
@@ -8792,7 +11109,123 @@ def run_pipeline_gui():
             inner.pack(pady=12, padx=24)
             return dlg, inner
 
-        # ── Mid-run dialog: sample number ─────────────────────────────────────
+        # ── Mid-run dialog: sample number verify ──────────────────────────────
+        def _ask_cohort_create(missing, attempt, report):
+            """
+            Pause while the user creates missing cohorts in Climb.
+            Responds 'recheck' or 'skip'.
+            """
+            again = ' (still missing)' if attempt > 1 else ''
+            dlg, inner = _make_dialog(
+                f'Cohorts need creating{again}',
+                f'{len(missing)} cohort(s) do not exist in Climb yet.\n'
+                'Cohorts cannot be created through the API — make them in Climb,\n'
+                'then choose "I\'ve created them" to continue.'
+            )
+
+            # Scrollable list of cohorts to create
+            box = tk.Frame(inner, bg=_T['bg_inset'], highlightthickness=1,
+                           highlightbackground=_T['border'])
+            box.grid(row=0, column=0, sticky='nsew', pady=(0, 6))
+
+            hdr = tk.Frame(box, bg=_T['hdr_bg'])
+            hdr.pack(fill='x')
+            for txt, w in (('Cohort name', 22), ('Animals', 8), ('Description', 34)):
+                tk.Label(hdr, text=txt, width=w, anchor='w',
+                         font=('Helvetica', 9, 'bold'),
+                         bg=_T['hdr_bg'], fg='white').pack(side='left', padx=4, pady=4)
+
+            canvas = tk.Canvas(box, bg=_T['bg_inset'], highlightthickness=0,
+                               height=min(220, 26 * max(len(missing), 1) + 10))
+            rows_f = tk.Frame(canvas, bg=_T['bg_inset'])
+            vsb    = ttk.Scrollbar(box, orient='vertical', command=canvas.yview)
+            canvas.configure(yscrollcommand=vsb.set)
+            canvas.pack(side='left', fill='both', expand=True)
+            vsb.pack(side='right', fill='y')
+            canvas.create_window((0, 0), window=rows_f, anchor='nw')
+
+            for m in missing:
+                r = tk.Frame(rows_f, bg=_T['bg_inset'])
+                r.pack(fill='x')
+                tk.Label(r, text=m['name'], width=22, anchor='w',
+                         font=('Courier New', 10, 'bold'),
+                         bg=_T['bg_inset'], fg=_T['accent']).pack(side='left', padx=4, pady=3)
+                tk.Label(r, text=str(m['count']), width=8, anchor='w',
+                         font=('Helvetica', 9),
+                         bg=_T['bg_inset'], fg=_T['text']).pack(side='left', padx=4)
+                tk.Label(r, text=m['description'], width=34, anchor='w',
+                         font=('Helvetica', 9),
+                         bg=_T['bg_inset'], fg=_T['text_muted']).pack(side='left', padx=4)
+
+            rows_f.update_idletasks()
+            canvas.configure(scrollregion=canvas.bbox('all'))
+
+            tk.Label(inner,
+                     text=f'Full list with every animal:  {report}',
+                     font=('Helvetica', 8, 'italic'),
+                     bg=_T['bg'], fg=_T['text_muted']).grid(row=1, column=0,
+                                                            sticky='w')
+
+            btns = tk.Frame(dlg, bg=_T['bg'])
+            btns.pack(pady=(10, 16))
+
+            def _respond(value):
+                _gui_respond(value)
+                dlg.destroy()
+
+            _make_styled_button(btns, "I've created them  \u2192",
+                                lambda: _respond('recheck'),
+                                style='primary').pack(side='left', padx=6)
+            _make_styled_button(btns, 'Skip cohort assignment',
+                                lambda: _respond('skip'),
+                                style='ghost').pack(side='left', padx=6)
+
+            dlg.protocol('WM_DELETE_WINDOW', lambda: _respond('skip'))
+
+            dlg.update_idletasks()
+            x = root.winfo_x() + (root.winfo_width()  - dlg.winfo_width())  // 2
+            y = root.winfo_y() + (root.winfo_height() - dlg.winfo_height()) // 2
+            dlg.geometry(f'+{x}+{y}')
+            root.wait_window(dlg)
+
+        def _ask_sample_number_verify(fetched_num):
+            dlg, inner = _make_dialog(
+                'Verify sample number',
+                f'Climb returned {fetched_num} as the next sample number.\n'
+                'Confirm or enter a different number to override.'
+            )
+            tk.Label(inner, text='Next sample number:',
+                     font=('Helvetica', 9), bg=_T['bg'],
+                     fg=_T['text_muted']).grid(row=0, column=0, padx=(0, 8))
+            var = tk.StringVar(value=str(fetched_num))
+            e = ttk.Entry(inner, textvariable=var, width=10)
+            e.grid(row=0, column=1)
+            e.select_range(0, 'end')
+            e.focus()
+
+            err_lbl = tk.Label(dlg, text='', font=('Helvetica', 9),
+                               bg=_T['bg'], fg=_T['red'])
+            err_lbl.pack()
+
+            def _ok():
+                try:
+                    val = int(var.get().strip())
+                    if val <= 0:
+                        raise ValueError
+                    _gui_respond(val)
+                    dlg.destroy()
+                except ValueError:
+                    err_lbl.configure(text='Enter a valid whole number.')
+
+            _make_styled_button(dlg, 'Confirm', _ok,
+                                style='primary').pack(pady=(6, 16))
+            dlg.bind('<Return>', lambda e: _ok())
+
+            dlg.update_idletasks()
+            x = root.winfo_x() + (root.winfo_width()  - dlg.winfo_width())  // 2
+            y = root.winfo_y() + (root.winfo_height() - dlg.winfo_height()) // 2
+            dlg.geometry(f'+{x}+{y}')
+            root.wait_window(dlg)
         def _ask_sample_number():
             dlg, inner = _make_dialog(
                 'Sample number setup',
@@ -8924,12 +11357,15 @@ def run_pipeline_gui():
                         return
                     elif msg['kind'] == _MSG_REQUEST:
                         rtype = msg['type']
-                        if rtype == 'sample_number':
-                            _ask_sample_number()
+                        if rtype == 'sample_number_verify':
+                            _ask_sample_number_verify(msg.get('fetched', 1))
                         elif rtype == 'label_offset':
                             _ask_label_offset(msg['sheet_num'], msg['labels_remaining'])
                         elif rtype == 'label_continue':
                             _ask_label_continue(msg['sheet_num'])
+                        elif rtype == 'cohort_create':
+                            _ask_cohort_create(msg['missing'], msg['attempt'],
+                                               msg['report'])
             except _queue.Empty:
                 pass
             root.after(120, _poll)
@@ -8946,57 +11382,263 @@ def run_pipeline_gui():
             try:
                 setup_logging(script_dir, CONFIG['LOG_LEVEL'])
 
-                schedule_file, assignments_df = create_complete_schedule(
-                    animal_file         = state['animal_file'],
-                    tracking_file       = state.get('tracking_file'),
-                    births_file         = state.get('births_file'),
-                    output_dir          = script_dir,
-                    birth_date_start    = None,
-                    birth_date_end      = None,
-                    behavior_date_start = None,
-                    behavior_date_end   = None,
-                    full_behavior_dates = state.get('full_behavior_dates'),
-                    breeding_reserves   = state.get('breeding_reserves') or None,
-                )
+                # ── Fetch data ────────────────────────────────────────────────
+                selected_modules = state.get('modules', {})
 
-                timestamp = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
-                output_files = [schedule_file]
+                if selected_modules.get('schedule', False):
+                    # Genotypes first — the animals pull below must reflect
+                    # them, or newly typed animals still schedule as Blank.
+                    if CONFIG.get('UPLOAD_TGS_GENOTYPES', True):
+                        run_tgs_genotypes(script_dir)
 
-                if assignments_df is not None and not assignments_df.empty:
-                    if 'Line' not in assignments_df.columns:
-                        if 'Strain' in assignments_df.columns:
-                            assignments_df['Line'] = assignments_df['Strain']
-                        elif 'Line (Short)' in assignments_df.columns:
-                            assignments_df['Line'] = assignments_df['Line (Short)']
+                    # Schedule selected — pull animals and births from Climb
+                    print('Fetching animals from Climb...')
+                    try:
+                        _sc = _load_sing_climb()
+                        animals_climb_df = _sc.get_animals_df(verbose=False)
+                        animals_path = _os.path.join(script_dir, CONFIG['INPUT_ANIMAL_FILE'])
+                        animals_climb_df.to_csv(animals_path, index=False)
+                        state['animal_file'] = animals_path
+                        print(f'  \u2713 {len(animals_climb_df):,} animals fetched from Climb')
+                    except Exception as _ex:
+                        raise RuntimeError(
+                            f'\u274c  Could not fetch animals from Climb: {_ex}\n'
+                            'Check your Climb credentials and connection, then try again.'
+                        )
 
-                    working_df = build_working_data(assignments_df)
+                    print('Fetching births from Climb...')
+                    try:
+                        births_climb_df = _sc.get_births_df(verbose=False)
+                        births_path = _os.path.join(script_dir, CONFIG['INPUT_BIRTHS_FILE'])
+                        births_climb_df.to_csv(births_path, index=False)
+                        state['births_file'] = births_path
+                        print(f'  \u2713 {len(births_climb_df):,} births fetched from Climb')
+                    except Exception as _ex:
+                        raise RuntimeError(
+                            f'\u274c  Could not fetch births from Climb: {_ex}\n'
+                            'Check your Climb credentials and connection, then try again.'
+                        )
+                else:
+                    # Partial run — use CSV from script folder
+                    csv_path = state.get('animal_file',
+                                         _os.path.join(script_dir, CONFIG['INPUT_ANIMAL_FILE']))
+                    if not _os.path.exists(csv_path):
+                        raise RuntimeError(
+                            f'\u274c  Animal CSV not found:\n  {csv_path}\n'
+                            f'Drop {CONFIG["INPUT_ANIMAL_FILE"]} in the script folder and try again.'
+                        )
+                    print(f'Using animal CSV: {_os.path.basename(csv_path)}')
+                schedule_selected = selected_modules.get('schedule', False)
 
-                    if not working_df.empty:
+                if schedule_selected:
+                    # ── Full pipeline ─────────────────────────────────────────
+                    schedule_file, assignments_df = create_complete_schedule(
+                        animal_file         = state['animal_file'],
+                        tracking_file       = state.get('tracking_file'),
+                        births_file         = state.get('births_file'),
+                        output_dir          = script_dir,
+                        birth_date_start    = None,
+                        birth_date_end      = None,
+                        behavior_date_start = None,
+                        behavior_date_end   = None,
+                        full_behavior_dates = state.get('full_behavior_dates'),
+                    )
+
+                    timestamp = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
+                    output_files = [schedule_file]
+
+                    if assignments_df is not None and not assignments_df.empty:
+                        if 'Line' not in assignments_df.columns:
+                            if 'Strain' in assignments_df.columns:
+                                assignments_df['Line'] = assignments_df['Strain']
+                            elif 'Line (Short)' in assignments_df.columns:
+                                assignments_df['Line'] = assignments_df['Line (Short)']
+
+                        working_df = build_working_data(assignments_df)
+
+                        if not working_df.empty:
+                            # Use first — quick and unattended. Cohorts can
+                            # pause for input, so it goes second.
+                            if CONFIG.get('UPDATE_ANIMAL_USE', True):
+                                update_animal_use(working_df)
+
+                            # Wild / Inconclusive animals can never be
+                            # scheduled — release them from the Sing pool.
+                            if CONFIG.get('RELEASE_UNUSABLE', True):
+                                try:
+                                    _pool = pd.read_csv(state['animal_file'])
+                                    _pool, _ = filter_animals_by_use(_pool)
+                                    release_unusable_to_available(_pool)
+                                except Exception as _re:
+                                    print(f'  \u26a0 Release skipped: {_re}')
+
+                            # Cohorts — this pauses for input, and the other
+                            # modules don't depend on it.
+                            if CONFIG.get('ASSIGN_COHORTS', True):
+                                try:
+                                    run_cohorts(working_df, timestamp,
+                                                output_dir=script_dir)
+                                except Exception as _ce:
+                                    print(f'  \u26a0 Cohort assignment failed: {_ce}')
+                                    print('    Continuing with the rest of the run.')
+
+                            if selected_modules.get('climb_samples', True):
+                                harvest_df, samples_df, climb_import_df = run_harvest_and_samples(
+                                    working_df, timestamp)
+                            else:
+                                samples_df = None
+
+                            if selected_modules.get('deliverables', True) and samples_df is not None:
+                                run_deliverables(working_df, samples_df, timestamp)
+
+                            if selected_modules.get('envision', True):
+                                envision_df = working_df[
+                                    ~working_df.get('_is_nb', pd.Series(False, index=working_df.index)) &
+                                    (working_df.get('Assigned_Timepoint', '') == 'P56')
+                                ].copy()
+                                if not envision_df.empty:
+                                    run_climb_to_envision(envision_df, timestamp, output_dir=script_dir)
+                                else:
+                                    print('  \u24d8 No Envision output \u2014 no P56 non-NB animals scheduled.')
+
+                            if selected_modules.get('labels', True) and samples_df is not None:
+                                run_labels(samples_df, working_df, timestamp)
+
+                    schedule_file_out = schedule_file
+
+                else:
+                    # ── Partial run — no scheduling ───────────────────────────
+                    import datetime as _dt
+                    timestamp = _dt.datetime.now().strftime('%Y%m%d_%H%M%S')
+                    schedule_file_out = None
+                    output_files = []
+
+                    print(f'Loading CSV: {_os.path.basename(csv_path)}')
+                    try:
+                        animals_df = pd.read_csv(csv_path)
+                        print(f'  {len(animals_df):,} rows loaded')
+                    except Exception as _csv_ex:
+                        raise RuntimeError(f'\u274c Could not read CSV: {_csv_ex}')
+
+                    # Rename Name → Animal_Name if needed
+                    if 'Name' in animals_df.columns and 'Animal_Name' not in animals_df.columns:
+                        animals_df = animals_df.rename(columns={'Name': 'Animal_Name'})
+
+                    if selected_modules.get('envision'):
+                        print('\nRunning Climb \u2192 Envision translation...')
+                        print(f'  animals_df shape: {animals_df.shape}')
+                        print(f'  animals_df columns: {list(animals_df.columns)}')
+                        print(f'  animals_df empty: {animals_df.empty}')
+                        try:
+                            envision_out = run_climb_to_envision(animals_df, timestamp, output_dir=script_dir)
+                            print(f'  envision_out = {envision_out!r}')
+                            if envision_out:
+                                output_files.append(envision_out)
+                                print(f'  Added to output_files: {envision_out}')
+                            else:
+                                print('  WARNING: run_climb_to_envision returned None or empty')
+                        except Exception as _env_ex:
+                            import traceback as _tb2
+                            print(f'  ERROR in Envision: {_env_ex}')
+                            print(_tb2.format_exc())
+
+                    if selected_modules.get('climb_samples'):
+                        print('\nCreating Climb samples...')
                         harvest_df, samples_df, climb_import_df = run_harvest_and_samples(
-                            working_df, timestamp)
-                        run_deliverables(working_df, samples_df, timestamp)
-                        # NB animals skip Envision — no behavior session needed
-                        # NB animals and P14 animals excluded from Envision — no behavior session
-                        envision_df = working_df[
-                            ~working_df.get('_is_nb', pd.Series(False, index=working_df.index)) &
-                            (working_df.get('Assigned_Timepoint', '') == 'P56')
-                        ].copy()
-                        if not envision_df.empty:
-                            run_climb_to_envision(envision_df, timestamp)
-                        else:
-                            print("  ⓘ No Envision output — no P56 non-NB animals scheduled.")
-                        run_labels(samples_df, working_df, timestamp)
+                            animals_df, timestamp)
 
-                        new_files = sorted([
-                            _os.path.join(script_dir, f)
-                            for f in _os.listdir(script_dir)
-                            if timestamp in f
-                        ])
-                        output_files.extend(new_files)
+                    if selected_modules.get('labels'):
+                        print('\nGenerating labels...')
+                        samples_df = locals().get('samples_df')
+                        # Labels are built from sample records. If the Climb Samples
+                        # module was not selected this pass, fall back to a samples.csv
+                        # in the script folder rather than crashing on None.
+                        if samples_df is None:
+                            _s_path = _os.path.join(_SCRIPT_DIR, 'samples.csv')
+                            if _os.path.exists(_s_path):
+                                print(f'  Climb Samples did not run — reading {_os.path.basename(_s_path)}')
+                                try:
+                                    samples_df = pd.read_csv(_s_path, dtype=str)
+                                    print(f'  {len(samples_df)} sample rows loaded')
+                                except Exception as _sx:
+                                    print(f'  Could not read samples.csv: {_sx}')
+                                    samples_df = None
+                            else:
+                                print('  No samples.csv found in the script folder.')
+                        run_labels(samples_df, animals_df, timestamp)
+
+                    if selected_modules.get('deliverables'):
+                        print('\nExporting deliverables sheet...')
+                        import glob as _glob, datetime as _dt2
+                        # Find the most recent Harvest_Sheet_Import file in the folder
+                        imports = sorted(
+                            _glob.glob(_os.path.join(script_dir, 'Harvest_Sheet_Import_*.xlsx')),
+                            reverse=True
+                        )
+                        if imports:
+                            print(f'  Using: {_os.path.basename(imports[0])}')
+                            samples_df = pd.read_excel(imports[0], dtype=str).fillna('')
+                        else:
+                            # Fall back to Harvest Worksheet from Sing Harvest Sheet
+                            harvest_xlsx = _os.path.join(script_dir, 'Sing Harvest Sheet.xlsx')
+                            if _os.path.exists(harvest_xlsx):
+                                print('  Using Harvest Worksheet from Sing Harvest Sheet.xlsx')
+                                samples_df = pd.read_excel(
+                                    harvest_xlsx, sheet_name='Harvest Worksheet', dtype=str
+                                ).fillna('')
+                            else:
+                                samples_df = animals_df
+
+                        # ── Scope to animals.csv ──────────────────────────────
+                        # The Harvest Worksheet holds the whole project history.
+                        # Only the animals in animals.csv belong in this export.
+                        _name_col = next((c for c in ('Animal_Name', 'Name')
+                                          if c in animals_df.columns), None)
+                        _samp_col = next((c for c in ('Animal_Name', 'Name')
+                                          if c in samples_df.columns), None)
+                        if _name_col and _samp_col:
+                            _wanted = set(
+                                animals_df[_name_col].astype(str).str.strip()
+                            )
+                            _before = len(samples_df)
+                            samples_df = samples_df[
+                                samples_df[_samp_col].astype(str).str.strip().isin(_wanted)
+                            ].copy()
+                            print(f'  Scoped to animals.csv: {len(samples_df)} of '
+                                  f'{_before} worksheet rows '
+                                  f'({len(_wanted)} animals in CSV)')
+                            if samples_df.empty:
+                                print('  \u26a0 No worksheet rows matched animals.csv \u2014 '
+                                      'nothing to export.')
+                        else:
+                            print(f'  \u26a0 Cannot scope to animals.csv \u2014 no name column. '
+                                  f'CSV has: {list(animals_df.columns)[:8]} | '
+                                  f'Worksheet has: {list(samples_df.columns)[:8]}')
+
+                        run_deliverables(animals_df, samples_df, timestamp,
+                                         output_dir=script_dir)
+
+                    if selected_modules.get('sanity'):
+                        print('\nRunning Sing Sanity...')
+                        _run_sing_sanity(script_dir, timestamp)
+
+                    # Collect all output files written during this run
+                    new_files = sorted([
+                        _os.path.join(script_dir, f)
+                        for f in _os.listdir(script_dir)
+                        if timestamp in f and _os.path.isfile(_os.path.join(script_dir, f))
+                    ])
+
+                new_files = sorted([
+                    _os.path.join(script_dir, f)
+                    for f in _os.listdir(script_dir)
+                    if timestamp in f
+                ])
+                output_files.extend(new_files)
 
                 _pipeline_queue.put({
                     'kind': _MSG_DONE, 'ok': True,
-                    'result': {'schedule_file': schedule_file, 'output_files': output_files}
+                    'result': {'schedule_file': schedule_file_out, 'output_files': output_files}
                 })
 
             except Exception as ex:
@@ -9006,6 +11648,7 @@ def run_pipeline_gui():
             finally:
                 _sys.stdout = old_stdout
 
+        _append_log(f'TAILS v{PIPELINE_VERSION}\n')
         _append_log('Starting pipeline…\n')
         status_var.set('Running — please wait…')
         t = _threading.Thread(target=_run_pipeline, daemon=True)
@@ -9016,7 +11659,7 @@ def run_pipeline_gui():
     # SCREEN 4: Summary
     # ─────────────────────────────────────────────────────────────────────────
     def screen_summary(result):
-        root.title('SING Pipeline Scheduler — Complete')
+        root.title('TAILS — Complete')
         root.geometry('640x440')
 
         # Header with green accent on title
@@ -9096,7 +11739,7 @@ def run_pipeline_gui():
     root.geometry(f'{w}x{h}+{x}+{y}')
     root.minsize(560, 600)
 
-    screen_file_setup()
+    screen_module_select()
     root.mainloop()
 
 

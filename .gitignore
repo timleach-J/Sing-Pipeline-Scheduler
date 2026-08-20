@@ -1,34 +1,152 @@
-﻿# Python
-__pycache__/
-*.pyc
-*.pyo
+# ==============================================================================
+# TAILS — Tracking Animal Inventory, Logging Shipments
+# .gitignore
+#
+# NOTE THE LEADING DOT. The previous file was named "gitignore" with no dot,
+# which git never reads. If that file is still present, delete it.
+#
+# Verify a path is actually ignored:
+#     git check-ignore -v lib/sing_credentials.json
+# It should print the rule that matches. No output = not ignored.
+# ==============================================================================
 
-# Data files — live colony data, never commit
+
+# ── SECRETS — never commit ────────────────────────────────────────────────────
+# ALL credentials live in lib/credentials/ and NOTHING in there is ever tracked.
+# Ignore the whole folder, contents and all — no exceptions, no negation rules.
+# Nothing is copied INTO this folder from the repo, and nothing is copied OUT.
+lib/credentials/
+**/credentials/
+
+# Belt and braces: these names are ignored wherever they turn up, in case a
+# copy is ever made outside the credentials folder by accident.
+sing_credentials.json
+**/sing_credentials.json
+
+# Google service account keys and OAuth tokens
+google_credentials.json
+**/google_credentials.json
+client_secret*.json
+service_account*.json
+token.json
+token.pickle
+application_default_credentials.json
+
+# Generic credential patterns
+*credentials*.json
+*secret*.json
+*.key
+*.pem
+.env
+.env.*
+
+# The empty template SHOULD be tracked — it documents the expected shape.
+# Keep it in lib/, NOT in lib/credentials/ — that folder is ignored outright,
+# so a template placed inside it could never be committed.
+!sing_credentials.json.template
+!*.template
+!*.example
+
+
+# ── ANIMAL / SAMPLE DATA — live colony data, never commit ─────────────────────
+# THIS REPO IS PUBLIC. Blanket-ignore every CSV — Climb exports, harvest
+# overrides, housing fixes, and anything dropped in the folder later.
+# Do not narrow this to specific filenames.
 *.csv
 
-# Pipeline outputs — timestamped files from every run
-Complete_Schedule_*.xlsx
-Harvest_Sheet_Import_*.xlsx
-Lab_Data_Export_*.xlsx
-Labels_Mailmerge_*.xlsx
-Climb_Sample_Import_*.csv
-Tube_Labeler_RNA_*.xlsx
-Mailmerge_Labels_PERFUSION_*.xlsx
+# Spreadsheets — sheet copies, downloads, and generated workbooks
+*.xlsx
+*.xls
 
-# Pipeline-generated folders
+# Generated import files
+Harvest_Sheet_Import_*
+Climb_Sample_Import_*
+TESTONLY_DO_NOT_IMPORT_*
+
+
+# ── GENERATED OUTPUT ──────────────────────────────────────────────────────────
+Complete_Schedule_*
+Labels_Mailmerge_*
+Mailmerge_Labels_PERFUSION_*
+Tube_Labeler_*
+Lab_Data_Export_*
+Deliverables_*
+Envision_*
+TAILS_Header_Report_*
+harvest_overrides.csv
+*.ics
+
+# Pipeline-generated and data folders — never commit.
+# THIS REPO IS PUBLIC. Genotypes/ holds TGS reports and upload receipts with
+# animal names, IDs and genotype calls. Keep every one of these out.
 backup_*/
 logs/
+Genotypes/
+genotypes/
+Complete Uploads/
 Complete exports/
+Complete Outputs/
+Labels and Tubes/
 Labels/
 Tubes/
 Envision/
 Data Export/
 Sample Import/
-Complete Outputs/
 Documents/
 
-# OS/editor junk
-.DS_Store
-Thumbs.db
+*.log
+
+
+# ── DATED WORKING COPIES ──────────────────────────────────────────────────────
+# Working files carry dates and versions (TAILS_20260820_v294.py). The repo
+# tracks the clean undated name instead (TAILS.py), which prep_for_git.py
+# creates. Ignore every dated .py so both don't end up committed.
+*_20[0-9][0-9][0-9][0-9][0-9][0-9]*.py
+
+# ── PYTHON ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+
+# ── EDITORS / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
 *.swp
 *.swo
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Office lock files — these appear when a doc is open and are never wanted
+~$*
+
+# macOS
+.DS_Store
+
+
+# ── SCRATCH ───────────────────────────────────────────────────────────────────
+scratch/
+tmp/
+temp/
+*.bak
+*.tmp
+*_OLD.*
+*_backup.*

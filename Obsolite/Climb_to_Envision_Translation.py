@@ -67,7 +67,9 @@ def clean_genotype(genotype):
     s = re.sub(r'\[[^\]]*\]', '', s)
     s = re.sub(r'probe\s*', '', s)
     s = ' '.join(s.split())
-    if any(k in s for k in ('inconclusive', 'pending', 'failed', 'no call')):
+    if 'inconclusive' in s:
+        return '+/+'   # treated as wild — not usable for harvest
+    if any(k in s for k in ('pending', 'failed', 'no call')):
         return 'Blank'
     if re.search(r'\bhom\d*\b|-/-', s):
         return '-/-'
@@ -113,29 +115,29 @@ def assign_ear_tags_by_strain_sex(df):
     for idx, row in df_sorted.iterrows():
         sort_data.append((
             idx,
-            row['Line'],
+            row.get('Line (Short)', row['Line']),
             row['Sex'],
             natural_sort_key(row['Name'])
         ))
-    
-    # Sort by Line, then Sex, then natural sort key
+
+    # Sort by Line (Short), then Sex, then natural sort key
     sort_data.sort(key=lambda x: (x[1], x[2], x[3]))
-    
+
     # Get the sorted indices
     sorted_indices = [item[0] for item in sort_data]
-    
+
     # Reorder the dataframe
     df_sorted = df_sorted.loc[sorted_indices].reset_index(drop=True)
-    
+
     # Now assign ear tags in order after sorting
     # Within each strain/sex group, assign S4, S3, S2, S4, S3, S2...
     tags = []
     current_strain = None
     current_sex = None
     counter_within_group = 0
-    
+
     for idx, row in df_sorted.iterrows():
-        strain = row['Line']
+        strain = row.get('Line (Short)', row['Line'])
         sex = row['Sex']
         
         # Check if we've moved to a new strain/sex combination
@@ -293,13 +295,37 @@ def create_envision_translation(input_file):
         print("✓ Cleaned genotype base")
         if len(df) > 0:
             print(f"  Example: Strain='{df['Line'].iloc[0]}', Genotype='{df['Genotype'].iloc[0]}' → '{df['genotype_base'].iloc[0]}'")
-        
+
+        # ── SHANK3 split: rename Line (Short) to SHANK3-Het / SHANK3-Hom ──────
+        # Mirrors the pipeline's check_eligibility behaviour so standalone output
+        # matches the main schedule.
+        _HETXHET_BASE = {'SHANK3'}   # add others here if more het×het strains are added
+        def _split_line_short(row):
+            ls = str(row.get('Line (Short)', '') or '').strip()
+            if ls.upper() not in _HETXHET_BASE:
+                return ls
+            geno = str(row.get('Genotype', '') or '').strip().lower()
+            if re.search(r'-/-|\bhom\d*\b', geno):
+                return f"{ls}-Hom"
+            if re.search(r'-/\+|\+/-|\bhet\d*\b', geno):
+                return f"{ls}-Het"
+            return ls
+
+        if 'Line (Short)' in df.columns:
+            df['Line (Short)'] = df.apply(_split_line_short, axis=1)
+        # ─────────────────────────────────────────────────────────────────────
+
         # Get first letter of sex (capitalized)
         df['sex_initial'] = df['Sex'].str[0].str.upper()
         print("✓ Extracted sex initial")
-        
-        # Create base Group column (before numbering)
-        df['Group_base'] = df['genotype_base'] + '-' + df['sex_initial']
+
+        # Create base Group column — use Line (Short) so the strain name appears
+        # in the group label (e.g. SHANK3-Hom-F3) rather than just the genotype.
+        if 'Line (Short)' in df.columns:
+            line_col = df['Line (Short)'].fillna(df['genotype_base'])
+        else:
+            line_col = df['genotype_base']
+        df['Group_base'] = line_col + '-' + df['sex_initial']
         print("✓ Created base groups")
         
         # Show unique base groups
@@ -411,23 +437,63 @@ def create_envision_translation(input_file):
 if __name__ == "__main__":
     # Input file is always "animals.csv"
     input_filename = "animals.csv"
-    
+
     print("\n" + "=" * 80)
-    print(" STARTING ENVISION TRANSLATION")
+    print(" ENVISION TRANSLATION")
     print("=" * 80)
-    print(f"\nLooking for: {input_filename}")
+
+    # ── Filtered CSV check ────────────────────────────────────────────────────
+    print("""
+This script expects a FILTERED animals.csv exported from Climb —
+containing only the animals for a specific behavior session cohort.
+
+Running it on the full Climb export (all Alive + Sing Inventory animals)
+will produce an Envision file for every animal in the colony, not just
+the ones scheduled for a given Wednesday.
+""")
+    while True:
+        answer = input("Is your animals.csv filtered for a specific behavior cohort? (y/n): ").strip().lower()
+        if answer in ('y', 'yes'):
+            print("✓ Great — proceeding.\n")
+            break
+        elif answer in ('n', 'no'):
+            print("""
+⚠  Warning: You are about to run Envision translation on the full
+   animals export. The output will include ALL colony animals, not
+   just a single session cohort, and ear tag numbering will not
+   reflect a real behavior session.
+
+   To get a filtered export from Climb:
+     1. Open the Animals list in Climb
+     2. Filter to the cohort/behavior date you need
+     3. Export that filtered view as animals.csv
+     4. Place it in the same folder as this script and re-run.
+""")
+            proceed = input("Continue anyway? (y/n): ").strip().lower()
+            if proceed in ('y', 'yes'):
+                print("⚠  Proceeding with unfiltered data.\n")
+                break
+            else:
+                print("Exiting. Re-run once you have the filtered CSV.")
+                input("\nPress ENTER to close...")
+                raise SystemExit(0)
+        else:
+            print("Please enter y or n.")
+    # ─────────────────────────────────────────────────────────────────────────
+
+    print(f"Looking for: {input_filename}")
     print(f"Output will be: [COHORT]_YYYYMMDD_HHMMSS.xlsx")
-    
+
     # Wait for user to confirm
     input("\nPress ENTER to start processing...")
-    
+
     result = create_envision_translation(input_filename)
-    
+
     if result is not None:
         print("\n✓ Script completed successfully!")
         print("✓ Check the same folder as this script for the output file.")
     else:
         print("\n❌ Script failed. Please read the error messages above.")
-    
+
     # Keep window open
     input("\nPress ENTER to exit...")

@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "Z:\kumarlab-new\Tim Leach\Scripts\API Pipeline\TGS_to_Climb_Genotypes_20260818.py", line 464, in <module>
+    main()
+    ~~~~^^
+  File "Z:\kumarlab-new\Tim Leach\Scripts\API Pipeline\TGS_to_Climb_Genotypes_20260818.py", line 251, in main
+    raise FileNotFoundError(
+        'No TGS_Typing_*.xls in this folder.\n'
+        'Download the typing reports from TGS and drop them here.')
+FileNotFoundError: No TGS_Typing_*.xls in this folder.
+Download the typing reports from TGS and drop them here.

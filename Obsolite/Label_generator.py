@@ -126,7 +126,9 @@ def _canon_geno_simple(raw: str) -> str:
     s = re.sub(r'\[[^\]]*\]', '', s)
     s = re.sub(r'probe\s*', '', s)
     s = ' '.join(s.split())
-    if any(k in s for k in ('inconclusive', 'pending', 'failed', 'no call')):
+    if 'inconclusive' in s:
+        return 'wt'    # treated as wild — excluded from harvest labels
+    if any(k in s for k in ('pending', 'failed', 'no call')):
         return 'blank'
     if re.search(r'\bhom\d*\b|-/-', s):
         return 'hom'
